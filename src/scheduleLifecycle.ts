@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type {
   ApprovalMode,
+  CreateActiveScheduleInput,
   CreateDraftScheduleInput,
   DueWorkScanResult,
   ExportSchedulesInput,
@@ -22,6 +23,7 @@ import type {
   TargetContext,
 } from "./domain.js";
 import { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
+import { nextRunAtAfter } from "./cadence.js";
 import type { AgentHarness } from "./harness.js";
 import type { ScheduleStore } from "./store.js";
 
@@ -71,12 +73,23 @@ export class ScheduleLifecycle {
   }
 
   async createDraftSchedule(input: CreateDraftScheduleInput): Promise<Schedule> {
+    return this.createSchedule(input, "draft");
+  }
+
+  async createActiveSchedule(input: CreateActiveScheduleInput): Promise<Schedule> {
+    return this.createSchedule(input, "active");
+  }
+
+  private async createSchedule(
+    input: CreateDraftScheduleInput | CreateActiveScheduleInput,
+    status: "draft" | "active",
+  ): Promise<Schedule> {
     const now = this.nowIso();
     const schedule: Schedule = {
       id: this.idGenerator.nextId("schedule"),
       revision: 1,
-      status: "draft",
-      enabled: false,
+      status,
+      enabled: status === "active",
       runInstructions: input.runInstructions,
       cadence: input.cadence,
       targetContext: input.targetContext,
@@ -87,7 +100,13 @@ export class ScheduleLifecycle {
         completed: 0,
         limit: input.runCap?.maxRuns ?? null,
       },
-      nextRunAt: null,
+      nextRunAt:
+        status === "active"
+          ? nextRunAtAfter(
+              (input as CreateActiveScheduleInput).cadence,
+              this.clock.now(),
+            )
+          : null,
       lastRunAt: null,
       createdAt: now,
       updatedAt: now,
@@ -149,6 +168,56 @@ export class ScheduleLifecycle {
     return this.importSchedules(exportFile, options);
   }
 
+  async activateSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["draft"], "activated");
+    this.requireActivationRequirements(schedule);
+    const now = this.nowIso();
+    const activeSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(activeSchedule);
+    return activeSchedule;
+  }
+
+  async pauseSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["active"], "paused");
+    const now = this.nowIso();
+    const pausedSchedule: Schedule = {
+      ...schedule,
+      status: "paused",
+      enabled: false,
+      nextRunAt: null,
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(pausedSchedule);
+    return pausedSchedule;
+  }
+
+  async resumeSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["paused"], "resumed");
+    this.requireActivationRequirements(schedule);
+    const now = this.nowIso();
+    const resumedSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(resumedSchedule);
+    return resumedSchedule;
+  }
+
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
     const schedule = await this.requireSchedule(scheduleId);
     const previousRuns = await this.store.listRunHistory(scheduleId);
@@ -191,7 +260,53 @@ export class ScheduleLifecycle {
     trigger: RunTrigger,
   ): Promise<RunHistoryEntry> {
     const requestedAt = this.nowIso();
-    const harness = this.harnesses.get(schedule.harnessMode);
+    const missingRunRequirements = this.missingActivationRequirements(schedule);
+    if (missingRunRequirements.length > 0) {
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error: missingRunRequirements.join(" "),
+      });
+      await this.persistRunResult(schedule, blockedRun, trigger);
+      return blockedRun;
+    }
+
+    if (
+      trigger !== "draft-manual" &&
+      this.hasRunCounterReachedLimit(schedule.runCounter)
+    ) {
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error:
+          "Run cap has been reached. Restart the completed schedule before running again.",
+      });
+      await this.store.saveRunHistory(blockedRun);
+      await this.store.saveSchedule({
+        ...schedule,
+        status: "completed",
+        enabled: false,
+        nextRunAt: null,
+        lastRunAt: requestedAt,
+        updatedAt: requestedAt,
+      });
+      return blockedRun;
+    }
+
+    const harnessMode = schedule.harnessMode;
+    const harness = harnessMode ? this.harnesses.get(harnessMode) : undefined;
 
     if (!harness) {
       const blockedRun = this.buildRunHistoryEntry({
@@ -203,7 +318,9 @@ export class ScheduleLifecycle {
         resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
         externalRunId: null,
         summary: null,
-        error: `Harness mode '${schedule.harnessMode}' is unavailable.`,
+        error: harnessMode
+          ? `Harness mode '${harnessMode}' is unavailable.`
+          : "Harness mode is required before activation.",
       });
       await this.persistRunResult(schedule, blockedRun, trigger);
       return blockedRun;
@@ -296,17 +413,60 @@ export class ScheduleLifecycle {
 
     const completedAt = run.completedAt ?? run.startedAt;
     const nextRunCounter = { ...schedule.runCounter };
+    let nextStatus = schedule.status;
+    let nextEnabled = schedule.enabled;
+    let nextRunAt = schedule.nextRunAt;
 
     if (trigger !== "draft-manual" && run.status === "completed") {
       nextRunCounter.completed += 1;
     }
 
+    if (this.hasRunCounterReachedLimit(nextRunCounter)) {
+      nextStatus = "completed";
+      nextEnabled = false;
+      nextRunAt = null;
+    } else if (
+      trigger === "automatic" &&
+      run.status === "completed" &&
+      schedule.cadence
+    ) {
+      nextRunAt = nextRunAtAfter(schedule.cadence, new Date(completedAt));
+    }
+
     await this.store.saveSchedule({
       ...schedule,
+      status: nextStatus,
+      enabled: nextEnabled,
       runCounter: nextRunCounter,
+      nextRunAt,
       lastRunAt: completedAt,
       updatedAt: completedAt,
     });
+  }
+
+  private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {
+    return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
+  }
+
+  private requireScheduleStatus(
+    schedule: Schedule,
+    allowedStatuses: Schedule["status"][],
+    action: string,
+  ): void {
+    if (!allowedStatuses.includes(schedule.status)) {
+      throw new Error(
+        `Only ${formatScheduleStatuses(allowedStatuses)} schedules can be ${action}.`,
+      );
+    }
+  }
+
+  private requireActivationRequirements(
+    schedule: Schedule,
+  ): asserts schedule is ActivationReadySchedule {
+    const missingRequirements = this.missingActivationRequirements(schedule);
+    if (missingRequirements.length > 0) {
+      throw new Error(missingRequirements.join(" "));
+    }
   }
 
   private defaultPolicySnapshot(schedule: Schedule): ResolvedHarnessPolicy {
@@ -340,25 +500,46 @@ export class ScheduleLifecycle {
     const warnings: ScheduleImportWarning[] = [];
 
     for (const entry of entries) {
-      const workspaceAvailable =
-        entry.targetContext.uri.trim().length > 0 &&
-        (options.isWorkspaceAvailable
-          ? await options.isWorkspaceAvailable(entry.targetContext.uri)
-          : true);
+      const workspaceAvailable = entry.targetContext
+        ? entry.targetContext.uri.trim().length > 0 &&
+          (options.isWorkspaceAvailable
+            ? await options.isWorkspaceAvailable(entry.targetContext.uri)
+            : true)
+        : false;
 
       if (!workspaceAvailable) {
         warnings.push({
           sourceScheduleId: entry.sourceScheduleId,
           code: "missing-workspace",
-          message: `Workspace '${entry.targetContext.uri}' is not available on this machine.`,
+          message: entry.targetContext
+            ? `Workspace '${entry.targetContext.uri}' is not available on this machine.`
+            : "Target context is required before activation.",
         });
       }
 
-      if (!this.harnesses.has(entry.harnessMode)) {
+      if (!entry.harnessMode || !this.harnesses.has(entry.harnessMode)) {
         warnings.push({
           sourceScheduleId: entry.sourceScheduleId,
           code: "unavailable-harness-mode",
-          message: `Harness mode '${entry.harnessMode}' is unavailable.`,
+          message: entry.harnessMode
+            ? `Harness mode '${entry.harnessMode}' is unavailable.`
+            : "Harness mode is required before activation.",
+        });
+      }
+
+      if (entry.runInstructions.trim().length === 0) {
+        warnings.push({
+          sourceScheduleId: entry.sourceScheduleId,
+          code: "activation-blocker",
+          message: "Run instructions are required before activation.",
+        });
+      }
+
+      if (!entry.cadence) {
+        warnings.push({
+          sourceScheduleId: entry.sourceScheduleId,
+          code: "activation-blocker",
+          message: "Run cadence is required before activation.",
         });
       }
 
@@ -400,6 +581,23 @@ export class ScheduleLifecycle {
     };
   }
 
+  private missingActivationRequirements(schedule: Schedule): string[] {
+    const messages: string[] = [];
+    if (schedule.runInstructions.trim().length === 0) {
+      messages.push("Run instructions are required before activation.");
+    }
+    if (!schedule.cadence) {
+      messages.push("Run cadence is required before activation.");
+    }
+    if (!schedule.targetContext) {
+      messages.push("Target context is required before activation.");
+    }
+    if (!schedule.harnessMode) {
+      messages.push("Harness mode is required before activation.");
+    }
+    return messages;
+  }
+
   private async requireSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.store.getSchedule(scheduleId);
     if (!schedule) {
@@ -417,9 +615,9 @@ interface ParsedScheduleExportEntry {
   sourceScheduleId: string;
   revision: number;
   runInstructions: string;
-  cadence: RunCadence;
-  targetContext: TargetContext;
-  harnessMode: HarnessMode;
+  cadence: RunCadence | null;
+  targetContext: TargetContext | null;
+  harnessMode: HarnessMode | null;
   model: string;
   approvalMode: ApprovalMode;
   originalApprovalMode: string;
@@ -458,14 +656,24 @@ function parseScheduleExportEntry(
     sourceScheduleId: requireString(entry, "sourceScheduleId", path),
     revision: requirePositiveInteger(entry, "revision", path),
     runInstructions: requireString(entry, "runInstructions", path),
-    cadence: parseCadence(entry.cadence, `${path}.cadence`),
-    targetContext: parseTargetContext(entry.targetContext, `${path}.targetContext`),
-    harnessMode: parseHarnessMode(entry.harnessMode, `${path}.harnessMode`),
+    cadence: parseNullableCadence(entry.cadence, `${path}.cadence`),
+    targetContext: parseNullableTargetContext(
+      entry.targetContext,
+      `${path}.targetContext`,
+    ),
+    harnessMode: parseNullableHarnessMode(
+      entry.harnessMode,
+      `${path}.harnessMode`,
+    ),
     model: requireString(entry, "model", path),
     approvalMode: parseApprovalMode(originalApprovalMode),
     originalApprovalMode,
     runCap: parseRunCap(entry.runCap, `${path}.runCap`),
   };
+}
+
+function parseNullableCadence(value: unknown, path: string): RunCadence | null {
+  return value === null ? null : parseCadence(value, path);
 }
 
 function parseCadence(value: unknown, path: string): RunCadence {
@@ -480,6 +688,13 @@ function parseCadence(value: unknown, path: string): RunCadence {
     type,
     expression: requireString(cadence, "expression", path),
   };
+}
+
+function parseNullableTargetContext(
+  value: unknown,
+  path: string,
+): TargetContext | null {
+  return value === null ? null : parseTargetContext(value, path);
 }
 
 function parseTargetContext(value: unknown, path: string): TargetContext {
@@ -500,6 +715,13 @@ function parseTargetContext(value: unknown, path: string): TargetContext {
   }
 
   return parsed;
+}
+
+function parseNullableHarnessMode(
+  value: unknown,
+  path: string,
+): HarnessMode | null {
+  return value === null ? null : parseHarnessMode(value, path);
 }
 
 function parseHarnessMode(value: unknown, path: string): HarnessMode {
@@ -565,4 +787,14 @@ function requirePositiveInteger(
   }
 
   throw new Error(`${path}.${key} must be a positive integer.`);
+}
+
+type ActivationReadySchedule = Schedule & {
+  cadence: NonNullable<Schedule["cadence"]>;
+  targetContext: NonNullable<Schedule["targetContext"]>;
+  harnessMode: NonNullable<Schedule["harnessMode"]>;
+};
+
+function formatScheduleStatuses(statuses: Schedule["status"][]): string {
+  return statuses.join(" or ");
 }

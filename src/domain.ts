@@ -39,6 +39,16 @@ export interface RunCapInput {
 
 export interface CreateDraftScheduleInput {
   runInstructions: string;
+  cadence: RunCadence | null;
+  targetContext: TargetContext | null;
+  harnessMode: HarnessMode | null;
+  model: string;
+  approvalMode: ApprovalMode;
+  runCap?: RunCapInput;
+}
+
+export interface CreateActiveScheduleInput {
+  runInstructions: string;
   cadence: RunCadence;
   targetContext: TargetContext;
   harnessMode: HarnessMode;
@@ -53,9 +63,9 @@ export interface Schedule {
   status: ScheduleStatus;
   enabled: boolean;
   runInstructions: string;
-  cadence: RunCadence;
-  targetContext: TargetContext;
-  harnessMode: HarnessMode;
+  cadence: RunCadence | null;
+  targetContext: TargetContext | null;
+  harnessMode: HarnessMode | null;
   model: string;
   approvalMode: ApprovalMode;
   runCounter: RunCounter;
@@ -78,9 +88,9 @@ export interface RunHistoryEntry {
   runInstructionsSnapshot: string;
   approvalModeSnapshot: ApprovalMode;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
-  harnessMode: HarnessMode;
+  harnessMode: HarnessMode | null;
   model: string;
-  targetContext: TargetContext;
+  targetContext: TargetContext | null;
   externalRunId: string | null;
   summary: string | null;
   error: string | null;
@@ -94,9 +104,9 @@ export interface ScheduleSummary {
   lastRunAt: IsoTimestamp | null;
   runCounter: RunCounter;
   runInstructions: string;
-  cadence: RunCadence;
-  targetContext: TargetContext;
-  harnessMode: HarnessMode;
+  cadence: RunCadence | null;
+  targetContext: TargetContext | null;
+  harnessMode: HarnessMode | null;
   model: string;
   approvalMode: ApprovalMode;
 }
@@ -119,9 +129,9 @@ export interface ScheduleExportEntry {
   sourceScheduleId: string;
   revision: number;
   runInstructions: string;
-  cadence: RunCadence;
-  targetContext: TargetContext;
-  harnessMode: HarnessMode;
+  cadence: RunCadence | null;
+  targetContext: TargetContext | null;
+  harnessMode: HarnessMode | null;
   model: string;
   approvalMode: ApprovalMode;
   runCap: RunCapInput | null;
@@ -140,7 +150,8 @@ export interface ExportSchedulesInput {
 export type ScheduleImportWarningCode =
   | "missing-workspace"
   | "unavailable-harness-mode"
-  | "stale-policy-setting";
+  | "stale-policy-setting"
+  | "activation-blocker";
 
 export interface ScheduleImportWarning {
   sourceScheduleId: string;

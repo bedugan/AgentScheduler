@@ -86,6 +86,56 @@ describe("schedule import and export", () => {
     assert.equal(selectedJson.includes("Fake harness completed"), false);
   });
 
+  it("round-trips incomplete draft activation fields with import warnings", async () => {
+    const clock = new FakeClock("2026-07-07T20:30:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+
+    const draft = await lifecycle.createDraftSchedule({
+      runInstructions: "Review bug branches.",
+      cadence: null,
+      targetContext: null,
+      harnessMode: null,
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const exportFile = await lifecycle.exportSchedules({
+      scheduleIds: [draft.id],
+    });
+
+    assert.deepEqual(exportFile.schedules[0], {
+      sourceScheduleId: draft.id,
+      revision: 1,
+      runInstructions: "Review bug branches.",
+      cadence: null,
+      targetContext: null,
+      harnessMode: null,
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: null,
+    });
+
+    clock.set("2026-07-07T20:35:00.000Z");
+    const imported = await lifecycle.importSchedules(exportFile);
+
+    assert.equal(imported.schedules.length, 1);
+    assert.deepEqual(
+      imported.warnings.map((warning) => warning.code).sort(),
+      ["activation-blocker", "missing-workspace", "unavailable-harness-mode"],
+    );
+    assert.equal(imported.schedules[0]?.status, "paused");
+    assert.equal(imported.schedules[0]?.enabled, false);
+    assert.equal(imported.schedules[0]?.cadence, null);
+    assert.equal(imported.schedules[0]?.targetContext, null);
+    assert.equal(imported.schedules[0]?.harnessMode, null);
+    assert.equal(imported.schedules[0]?.nextRunAt, null);
+  });
+
   it("imports versioned schedules as paused and returns activation warnings", async () => {
     const clock = new FakeClock("2026-07-07T21:00:00.000Z");
     const lifecycle = new ScheduleLifecycle({

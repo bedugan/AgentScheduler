@@ -1,5 +1,6 @@
 export type {
   ApprovalMode,
+  CreateActiveScheduleInput,
   CreateDraftScheduleInput,
   DueWorkScanResult,
   ExportSchedulesInput,
@@ -40,3 +41,18 @@ export {
 } from "./scheduleLifecycle.js";
 export { EditorControlSurface } from "./editorControlSurface.js";
 export { SqliteScheduleStore } from "./sqliteScheduleStore.js";
+export type {
+  NaturalLanguageScheduleActivationProposal,
+  NaturalLanguageScheduleCreationChatParticipant,
+  NaturalLanguageScheduleCreationInput,
+  NaturalLanguageScheduleCreationOutcome,
+  NaturalLanguageScheduleCreationResult,
+  NaturalLanguageScheduleCreationSlashCommand,
+  NaturalLanguageScheduleCreationSource,
+  NaturalLanguageScheduleCreationTool,
+  VsCodeNaturalLanguageScheduleCreationOptions,
+} from "./vscodeNaturalLanguageScheduleCreation.js";
+export {
+  naturalLanguageScheduleCreationInputSchema,
+  VsCodeNaturalLanguageScheduleCreationFlow,
+} from "./vscodeNaturalLanguageScheduleCreation.js";

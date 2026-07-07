@@ -28,7 +28,7 @@ interface ScheduleRow {
   run_instructions: string;
   cadence_json: string;
   target_context_json: string;
-  harness_mode: HarnessMode;
+  harness_mode: HarnessMode | "";
   model: string;
   approval_mode: ApprovalMode;
   run_counter_json: string;
@@ -49,7 +49,7 @@ interface RunHistoryRow {
   run_instructions_snapshot: string;
   approval_mode_snapshot: ApprovalMode;
   resolved_harness_policy_json: string;
-  harness_mode: HarnessMode;
+  harness_mode: HarnessMode | "";
   model: string;
   target_context_json: string;
   external_run_id: string | null;
@@ -133,7 +133,7 @@ export class SqliteScheduleStore implements ScheduleStore {
         run_instructions: schedule.runInstructions,
         cadence_json: JSON.stringify(schedule.cadence),
         target_context_json: JSON.stringify(schedule.targetContext),
-        harness_mode: schedule.harnessMode,
+        harness_mode: schedule.harnessMode ?? "",
         model: schedule.model,
         approval_mode: schedule.approvalMode,
         run_counter_json: JSON.stringify(schedule.runCounter),
@@ -168,6 +168,9 @@ export class SqliteScheduleStore implements ScheduleStore {
         WHERE enabled = 1
           AND status = 'active'
           AND next_run_at IS NOT NULL
+          AND cadence_json <> 'null'
+          AND target_context_json <> 'null'
+          AND harness_mode <> ''
           AND next_run_at <= $now
         ORDER BY next_run_at ASC, id ASC
       `)
@@ -226,7 +229,7 @@ export class SqliteScheduleStore implements ScheduleStore {
         run_instructions_snapshot: entry.runInstructionsSnapshot,
         approval_mode_snapshot: entry.approvalModeSnapshot,
         resolved_harness_policy_json: JSON.stringify(entry.resolvedHarnessPolicy),
-        harness_mode: entry.harnessMode,
+        harness_mode: entry.harnessMode ?? "",
         model: entry.model,
         target_context_json: JSON.stringify(entry.targetContext),
         external_run_id: entry.externalRunId,
@@ -303,9 +306,9 @@ export class SqliteScheduleStore implements ScheduleStore {
       status: row.status,
       enabled: row.enabled === 1,
       runInstructions: row.run_instructions,
-      cadence: parseJson<RunCadence>(row.cadence_json),
-      targetContext: parseJson<TargetContext>(row.target_context_json),
-      harnessMode: row.harness_mode,
+      cadence: parseJson<RunCadence | null>(row.cadence_json),
+      targetContext: parseJson<TargetContext | null>(row.target_context_json),
+      harnessMode: row.harness_mode === "" ? null : row.harness_mode,
       model: row.model,
       approvalMode: row.approval_mode,
       runCounter: parseJson<RunCounter>(row.run_counter_json),
@@ -330,9 +333,9 @@ export class SqliteScheduleStore implements ScheduleStore {
       resolvedHarnessPolicy: parseJson<Record<string, unknown>>(
         row.resolved_harness_policy_json,
       ),
-      harnessMode: row.harness_mode,
+      harnessMode: row.harness_mode === "" ? null : row.harness_mode,
       model: row.model,
-      targetContext: parseJson<TargetContext>(row.target_context_json),
+      targetContext: parseJson<TargetContext | null>(row.target_context_json),
       externalRunId: row.external_run_id,
       summary: row.summary,
       error: row.error,
