@@ -74,6 +74,11 @@ describe("Schedule Detail view model", () => {
       runOutcomes: "quiet-in-app",
       desktopNotifications: "off",
     });
+    assert.deepEqual(detail.localScheduling, {
+      enabled: true,
+      automaticRuns: "active",
+      message: "Automatic runs are active because local scheduling setup is enabled.",
+    });
     assert.equal(detail.previousRuns.length, 1);
     assert.equal(detail.previousRuns[0]?.id, run.id);
     assert.deepEqual(detail.previousRuns[0]?.outcome, {
@@ -81,6 +86,7 @@ describe("Schedule Detail view model", () => {
       completedAt: "2026-07-07T16:10:00.000Z",
       summary: "Fake harness completed the draft run.",
       error: null,
+      description: "Fake harness completed the draft run.",
     });
     assert.deepEqual(detail.previousRuns[0]?.historyDetailLink, {
       runId: run.id,
@@ -292,6 +298,87 @@ describe("Schedule Detail view model", () => {
     assert.deepEqual(
       restartedDetail.previousRuns.map((run) => run.id),
       [completedRun.id],
+    );
+  });
+
+  it("surfaces disabled local scheduling plus blocked and approval-needed run descriptions", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    let preflightAttempt = 0;
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      preflightResult: () => {
+        preflightAttempt += 1;
+        return preflightAttempt === 1
+          ? {
+              status: "blocked",
+              reason:
+                "Default Approvals requires an approval surface for unattended Local Copilot Mode runs, but no approval surface is available.",
+              resolvedHarnessPolicy: {
+                harnessMode: "local-copilot",
+                approvalMode: "default-approvals",
+              },
+            }
+          : {
+              status: "requires-approval",
+              reason:
+                "Approval needed in VS Code before AgentScheduler can start this run.",
+              resolvedHarnessPolicy: {
+                harnessMode: "local-copilot",
+                approvalMode: "default-approvals",
+              },
+            };
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Run only when approvals and setup are clear.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    clock.set("2026-07-07T16:10:00.000Z");
+    const blockedRun = await editor.runScheduleNow(schedule.id);
+    clock.set("2026-07-07T16:20:00.000Z");
+    const approvalRun = await editor.runScheduleNow(schedule.id);
+
+    const detail = await editor.openScheduleDetail(schedule.id);
+    assert.deepEqual(detail.localScheduling, {
+      enabled: false,
+      automaticRuns: "inactive",
+      message:
+        "Automatic runs are inactive until local scheduling setup is enabled. Manual Run Now can still run from the editor when the harness is available.",
+    });
+    assert.equal(detail.previousRuns[0]?.id, approvalRun.id);
+    assert.equal(detail.previousRuns[0]?.outcome.status, "approval-waiting");
+    assert.equal(
+      detail.previousRuns[0]?.outcome.description,
+      "Approval needed: Approval needed in VS Code before AgentScheduler can start this run.",
+    );
+    assert.equal(detail.previousRuns[1]?.id, blockedRun.id);
+    assert.equal(detail.previousRuns[1]?.outcome.status, "blocked");
+    assert.equal(
+      detail.previousRuns[1]?.outcome.description,
+      "Blocked: Default Approvals requires an approval surface for unattended Local Copilot Mode runs, but no approval surface is available.",
+    );
+
+    const historyDetail = await editor.openRunHistoryDetail(blockedRun.id);
+    assert.equal(
+      historyDetail.outcome.description,
+      "Blocked: Default Approvals requires an approval surface for unattended Local Copilot Mode runs, but no approval surface is available.",
     );
   });
 });

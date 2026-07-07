@@ -156,19 +156,28 @@ export interface ScheduleDetailHistoryLink {
   view: "run-history-detail";
 }
 
+export interface RunOutcomeView {
+  status: RunStatus;
+  completedAt: IsoTimestamp | null;
+  summary: string | null;
+  error: string | null;
+  description: string;
+}
+
 export interface ScheduleDetailPreviousRun extends RunHistoryEntry {
-  outcome: {
-    status: RunStatus;
-    completedAt: IsoTimestamp | null;
-    summary: string | null;
-    error: string | null;
-  };
+  outcome: RunOutcomeView;
   historyDetailLink: ScheduleDetailHistoryLink;
 }
 
 export interface ScheduleDetailNotificationState {
   runOutcomes: "quiet-in-app";
   desktopNotifications: "off";
+}
+
+export interface ScheduleDetailLocalSchedulingState {
+  enabled: boolean;
+  automaticRuns: "active" | "inactive";
+  message: string;
 }
 
 export interface ResolveActiveRunInput {
@@ -203,6 +212,7 @@ export interface ScheduleDetailView {
   nextRunAt: IsoTimestamp | null;
   lastRunAt: IsoTimestamp | null;
   notificationState: ScheduleDetailNotificationState;
+  localScheduling: ScheduleDetailLocalSchedulingState;
 }
 
 export interface RunHistoryDetailView {
@@ -212,12 +222,7 @@ export interface RunHistoryDetailView {
   resolvedRunInstructions: string;
   approvalMode: ApprovalMode;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
-  outcome: {
-    status: RunStatus;
-    completedAt: IsoTimestamp | null;
-    summary: string | null;
-    error: string | null;
-  };
+  outcome: RunOutcomeView;
 }
 
 export interface UpdateScheduleInput {
@@ -230,8 +235,32 @@ export interface UpdateScheduleInput {
   runCap?: RunCapInput | null;
 }
 
+export interface DueWorkScanDiagnostics {
+  scannedAt: IsoTimestamp;
+  localScheduling: {
+    enabled: boolean;
+    message: string;
+  };
+  wakeupProvider: {
+    configured: boolean;
+    platform: "windows" | "macos" | null;
+    triggerId: string | null;
+    status: "installed" | "not-installed" | "unknown";
+  };
+  dueScheduleCount: number;
+  outcomes: {
+    started: number;
+    completed: number;
+    blocked: number;
+    deferred: number;
+    approvalWaiting: number;
+    failed: number;
+  };
+}
+
 export interface DueWorkScanResult {
   startedRunIds: string[];
+  diagnostics: DueWorkScanDiagnostics;
 }
 
 export const SCHEDULE_EXPORT_SCHEMA_VERSION = 1;
