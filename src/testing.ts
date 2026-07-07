@@ -9,10 +9,16 @@ import type {
 import { isActiveRunStatus } from "./domain.js";
 import type {
   AgentHarness,
+  HarnessCancelRequest,
+  HarnessCancelResult,
+  HarnessOpenRequest,
+  HarnessOpenResult,
   HarnessPreflightRequest,
   HarnessPreflightResult,
   HarnessStartRequest,
   HarnessStartResult,
+  HarnessStatusRequest,
+  HarnessStatusResult,
 } from "./harness.js";
 import {
   defaultLocalSchedulingSetupState,
@@ -155,24 +161,48 @@ export class InMemoryLocalSchedulingSetupStore
   }
 }
 
+type FakeHarnessStatusResult =
+  | HarnessStatusResult
+  | ((request: HarnessStatusRequest) => HarnessStatusResult);
+
+type FakeHarnessCancelResult =
+  | HarnessCancelResult
+  | ((request: HarnessCancelRequest) => HarnessCancelResult);
+
+type FakeHarnessOpenResult =
+  | HarnessOpenResult
+  | ((request: HarnessOpenRequest) => HarnessOpenResult);
+
 export class FakeHarness implements AgentHarness {
   readonly mode: HarnessMode;
   readonly preflightRequests: HarnessPreflightRequest[] = [];
   readonly startRequests: HarnessStartRequest[] = [];
+  readonly statusRequests: HarnessStatusRequest[] = [];
+  readonly cancelRequests: HarnessCancelRequest[] = [];
+  readonly openRequests: HarnessOpenRequest[] = [];
   private readonly policyOverride: ResolvedHarnessPolicy | null;
   private readonly preflightResult: FakeHarnessPreflightResult | null;
   private readonly startResult: FakeHarnessStartResult | null;
+  private readonly statusResult: FakeHarnessStatusResult | null;
+  private readonly cancelResult: FakeHarnessCancelResult | null;
+  private readonly openResult: FakeHarnessOpenResult | null;
 
   constructor(options: {
     mode: HarnessMode;
     resolvedPolicy?: ResolvedHarnessPolicy;
     preflightResult?: FakeHarnessPreflightResult;
     startResult?: FakeHarnessStartResult;
+    statusResult?: FakeHarnessStatusResult;
+    cancelResult?: FakeHarnessCancelResult;
+    openResult?: FakeHarnessOpenResult;
   }) {
     this.mode = options.mode;
     this.policyOverride = options.resolvedPolicy ?? null;
     this.preflightResult = options.preflightResult ?? null;
     this.startResult = options.startResult ?? null;
+    this.statusResult = options.statusResult ?? null;
+    this.cancelResult = options.cancelResult ?? null;
+    this.openResult = options.openResult ?? null;
   }
 
   async preflight(
@@ -205,6 +235,52 @@ export class FakeHarness implements AgentHarness {
       status: "completed",
       completedAt: request.requestedAt,
       summary: "Fake harness completed the draft run.",
+    };
+  }
+
+  async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {
+    this.statusRequests.push(cloneStoreValue(request));
+    if (this.statusResult) {
+      return typeof this.statusResult === "function"
+        ? cloneStoreValue(this.statusResult(request))
+        : cloneStoreValue(this.statusResult);
+    }
+
+    return {
+      status: "completed",
+      completedAt: request.requestedAt,
+      summary: "Fake harness reported the run completed.",
+      error: null,
+    };
+  }
+
+  async cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult> {
+    this.cancelRequests.push(cloneStoreValue(request));
+    if (this.cancelResult) {
+      return typeof this.cancelResult === "function"
+        ? cloneStoreValue(this.cancelResult(request))
+        : cloneStoreValue(this.cancelResult);
+    }
+
+    return {
+      status: "canceled",
+      completedAt: request.requestedAt,
+      summary: "Fake harness canceled the run.",
+      error: null,
+    };
+  }
+
+  async open(request: HarnessOpenRequest): Promise<HarnessOpenResult> {
+    this.openRequests.push(cloneStoreValue(request));
+    if (this.openResult) {
+      return typeof this.openResult === "function"
+        ? cloneStoreValue(this.openResult(request))
+        : cloneStoreValue(this.openResult);
+    }
+
+    return {
+      status: "opened",
+      target: `fake://${this.mode}/${request.externalRunId}/${request.purpose}`,
     };
   }
 

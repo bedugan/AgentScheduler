@@ -27,11 +27,31 @@ export type {
 export { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
 export type {
   AgentHarness,
+  HarnessCancelRequest,
+  HarnessCancelResult,
+  HarnessOpenPurpose,
+  HarnessOpenRequest,
+  HarnessOpenResult,
   HarnessPreflightRequest,
   HarnessPreflightResult,
   HarnessStartRequest,
   HarnessStartResult,
+  HarnessStatusRequest,
+  HarnessStatusResult,
 } from "./harness.js";
+export type {
+  CopilotLocalClient,
+  CopilotLocalClientAvailability,
+  CopilotLocalHarnessOptions,
+  CopilotLocalResolvedHarnessPolicy,
+  CopilotLocalStartRequest,
+  ResolveCopilotLocalHarnessPolicyInput,
+} from "./copilotHarness.js";
+export {
+  COPILOT_APPROVAL_MODE_LABELS,
+  CopilotLocalHarness,
+  resolveCopilotLocalHarnessPolicy,
+} from "./copilotHarness.js";
 export type { ScheduleStore } from "./store.js";
 export {
   RandomIdGenerator,

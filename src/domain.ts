@@ -16,6 +16,7 @@ export type RunStatus =
   | "approval-waiting"
   | "completed"
   | "failed"
+  | "canceled"
   | "blocked"
   | "deferred";
 
