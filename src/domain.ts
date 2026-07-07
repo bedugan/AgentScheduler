@@ -108,6 +108,69 @@ export interface RunHistoryEntry {
   error: string | null;
 }
 
+export interface ScheduleDetailRunCounterView extends RunCounter {
+  label: string;
+}
+
+export interface ScheduleDetailRunInstructionsView {
+  value: string;
+  editable: true;
+  scheduleRevision: number;
+}
+
+export interface ScheduleDetailOverview {
+  status: ScheduleStatus;
+  enabled: boolean;
+  nextRunAt: IsoTimestamp | null;
+  lastRunAt: IsoTimestamp | null;
+  targetContext: TargetContext | null;
+  cadence: RunCadence | null;
+  harnessMode: HarnessMode | null;
+  model: string;
+  approvalMode: ApprovalMode;
+  runCounter: ScheduleDetailRunCounterView;
+}
+
+export type ScheduleDetailActionKind =
+  | "run-now"
+  | "pause"
+  | "resume"
+  | "restart";
+
+export interface ScheduleDetailAction {
+  kind: ScheduleDetailActionKind;
+  label: string;
+  enabled: boolean;
+  disabledReason?: string;
+}
+
+export interface ScheduleDetailActions {
+  runNow: ScheduleDetailAction;
+  pause: ScheduleDetailAction;
+  resume: ScheduleDetailAction;
+  restart: ScheduleDetailAction;
+}
+
+export interface ScheduleDetailHistoryLink {
+  runId: string;
+  view: "run-history-detail";
+}
+
+export interface ScheduleDetailPreviousRun extends RunHistoryEntry {
+  outcome: {
+    status: RunStatus;
+    completedAt: IsoTimestamp | null;
+    summary: string | null;
+    error: string | null;
+  };
+  historyDetailLink: ScheduleDetailHistoryLink;
+}
+
+export interface ScheduleDetailNotificationState {
+  runOutcomes: "quiet-in-app";
+  desktopNotifications: "off";
+}
+
 export interface ResolveActiveRunInput {
   status: Extract<RunStatus, "completed" | "failed">;
   completedAt?: IsoTimestamp;
@@ -132,10 +195,39 @@ export interface ScheduleSummary {
 
 export interface ScheduleDetailView {
   schedule: Schedule;
-  previousRuns: RunHistoryEntry[];
+  runInstructions: ScheduleDetailRunInstructionsView;
+  overview: ScheduleDetailOverview;
+  actions: ScheduleDetailActions;
+  previousRuns: ScheduleDetailPreviousRun[];
   runCounter: RunCounter;
   nextRunAt: IsoTimestamp | null;
   lastRunAt: IsoTimestamp | null;
+  notificationState: ScheduleDetailNotificationState;
+}
+
+export interface RunHistoryDetailView {
+  run: RunHistoryEntry;
+  scheduleId: string;
+  scheduleRevision: number;
+  resolvedRunInstructions: string;
+  approvalMode: ApprovalMode;
+  resolvedHarnessPolicy: ResolvedHarnessPolicy;
+  outcome: {
+    status: RunStatus;
+    completedAt: IsoTimestamp | null;
+    summary: string | null;
+    error: string | null;
+  };
+}
+
+export interface UpdateScheduleInput {
+  runInstructions?: string;
+  cadence?: RunCadence | null;
+  targetContext?: TargetContext | null;
+  harnessMode?: HarnessMode | null;
+  model?: string;
+  approvalMode?: ApprovalMode;
+  runCap?: RunCapInput | null;
 }
 
 export interface DueWorkScanResult {
