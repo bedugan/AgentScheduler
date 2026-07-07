@@ -6,7 +6,12 @@ export interface ScheduleStore {
   listSchedules(): Promise<Schedule[]>;
   listDueSchedules(now: IsoTimestamp): Promise<Schedule[]>;
   saveRunHistory(entry: RunHistoryEntry): Promise<void>;
+  getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined>;
   listRunHistory(scheduleId: string): Promise<RunHistoryEntry[]>;
+  listActiveRuns(): Promise<RunHistoryEntry[]>;
+  getPendingDeferredRun(
+    scheduleId: string,
+  ): Promise<RunHistoryEntry | undefined>;
 }
 
 export function cloneStoreValue<T>(value: T): T {

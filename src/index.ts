@@ -7,6 +7,7 @@ export type {
   HarnessMode,
   ImportSchedulesOptions,
   ResolvedHarnessPolicy,
+  ResolveActiveRunInput,
   RunCadence,
   RunCounter,
   RunHistoryEntry,

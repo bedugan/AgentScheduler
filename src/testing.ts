@@ -6,6 +6,7 @@ import type {
   RunHistoryEntry,
   Schedule,
 } from "./domain.js";
+import { isActiveRunStatus } from "./domain.js";
 import type {
   AgentHarness,
   HarnessPreflightRequest,
@@ -77,8 +78,26 @@ export class InMemoryScheduleStore implements ScheduleStore {
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
     const entries = this.runHistory.get(entry.scheduleId) ?? [];
-    entries.push(cloneStoreValue(entry));
+    const existingIndex = entries.findIndex(
+      (existingEntry) => existingEntry.id === entry.id,
+    );
+    if (existingIndex === -1) {
+      entries.push(cloneStoreValue(entry));
+    } else {
+      entries[existingIndex] = cloneStoreValue(entry);
+    }
     this.runHistory.set(entry.scheduleId, entries);
+  }
+
+  async getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined> {
+    for (const entries of this.runHistory.values()) {
+      const entry = entries.find((candidate) => candidate.id === id);
+      if (entry) {
+        return cloneStoreValue(entry);
+      }
+    }
+
+    return undefined;
   }
 
   async listRunHistory(scheduleId: string): Promise<RunHistoryEntry[]> {
@@ -86,26 +105,65 @@ export class InMemoryScheduleStore implements ScheduleStore {
       .map((entry) => cloneStoreValue(entry))
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
   }
+
+  async listActiveRuns(): Promise<RunHistoryEntry[]> {
+    return [...this.runHistory.values()]
+      .flat()
+      .filter(
+        (entry) => isActiveRunStatus(entry.status) && entry.completedAt === null,
+      )
+      .map((entry) => cloneStoreValue(entry));
+  }
+
+  async getPendingDeferredRun(
+    scheduleId: string,
+  ): Promise<RunHistoryEntry | undefined> {
+    const entry = (this.runHistory.get(scheduleId) ?? []).find(
+      (candidate) =>
+        candidate.status === "deferred" && candidate.completedAt === null,
+    );
+    return entry ? cloneStoreValue(entry) : undefined;
+  }
 }
+
+type FakeHarnessPreflightResult =
+  | HarnessPreflightResult
+  | ((request: HarnessPreflightRequest) => HarnessPreflightResult);
+
+type FakeHarnessStartResult =
+  | HarnessStartResult
+  | ((request: HarnessStartRequest) => HarnessStartResult);
 
 export class FakeHarness implements AgentHarness {
   readonly mode: HarnessMode;
   readonly preflightRequests: HarnessPreflightRequest[] = [];
   readonly startRequests: HarnessStartRequest[] = [];
   private readonly policyOverride: ResolvedHarnessPolicy | null;
+  private readonly preflightResult: FakeHarnessPreflightResult | null;
+  private readonly startResult: FakeHarnessStartResult | null;
 
   constructor(options: {
     mode: HarnessMode;
     resolvedPolicy?: ResolvedHarnessPolicy;
+    preflightResult?: FakeHarnessPreflightResult;
+    startResult?: FakeHarnessStartResult;
   }) {
     this.mode = options.mode;
     this.policyOverride = options.resolvedPolicy ?? null;
+    this.preflightResult = options.preflightResult ?? null;
+    this.startResult = options.startResult ?? null;
   }
 
   async preflight(
     request: HarnessPreflightRequest,
   ): Promise<HarnessPreflightResult> {
     this.preflightRequests.push(cloneStoreValue(request));
+    if (this.preflightResult) {
+      return typeof this.preflightResult === "function"
+        ? cloneStoreValue(this.preflightResult(request))
+        : cloneStoreValue(this.preflightResult);
+    }
+
     return {
       status: "ready",
       resolvedHarnessPolicy:
@@ -115,6 +173,12 @@ export class FakeHarness implements AgentHarness {
 
   async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
     this.startRequests.push(cloneStoreValue(request));
+    if (this.startResult) {
+      return typeof this.startResult === "function"
+        ? cloneStoreValue(this.startResult(request))
+        : cloneStoreValue(this.startResult);
+    }
+
     return {
       externalRunId: `fake-run-${this.startRequests.length}`,
       status: "completed",

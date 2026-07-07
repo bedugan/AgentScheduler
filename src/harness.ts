@@ -23,6 +23,16 @@ export type HarnessPreflightResult =
       status: "blocked";
       reason: string;
       resolvedHarnessPolicy?: ResolvedHarnessPolicy;
+    }
+  | {
+      status: "requires-approval";
+      reason: string;
+      resolvedHarnessPolicy: ResolvedHarnessPolicy;
+    }
+  | {
+      status: "deferred";
+      reason: string;
+      resolvedHarnessPolicy?: ResolvedHarnessPolicy;
     };
 
 export interface HarnessStartRequest {
@@ -35,7 +45,7 @@ export interface HarnessStartRequest {
 
 export interface HarnessStartResult {
   externalRunId: string;
-  status: Exclude<RunStatus, "blocked">;
+  status: Exclude<RunStatus, "blocked" | "deferred">;
   completedAt: IsoTimestamp | null;
   summary: string | null;
 }
