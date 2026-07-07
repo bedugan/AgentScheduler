@@ -406,6 +406,53 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual(detail.runCounter, { completed: 1, limit: 1 });
   });
 
+  it("rejects lifecycle transitions that would silently restart completed schedules", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Complete before invalid transitions are attempted.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 1 },
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T16:10:00.000Z");
+    await lifecycle.startManualRun(schedule.id);
+
+    await assert.rejects(
+      () => lifecycle.resumeSchedule(schedule.id),
+      /Only paused schedules can be resumed./,
+    );
+    await assert.rejects(
+      () => lifecycle.activateSchedule(schedule.id),
+      /Only draft schedules can be activated./,
+    );
+    await assert.rejects(
+      () => lifecycle.pauseSchedule(schedule.id),
+      /Only active schedules can be paused./,
+    );
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.schedule.status, "completed");
+    assert.equal(detail.schedule.enabled, false);
+    assert.deepEqual(detail.runCounter, { completed: 1, limit: 1 });
+    assert.equal(detail.nextRunAt, null);
+  });
+
   it("resumes paused schedules from the resume time without replaying missed intervals", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const fakeHarness = new FakeHarness({ mode: "local-copilot" });
@@ -435,6 +482,11 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.equal(pausedSchedule.status, "paused");
     assert.equal(pausedSchedule.enabled, false);
     assert.equal(pausedSchedule.nextRunAt, null);
+
+    await assert.rejects(
+      () => lifecycle.activateSchedule(schedule.id),
+      /Only draft schedules can be activated./,
+    );
 
     clock.set("2026-07-07T18:10:00.000Z");
     const resumedSchedule = await lifecycle.resumeSchedule(schedule.id);

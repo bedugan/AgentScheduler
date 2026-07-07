@@ -92,6 +92,7 @@ export class ScheduleLifecycle {
 
   async activateSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["draft"], "activated");
     const now = this.nowIso();
     const activeSchedule: Schedule = {
       ...schedule,
@@ -107,6 +108,7 @@ export class ScheduleLifecycle {
 
   async pauseSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["active"], "paused");
     const now = this.nowIso();
     const pausedSchedule: Schedule = {
       ...schedule,
@@ -122,6 +124,7 @@ export class ScheduleLifecycle {
 
   async resumeSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["paused"], "resumed");
     const now = this.nowIso();
     const resumedSchedule: Schedule = {
       ...schedule,
@@ -342,6 +345,18 @@ export class ScheduleLifecycle {
     return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
   }
 
+  private requireScheduleStatus(
+    schedule: Schedule,
+    allowedStatuses: Schedule["status"][],
+    action: string,
+  ): void {
+    if (!allowedStatuses.includes(schedule.status)) {
+      throw new Error(
+        `Only ${formatScheduleStatuses(allowedStatuses)} schedules can be ${action}.`,
+      );
+    }
+  }
+
   private defaultPolicySnapshot(schedule: Schedule): ResolvedHarnessPolicy {
     return {
       harnessMode: schedule.harnessMode,
@@ -360,4 +375,8 @@ export class ScheduleLifecycle {
   private nowIso(): IsoTimestamp {
     return this.clock.now().toISOString();
   }
+}
+
+function formatScheduleStatuses(statuses: Schedule["status"][]): string {
+  return statuses.join(" or ");
 }
