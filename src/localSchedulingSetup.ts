@@ -84,6 +84,7 @@ export interface LocalSchedulingSetupStore {
 
 export interface LocalSchedulingStateSource {
   isLocalSchedulingEnabled(): Promise<boolean>;
+  getLocalSchedulingSetupState?(): Promise<LocalSchedulingSetupState>;
 }
 
 export interface LocalSchedulingSetupOptions {
@@ -168,6 +169,10 @@ export class LocalSchedulingSetup implements LocalSchedulingStateSource {
 
   async isLocalSchedulingEnabled(): Promise<boolean> {
     return (await this.store.getLocalSchedulingSetup()).enabled;
+  }
+
+  async getLocalSchedulingSetupState(): Promise<LocalSchedulingSetupState> {
+    return this.store.getLocalSchedulingSetup();
   }
 
   private nowIso(): IsoTimestamp {

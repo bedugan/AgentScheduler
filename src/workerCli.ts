@@ -334,6 +334,8 @@ async function runScanDueWorkCommand(
       localSchedulingSetup: {
         isLocalSchedulingEnabled: async () =>
           (await store.getLocalSchedulingSetup()).enabled,
+        getLocalSchedulingSetupState: async () =>
+          store.getLocalSchedulingSetup(),
       },
     });
     const result = await lifecycle.scanDueWork();

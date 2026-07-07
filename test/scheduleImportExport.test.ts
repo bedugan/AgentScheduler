@@ -183,6 +183,10 @@ describe("schedule import and export", () => {
         "unavailable-harness-mode",
       ],
     );
+    assert.deepEqual(
+      result.warnings.map((warning) => warning.message.startsWith("Blocked:")),
+      [true, true, true],
+    );
     assert.equal(result.warnings[0]?.sourceScheduleId, "source_schedule_1");
 
     const imported = result.schedules[0];

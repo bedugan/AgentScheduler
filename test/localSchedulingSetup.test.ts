@@ -176,7 +176,31 @@ describe("local scheduling setup", () => {
     assert.equal(provider.installRequests.length, 0);
 
     clock.set("2026-07-07T17:00:00.000Z");
-    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    const disabledScan = await lifecycle.scanDueWork();
+    assert.deepEqual(disabledScan.startedRunIds, []);
+    assert.deepEqual(disabledScan.diagnostics, {
+      scannedAt: "2026-07-07T17:00:00.000Z",
+      localScheduling: {
+        enabled: false,
+        message:
+          "Automatic runs are inactive until local scheduling setup is enabled.",
+      },
+      wakeupProvider: {
+        configured: false,
+        platform: null,
+        triggerId: null,
+        status: "not-installed",
+      },
+      dueScheduleCount: 0,
+      outcomes: {
+        started: 0,
+        completed: 0,
+        blocked: 0,
+        deferred: 0,
+        approvalWaiting: 0,
+        failed: 0,
+      },
+    });
     assert.equal(fakeHarness.startRequests.length, 0);
     assert.equal(provider.installRequests.length, 0);
 
@@ -277,12 +301,69 @@ describe("local scheduling setup", () => {
     assert.equal(fakeHarness.startRequests.length, 0);
 
     await editor.enableLocalScheduling();
-    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_2"]);
+    const enabledScan = await lifecycle.scanDueWork();
+    assert.deepEqual(enabledScan.startedRunIds, ["run_2"]);
+    assert.deepEqual(enabledScan.diagnostics.localScheduling, {
+      enabled: true,
+      message: "Automatic runs are active because local scheduling setup is enabled.",
+    });
+    assert.deepEqual(enabledScan.diagnostics.wakeupProvider, {
+      configured: true,
+      platform: "windows",
+      triggerId: "AgentSchedulerLocalWakeup",
+      status: "installed",
+    });
+    assert.equal(enabledScan.diagnostics.dueScheduleCount, 1);
+    assert.deepEqual(enabledScan.diagnostics.outcomes, {
+      started: 1,
+      completed: 1,
+      blocked: 0,
+      deferred: 0,
+      approvalWaiting: 0,
+      failed: 0,
+    });
     assert.equal(fakeHarness.preflightRequests[0]?.localSchedulingEnabled, true);
     assert.equal(fakeHarness.startRequests.length, 1);
 
     const detail = await lifecycle.openScheduleDetail(schedule.id);
     assert.equal(detail.lastRunAt, "2026-07-07T17:00:00.000Z");
+  });
+
+  it("honors lightweight local scheduling state sources in worker scans", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const fakeHarness = new FakeHarness({ mode: "local-copilot" });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingSetup: {
+        isLocalSchedulingEnabled: async () => true,
+      },
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+
+    await lifecycle.createActiveSchedule({
+      runInstructions: "Run from a lightweight setup source.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    const scan = await lifecycle.scanDueWork();
+
+    assert.deepEqual(scan.startedRunIds, ["run_2"]);
+    assert.deepEqual(scan.diagnostics.wakeupProvider, {
+      configured: false,
+      platform: null,
+      triggerId: null,
+      status: "unknown",
+    });
   });
 
   it("persists local scheduling setup state in the SQLite local store", async () => {
@@ -454,8 +535,30 @@ describe("local scheduling setup", () => {
       );
 
       assert.equal(stderr.length, 0);
-      const scan = JSON.parse(stdout[0] ?? "{}") as { startedRunIds: string[] };
+      const scan = JSON.parse(stdout[0] ?? "{}") as {
+        startedRunIds: string[];
+        diagnostics: {
+          localScheduling: { enabled: boolean };
+          wakeupProvider: {
+            configured: boolean;
+            platform: string | null;
+            triggerId: string | null;
+            status: string;
+          };
+          dueScheduleCount: number;
+          outcomes: { blocked: number };
+        };
+      };
       assert.deepEqual(scan.startedRunIds, []);
+      assert.equal(scan.diagnostics.localScheduling.enabled, true);
+      assert.deepEqual(scan.diagnostics.wakeupProvider, {
+        configured: true,
+        platform: "windows",
+        triggerId: "AgentSchedulerLocalWakeup",
+        status: "installed",
+      });
+      assert.equal(scan.diagnostics.dueScheduleCount, 1);
+      assert.equal(scan.diagnostics.outcomes.blocked, 1);
 
       const reopenedStore = new SqliteScheduleStore({ databasePath });
       const history = await reopenedStore.listRunHistory("schedule_due_from_cli");

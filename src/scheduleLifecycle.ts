@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type {
   ApprovalMode,
+  DueWorkScanDiagnostics,
   CreateActiveScheduleInput,
   CreateDraftScheduleInput,
   DueWorkScanResult,
@@ -15,6 +16,7 @@ import type {
   RunCapInput,
   RunHistoryEntry,
   RunHistoryDetailView,
+  RunOutcomeView,
   RunTrigger,
   Schedule,
   ScheduleExportEntry,
@@ -39,7 +41,11 @@ import type {
   HarnessOpenResult,
   HarnessStatusResult,
 } from "./harness.js";
-import type { LocalSchedulingStateSource } from "./localSchedulingSetup.js";
+import type {
+  LocalSchedulingSetupState,
+  LocalSchedulingStateSource,
+} from "./localSchedulingSetup.js";
+import { defaultLocalSchedulingSetupState } from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
 
 export interface Clock {
@@ -303,8 +309,13 @@ export class ScheduleLifecycle {
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
     const schedule = await this.requireSchedule(scheduleId);
     const previousRuns = await this.store.listRunHistory(scheduleId);
+    const localSchedulingEnabled = await this.isLocalSchedulingEnabled();
 
-    return this.scheduleDetailViewFor(schedule, previousRuns);
+    return this.scheduleDetailViewFor(
+      schedule,
+      previousRuns,
+      localSchedulingEnabled,
+    );
   }
 
   async openRunHistoryDetail(runId: string): Promise<RunHistoryDetailView> {
@@ -317,18 +328,14 @@ export class ScheduleLifecycle {
       resolvedRunInstructions: run.runInstructionsSnapshot,
       approvalMode: run.approvalModeSnapshot,
       resolvedHarnessPolicy: run.resolvedHarnessPolicy,
-      outcome: {
-        status: run.status,
-        completedAt: run.completedAt,
-        summary: run.summary,
-        error: run.error,
-      },
+      outcome: this.runOutcomeViewFor(run),
     };
   }
 
   private scheduleDetailViewFor(
     schedule: Schedule,
     previousRuns: RunHistoryEntry[],
+    localSchedulingEnabled: boolean,
   ): ScheduleDetailView {
     return {
       schedule,
@@ -358,25 +365,48 @@ export class ScheduleLifecycle {
         runOutcomes: "quiet-in-app",
         desktopNotifications: "off",
       },
+      localScheduling: this.localSchedulingViewFor(localSchedulingEnabled),
     };
   }
 
   async scanDueWork(): Promise<DueWorkScanResult> {
-    if (!(await this.isLocalSchedulingEnabled())) {
-      return { startedRunIds: [] };
+    const scannedAt = this.nowIso();
+    const localSchedulingState = await this.getLocalSchedulingSetupState();
+    if (!localSchedulingState.enabled) {
+      return {
+        startedRunIds: [],
+        diagnostics: this.dueWorkScanDiagnosticsFor({
+          scannedAt,
+          localSchedulingEnabled: false,
+          localSchedulingState,
+          dueScheduleCount: 0,
+          runs: [],
+        }),
+      };
     }
 
-    const dueSchedules = await this.store.listDueSchedules(this.nowIso());
+    const dueSchedules = await this.store.listDueSchedules(scannedAt);
     const startedRunIds: string[] = [];
+    const runs: RunHistoryEntry[] = [];
 
     for (const schedule of dueSchedules) {
       const run = await this.startRun(schedule, "automatic");
+      runs.push(run);
       if (isStartedRunStatus(run.status)) {
         startedRunIds.push(run.id);
       }
     }
 
-    return { startedRunIds };
+    return {
+      startedRunIds,
+      diagnostics: this.dueWorkScanDiagnosticsFor({
+        scannedAt,
+        localSchedulingEnabled: true,
+        localSchedulingState,
+        dueScheduleCount: dueSchedules.length,
+        runs,
+      }),
+    };
   }
 
   async startManualRun(scheduleId: string): Promise<RunHistoryEntry> {
@@ -961,16 +991,54 @@ export class ScheduleLifecycle {
   ): ScheduleDetailPreviousRun {
     return {
       ...run,
-      outcome: {
-        status: run.status,
-        completedAt: run.completedAt,
-        summary: run.summary,
-        error: run.error,
-      },
+      outcome: this.runOutcomeViewFor(run),
       historyDetailLink: {
         runId: run.id,
         view: "run-history-detail",
       },
+    };
+  }
+
+  private runOutcomeViewFor(run: RunHistoryEntry): RunOutcomeView {
+    return {
+      status: run.status,
+      completedAt: run.completedAt,
+      summary: run.summary,
+      error: run.error,
+      description: this.runOutcomeDescriptionFor(run),
+    };
+  }
+
+  private runOutcomeDescriptionFor(run: RunHistoryEntry): string {
+    const detail = run.error ?? run.summary;
+
+    switch (run.status) {
+      case "blocked":
+        return `Blocked: ${detail ?? "AgentScheduler blocked this run before it started."}`;
+      case "approval-waiting":
+        return `Approval needed: ${detail ?? "Open the approval surface to continue this run."}`;
+      case "deferred":
+        return `Deferred: ${detail ?? "AgentScheduler deferred this run and will coalesce catch-up work."}`;
+      case "failed":
+        return `Failed: ${detail ?? "The harness reported that this run failed."}`;
+      case "completed":
+        return detail ?? "Run completed.";
+      case "running":
+        return detail ?? "Run is running.";
+      case "canceled":
+        return detail ?? "Run was canceled.";
+    }
+  }
+
+  private localSchedulingViewFor(
+    enabled: boolean,
+  ): ScheduleDetailView["localScheduling"] {
+    return {
+      enabled,
+      automaticRuns: enabled ? "active" : "inactive",
+      message: enabled
+        ? "Automatic runs are active because local scheduling setup is enabled."
+        : "Automatic runs are inactive until local scheduling setup is enabled. Manual Run Now can still run from the editor when the harness is available.",
     };
   }
 
@@ -1038,8 +1106,8 @@ export class ScheduleLifecycle {
           sourceScheduleId: entry.sourceScheduleId,
           code: "missing-workspace",
           message: entry.targetContext
-            ? `Workspace '${entry.targetContext.uri}' is not available on this machine.`
-            : "Target context is required before activation.",
+            ? `Blocked: Workspace '${entry.targetContext.uri}' is not available on this machine.`
+            : "Blocked: Target context is required before activation.",
         });
       }
 
@@ -1048,8 +1116,8 @@ export class ScheduleLifecycle {
           sourceScheduleId: entry.sourceScheduleId,
           code: "unavailable-harness-mode",
           message: entry.harnessMode
-            ? `Harness mode '${entry.harnessMode}' is unavailable.`
-            : "Harness mode is required before activation.",
+            ? `Blocked: Harness mode '${entry.harnessMode}' is unavailable.`
+            : "Blocked: Harness mode is required before activation.",
         });
       }
 
@@ -1057,7 +1125,7 @@ export class ScheduleLifecycle {
         warnings.push({
           sourceScheduleId: entry.sourceScheduleId,
           code: "activation-blocker",
-          message: "Run instructions are required before activation.",
+          message: "Blocked: Run instructions are required before activation.",
         });
       }
 
@@ -1065,7 +1133,7 @@ export class ScheduleLifecycle {
         warnings.push({
           sourceScheduleId: entry.sourceScheduleId,
           code: "activation-blocker",
-          message: "Run cadence is required before activation.",
+          message: "Blocked: Run cadence is required before activation.",
         });
       }
 
@@ -1073,7 +1141,7 @@ export class ScheduleLifecycle {
         warnings.push({
           sourceScheduleId: entry.sourceScheduleId,
           code: "stale-policy-setting",
-          message: `Approval mode '${entry.originalApprovalMode}' is no longer supported; imported schedule uses Default Approvals.`,
+          message: `Blocked: Approval mode '${entry.originalApprovalMode}' is no longer supported; imported schedule uses Default Approvals.`,
         });
       }
     }
@@ -1142,6 +1210,67 @@ export class ScheduleLifecycle {
     }
 
     return this.localSchedulingEnabled;
+  }
+
+  private async getLocalSchedulingSetupState(): Promise<LocalSchedulingSetupState> {
+    if (this.localSchedulingSetup?.getLocalSchedulingSetupState) {
+      return this.localSchedulingSetup.getLocalSchedulingSetupState();
+    }
+    if (this.localSchedulingSetup) {
+      return {
+        ...defaultLocalSchedulingSetupState(),
+        enabled: await this.localSchedulingSetup.isLocalSchedulingEnabled(),
+      };
+    }
+
+    return {
+      ...defaultLocalSchedulingSetupState(),
+      enabled: this.localSchedulingEnabled,
+    };
+  }
+
+  private dueWorkScanDiagnosticsFor(input: {
+    scannedAt: IsoTimestamp;
+    localSchedulingEnabled: boolean;
+    localSchedulingState: LocalSchedulingSetupState;
+    dueScheduleCount: number;
+    runs: RunHistoryEntry[];
+  }): DueWorkScanDiagnostics {
+    const wakeupProviderConfigured =
+      input.localSchedulingState.enabled &&
+      input.localSchedulingState.platform !== null &&
+      input.localSchedulingState.triggerId !== null;
+
+    return {
+      scannedAt: input.scannedAt,
+      localScheduling: {
+        enabled: input.localSchedulingEnabled,
+        message: input.localSchedulingEnabled
+          ? "Automatic runs are active because local scheduling setup is enabled."
+          : "Automatic runs are inactive until local scheduling setup is enabled.",
+      },
+      wakeupProvider: {
+        configured: wakeupProviderConfigured,
+        platform: input.localSchedulingState.platform,
+        triggerId: input.localSchedulingState.triggerId,
+        status: wakeupProviderConfigured
+          ? "installed"
+          : input.localSchedulingState.enabled
+            ? "unknown"
+            : "not-installed",
+      },
+      dueScheduleCount: input.dueScheduleCount,
+      outcomes: {
+        started: input.runs.filter((run) => isStartedRunStatus(run.status)).length,
+        completed: input.runs.filter((run) => run.status === "completed").length,
+        blocked: input.runs.filter((run) => run.status === "blocked").length,
+        deferred: input.runs.filter((run) => run.status === "deferred").length,
+        approvalWaiting: input.runs.filter(
+          (run) => run.status === "approval-waiting",
+        ).length,
+        failed: input.runs.filter((run) => run.status === "failed").length,
+      },
+    };
   }
 }
 
