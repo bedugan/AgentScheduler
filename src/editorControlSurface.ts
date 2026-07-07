@@ -1,4 +1,10 @@
-import type { ScheduleDetailView, ScheduleSummary } from "./domain.js";
+import type {
+  RunHistoryDetailView,
+  RunHistoryEntry,
+  ScheduleDetailView,
+  ScheduleSummary,
+  UpdateScheduleInput,
+} from "./domain.js";
 import type {
   LocalSchedulingSetup,
   LocalSchedulingSetupResult,
@@ -39,6 +45,34 @@ export class EditorControlSurface {
   }
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
+    return this.lifecycle.openScheduleDetail(scheduleId);
+  }
+
+  async openRunHistoryDetail(runId: string): Promise<RunHistoryDetailView> {
+    return this.lifecycle.openRunHistoryDetail(runId);
+  }
+
+  async saveScheduleDetailEdits(
+    scheduleId: string,
+    input: UpdateScheduleInput,
+  ): Promise<ScheduleDetailView> {
+    await this.lifecycle.updateSchedule(scheduleId, input);
+    return this.lifecycle.openScheduleDetail(scheduleId);
+  }
+
+  async runScheduleNow(scheduleId: string): Promise<RunHistoryEntry> {
+    return this.lifecycle.startManualRun(scheduleId);
+  }
+
+  async resumeSchedule(scheduleId: string): Promise<ScheduleDetailView> {
+    await this.lifecycle.resumeSchedule(scheduleId);
+    return this.lifecycle.openScheduleDetail(scheduleId);
+  }
+
+  async restartCompletedSchedule(
+    scheduleId: string,
+  ): Promise<ScheduleDetailView> {
+    await this.lifecycle.restartCompletedSchedule(scheduleId);
     return this.lifecycle.openScheduleDetail(scheduleId);
   }
 

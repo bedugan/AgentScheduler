@@ -474,7 +474,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.equal(detail.nextRunAt, null);
   });
 
-  it("blocks manual runs after a finite run cap is completed", async () => {
+  it("rejects manual runs after a finite run cap is completed until explicit restart", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const fakeHarness = new FakeHarness({ mode: "local-copilot" });
     const lifecycle = new ScheduleLifecycle({
@@ -503,18 +503,17 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     await lifecycle.startManualRun(schedule.id);
 
     clock.set("2026-07-07T16:20:00.000Z");
-    const blockedRun = await lifecycle.startManualRun(schedule.id);
-
-    assert.equal(blockedRun.status, "blocked");
-    assert.equal(
-      blockedRun.error,
-      "Run cap has been reached. Restart the completed schedule before running again.",
+    await assert.rejects(
+      () => lifecycle.startManualRun(schedule.id),
+      /Manual Run Now is only available for draft or enabled schedules./,
     );
     assert.equal(fakeHarness.startRequests.length, 1);
 
     const detail = await lifecycle.openScheduleDetail(schedule.id);
     assert.equal(detail.schedule.status, "completed");
     assert.deepEqual(detail.runCounter, { completed: 1, limit: 1 });
+    assert.equal(detail.actions.restart.enabled, true);
+    assert.equal(detail.actions.runNow.enabled, false);
   });
 
   it("rejects lifecycle transitions that would silently restart completed schedules", async () => {

@@ -10,10 +10,19 @@ export type {
   ResolveActiveRunInput,
   RunCadence,
   RunCounter,
+  RunHistoryDetailView,
   RunHistoryEntry,
   RunStatus,
   RunTrigger,
   Schedule,
+  ScheduleDetailAction,
+  ScheduleDetailActions,
+  ScheduleDetailHistoryLink,
+  ScheduleDetailNotificationState,
+  ScheduleDetailOverview,
+  ScheduleDetailPreviousRun,
+  ScheduleDetailRunCounterView,
+  ScheduleDetailRunInstructionsView,
   ScheduleDetailView,
   ScheduleExportEntry,
   ScheduleExportFile,
@@ -23,6 +32,7 @@ export type {
   ScheduleStatus,
   ScheduleSummary,
   TargetContext,
+  UpdateScheduleInput,
 } from "./domain.js";
 export { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
 export type {

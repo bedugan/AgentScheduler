@@ -14,14 +14,17 @@ import type {
   RunCadence,
   RunCapInput,
   RunHistoryEntry,
+  RunHistoryDetailView,
   RunTrigger,
   Schedule,
   ScheduleExportEntry,
   ScheduleExportFile,
+  ScheduleDetailPreviousRun,
   ScheduleDetailView,
   ScheduleImportResult,
   ScheduleImportWarning,
   TargetContext,
+  UpdateScheduleInput,
 } from "./domain.js";
 import {
   SCHEDULE_EXPORT_SCHEMA_VERSION,
@@ -233,16 +236,128 @@ export class ScheduleLifecycle {
     return resumedSchedule;
   }
 
+  async restartCompletedSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["completed"], "restarted");
+    this.requireActivationRequirements(schedule);
+    const now = this.nowIso();
+    const restartedSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      runCounter: {
+        ...schedule.runCounter,
+        completed: 0,
+      },
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(restartedSchedule);
+    return restartedSchedule;
+  }
+
+  async updateSchedule(
+    scheduleId: string,
+    input: UpdateScheduleInput,
+  ): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    const nextSchedule: Schedule = {
+      ...schedule,
+      revision: schedule.revision + 1,
+      runInstructions: input.runInstructions ?? schedule.runInstructions,
+      cadence: Object.hasOwn(input, "cadence")
+        ? (input.cadence ?? null)
+        : schedule.cadence,
+      targetContext: Object.hasOwn(input, "targetContext")
+        ? (input.targetContext ?? null)
+        : schedule.targetContext,
+      harnessMode: Object.hasOwn(input, "harnessMode")
+        ? (input.harnessMode ?? null)
+        : schedule.harnessMode,
+      model: input.model ?? schedule.model,
+      approvalMode: input.approvalMode ?? schedule.approvalMode,
+      runCounter: Object.hasOwn(input, "runCap")
+        ? {
+            completed: schedule.runCounter.completed,
+            limit: input.runCap?.maxRuns ?? null,
+          }
+        : schedule.runCounter,
+      updatedAt: this.nowIso(),
+    };
+
+    if (nextSchedule.status === "active") {
+      this.requireActivationRequirements(nextSchedule);
+      if (Object.hasOwn(input, "cadence")) {
+        nextSchedule.nextRunAt = nextRunAtAfter(
+          nextSchedule.cadence,
+          this.clock.now(),
+        );
+      }
+    }
+
+    await this.store.saveSchedule(nextSchedule);
+    return nextSchedule;
+  }
+
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
     const schedule = await this.requireSchedule(scheduleId);
     const previousRuns = await this.store.listRunHistory(scheduleId);
 
+    return this.scheduleDetailViewFor(schedule, previousRuns);
+  }
+
+  async openRunHistoryDetail(runId: string): Promise<RunHistoryDetailView> {
+    const run = await this.requireRun(runId);
+
+    return {
+      run,
+      scheduleId: run.scheduleId,
+      scheduleRevision: run.scheduleRevision,
+      resolvedRunInstructions: run.runInstructionsSnapshot,
+      approvalMode: run.approvalModeSnapshot,
+      resolvedHarnessPolicy: run.resolvedHarnessPolicy,
+      outcome: {
+        status: run.status,
+        completedAt: run.completedAt,
+        summary: run.summary,
+        error: run.error,
+      },
+    };
+  }
+
+  private scheduleDetailViewFor(
+    schedule: Schedule,
+    previousRuns: RunHistoryEntry[],
+  ): ScheduleDetailView {
     return {
       schedule,
-      previousRuns,
+      runInstructions: {
+        value: schedule.runInstructions,
+        editable: true,
+        scheduleRevision: schedule.revision,
+      },
+      overview: {
+        status: schedule.status,
+        enabled: schedule.enabled,
+        nextRunAt: schedule.nextRunAt,
+        lastRunAt: schedule.lastRunAt,
+        targetContext: schedule.targetContext,
+        cadence: schedule.cadence,
+        harnessMode: schedule.harnessMode,
+        model: schedule.model,
+        approvalMode: schedule.approvalMode,
+        runCounter: this.runCounterViewFor(schedule),
+      },
+      actions: this.scheduleActionsFor(schedule),
+      previousRuns: previousRuns.map((run) => this.previousRunViewFor(run)),
       runCounter: schedule.runCounter,
       nextRunAt: schedule.nextRunAt,
       lastRunAt: schedule.lastRunAt,
+      notificationState: {
+        runOutcomes: "quiet-in-app",
+        desktopNotifications: "off",
+      },
     };
   }
 
@@ -266,6 +381,11 @@ export class ScheduleLifecycle {
 
   async startManualRun(scheduleId: string): Promise<RunHistoryEntry> {
     const schedule = await this.requireSchedule(scheduleId);
+    if (schedule.status !== "draft" && !schedule.enabled) {
+      throw new Error(
+        "Manual Run Now is only available for draft or enabled schedules.",
+      );
+    }
     const trigger: RunTrigger =
       schedule.status === "draft" ? "draft-manual" : "manual";
 
@@ -781,6 +901,77 @@ export class ScheduleLifecycle {
 
   private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {
     return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
+  }
+
+  private runCounterViewFor(schedule: Schedule): {
+    completed: number;
+    limit: number | null;
+    label: string;
+  } {
+    return {
+      ...schedule.runCounter,
+      label:
+        schedule.runCounter.limit === null
+          ? String(schedule.runCounter.completed)
+          : `${schedule.runCounter.completed}/${schedule.runCounter.limit}`,
+    };
+  }
+
+  private scheduleActionsFor(schedule: Schedule): ScheduleDetailView["actions"] {
+    const runNowEnabled = schedule.status === "draft" || schedule.enabled;
+    return {
+      runNow: {
+        kind: "run-now",
+        label: "Run Now",
+        enabled: runNowEnabled,
+        ...(!runNowEnabled && {
+          disabledReason:
+            "Manual Run Now is only available for draft or enabled schedules.",
+        }),
+      },
+      pause: {
+        kind: "pause",
+        label: "Pause",
+        enabled: schedule.status === "active",
+        ...(schedule.status !== "active" && {
+          disabledReason: "Only active schedules can be paused.",
+        }),
+      },
+      resume: {
+        kind: "resume",
+        label: "Resume",
+        enabled: schedule.status === "paused",
+        ...(schedule.status !== "paused" && {
+          disabledReason: "Only paused schedules can be resumed.",
+        }),
+      },
+      restart: {
+        kind: "restart",
+        label: "Restart",
+        enabled: schedule.status === "completed",
+        ...(schedule.status !== "completed" && {
+          disabledReason: "Only completed schedules can be restarted.",
+        }),
+      },
+    };
+  }
+
+  private previousRunViewFor(
+    run: RunHistoryEntry,
+  ): ScheduleDetailPreviousRun {
+    return {
+      ...run,
+      outcome: {
+        status: run.status,
+        completedAt: run.completedAt,
+        summary: run.summary,
+        error: run.error,
+      },
+      historyDetailLink: {
+        runId: run.id,
+        view: "run-history-detail",
+      },
+    };
   }
 
   private requireScheduleStatus(
