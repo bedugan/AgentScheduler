@@ -10,6 +10,7 @@ import type {
   Schedule,
   ScheduleDetailView,
 } from "./domain.js";
+import { nextRunAtAfter } from "./cadence.js";
 import type { AgentHarness } from "./harness.js";
 import type { ScheduleStore } from "./store.js";
 
@@ -89,6 +90,51 @@ export class ScheduleLifecycle {
     return this.store.listSchedules();
   }
 
+  async activateSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    const now = this.nowIso();
+    const activeSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(activeSchedule);
+    return activeSchedule;
+  }
+
+  async pauseSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    const now = this.nowIso();
+    const pausedSchedule: Schedule = {
+      ...schedule,
+      status: "paused",
+      enabled: false,
+      nextRunAt: null,
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(pausedSchedule);
+    return pausedSchedule;
+  }
+
+  async resumeSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    const now = this.nowIso();
+    const resumedSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(resumedSchedule);
+    return resumedSchedule;
+  }
+
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
     const schedule = await this.requireSchedule(scheduleId);
     const previousRuns = await this.store.listRunHistory(scheduleId);
@@ -131,6 +177,35 @@ export class ScheduleLifecycle {
     trigger: RunTrigger,
   ): Promise<RunHistoryEntry> {
     const requestedAt = this.nowIso();
+
+    if (
+      trigger !== "draft-manual" &&
+      this.hasRunCounterReachedLimit(schedule.runCounter)
+    ) {
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error:
+          "Run cap has been reached. Restart the completed schedule before running again.",
+      });
+      await this.store.saveRunHistory(blockedRun);
+      await this.store.saveSchedule({
+        ...schedule,
+        status: "completed",
+        enabled: false,
+        nextRunAt: null,
+        lastRunAt: requestedAt,
+        updatedAt: requestedAt,
+      });
+      return blockedRun;
+    }
+
     const harness = this.harnesses.get(schedule.harnessMode);
 
     if (!harness) {
@@ -236,17 +311,35 @@ export class ScheduleLifecycle {
 
     const completedAt = run.completedAt ?? run.startedAt;
     const nextRunCounter = { ...schedule.runCounter };
+    let nextStatus = schedule.status;
+    let nextEnabled = schedule.enabled;
+    let nextRunAt = schedule.nextRunAt;
 
     if (trigger !== "draft-manual" && run.status === "completed") {
       nextRunCounter.completed += 1;
     }
 
+    if (this.hasRunCounterReachedLimit(nextRunCounter)) {
+      nextStatus = "completed";
+      nextEnabled = false;
+      nextRunAt = null;
+    } else if (trigger === "automatic" && run.status === "completed") {
+      nextRunAt = nextRunAtAfter(schedule.cadence, new Date(completedAt));
+    }
+
     await this.store.saveSchedule({
       ...schedule,
+      status: nextStatus,
+      enabled: nextEnabled,
       runCounter: nextRunCounter,
+      nextRunAt,
       lastRunAt: completedAt,
       updatedAt: completedAt,
     });
+  }
+
+  private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {
+    return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
   }
 
   private defaultPolicySnapshot(schedule: Schedule): ResolvedHarnessPolicy {
