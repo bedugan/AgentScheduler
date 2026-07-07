@@ -11,6 +11,7 @@ import type {
   Schedule,
   ScheduleDetailView,
 } from "./domain.js";
+import { nextRunAtAfter } from "./cadence.js";
 import type { AgentHarness } from "./harness.js";
 import type { ScheduleStore } from "./store.js";
 
@@ -87,7 +88,13 @@ export class ScheduleLifecycle {
         completed: 0,
         limit: input.runCap?.maxRuns ?? null,
       },
-      nextRunAt: status === "active" ? now : null,
+      nextRunAt:
+        status === "active"
+          ? nextRunAtAfter(
+              (input as CreateActiveScheduleInput).cadence,
+              this.clock.now(),
+            )
+          : null,
       lastRunAt: null,
       createdAt: now,
       updatedAt: now,
@@ -99,6 +106,56 @@ export class ScheduleLifecycle {
 
   async listSchedules(): Promise<Schedule[]> {
     return this.store.listSchedules();
+  }
+
+  async activateSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["draft"], "activated");
+    this.requireActivationRequirements(schedule);
+    const now = this.nowIso();
+    const activeSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(activeSchedule);
+    return activeSchedule;
+  }
+
+  async pauseSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["active"], "paused");
+    const now = this.nowIso();
+    const pausedSchedule: Schedule = {
+      ...schedule,
+      status: "paused",
+      enabled: false,
+      nextRunAt: null,
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(pausedSchedule);
+    return pausedSchedule;
+  }
+
+  async resumeSchedule(scheduleId: string): Promise<Schedule> {
+    const schedule = await this.requireSchedule(scheduleId);
+    this.requireScheduleStatus(schedule, ["paused"], "resumed");
+    this.requireActivationRequirements(schedule);
+    const now = this.nowIso();
+    const resumedSchedule: Schedule = {
+      ...schedule,
+      status: "active",
+      enabled: true,
+      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
+      updatedAt: now,
+    };
+
+    await this.store.saveSchedule(resumedSchedule);
+    return resumedSchedule;
   }
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
@@ -157,6 +214,34 @@ export class ScheduleLifecycle {
         error: missingRunRequirements.join(" "),
       });
       await this.persistRunResult(schedule, blockedRun, trigger);
+      return blockedRun;
+    }
+
+    if (
+      trigger !== "draft-manual" &&
+      this.hasRunCounterReachedLimit(schedule.runCounter)
+    ) {
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error:
+          "Run cap has been reached. Restart the completed schedule before running again.",
+      });
+      await this.store.saveRunHistory(blockedRun);
+      await this.store.saveSchedule({
+        ...schedule,
+        status: "completed",
+        enabled: false,
+        nextRunAt: null,
+        lastRunAt: requestedAt,
+        updatedAt: requestedAt,
+      });
       return blockedRun;
     }
 
@@ -268,17 +353,60 @@ export class ScheduleLifecycle {
 
     const completedAt = run.completedAt ?? run.startedAt;
     const nextRunCounter = { ...schedule.runCounter };
+    let nextStatus = schedule.status;
+    let nextEnabled = schedule.enabled;
+    let nextRunAt = schedule.nextRunAt;
 
     if (trigger !== "draft-manual" && run.status === "completed") {
       nextRunCounter.completed += 1;
     }
 
+    if (this.hasRunCounterReachedLimit(nextRunCounter)) {
+      nextStatus = "completed";
+      nextEnabled = false;
+      nextRunAt = null;
+    } else if (
+      trigger === "automatic" &&
+      run.status === "completed" &&
+      schedule.cadence
+    ) {
+      nextRunAt = nextRunAtAfter(schedule.cadence, new Date(completedAt));
+    }
+
     await this.store.saveSchedule({
       ...schedule,
+      status: nextStatus,
+      enabled: nextEnabled,
       runCounter: nextRunCounter,
+      nextRunAt,
       lastRunAt: completedAt,
       updatedAt: completedAt,
     });
+  }
+
+  private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {
+    return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
+  }
+
+  private requireScheduleStatus(
+    schedule: Schedule,
+    allowedStatuses: Schedule["status"][],
+    action: string,
+  ): void {
+    if (!allowedStatuses.includes(schedule.status)) {
+      throw new Error(
+        `Only ${formatScheduleStatuses(allowedStatuses)} schedules can be ${action}.`,
+      );
+    }
+  }
+
+  private requireActivationRequirements(
+    schedule: Schedule,
+  ): asserts schedule is ActivationReadySchedule {
+    const missingRequirements = this.missingActivationRequirements(schedule);
+    if (missingRequirements.length > 0) {
+      throw new Error(missingRequirements.join(" "));
+    }
   }
 
   private defaultPolicySnapshot(schedule: Schedule): ResolvedHarnessPolicy {
@@ -316,4 +444,14 @@ export class ScheduleLifecycle {
   private nowIso(): IsoTimestamp {
     return this.clock.now().toISOString();
   }
+}
+
+type ActivationReadySchedule = Schedule & {
+  cadence: NonNullable<Schedule["cadence"]>;
+  targetContext: NonNullable<Schedule["targetContext"]>;
+  harnessMode: NonNullable<Schedule["harnessMode"]>;
+};
+
+function formatScheduleStatuses(statuses: Schedule["status"][]): string {
+  return statuses.join(" or ");
 }
