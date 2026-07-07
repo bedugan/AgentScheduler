@@ -66,6 +66,9 @@ export class InMemoryScheduleStore implements ScheduleStore {
         (schedule) =>
           schedule.enabled &&
           schedule.status === "active" &&
+          schedule.cadence !== null &&
+          schedule.targetContext !== null &&
+          schedule.harnessMode !== null &&
           schedule.nextRunAt !== null &&
           schedule.nextRunAt <= now,
       )

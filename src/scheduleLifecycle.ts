@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type {
+  CreateActiveScheduleInput,
   CreateDraftScheduleInput,
   DueWorkScanResult,
   IsoTimestamp,
@@ -59,12 +60,23 @@ export class ScheduleLifecycle {
   }
 
   async createDraftSchedule(input: CreateDraftScheduleInput): Promise<Schedule> {
+    return this.createSchedule(input, "draft");
+  }
+
+  async createActiveSchedule(input: CreateActiveScheduleInput): Promise<Schedule> {
+    return this.createSchedule(input, "active");
+  }
+
+  private async createSchedule(
+    input: CreateDraftScheduleInput | CreateActiveScheduleInput,
+    status: "draft" | "active",
+  ): Promise<Schedule> {
     const now = this.nowIso();
     const schedule: Schedule = {
       id: this.idGenerator.nextId("schedule"),
       revision: 1,
-      status: "draft",
-      enabled: false,
+      status,
+      enabled: status === "active",
       runInstructions: input.runInstructions,
       cadence: input.cadence,
       targetContext: input.targetContext,
@@ -75,7 +87,7 @@ export class ScheduleLifecycle {
         completed: 0,
         limit: input.runCap?.maxRuns ?? null,
       },
-      nextRunAt: null,
+      nextRunAt: status === "active" ? now : null,
       lastRunAt: null,
       createdAt: now,
       updatedAt: now,
@@ -131,7 +143,25 @@ export class ScheduleLifecycle {
     trigger: RunTrigger,
   ): Promise<RunHistoryEntry> {
     const requestedAt = this.nowIso();
-    const harness = this.harnesses.get(schedule.harnessMode);
+    const missingRunRequirements = this.missingActivationRequirements(schedule);
+    if (missingRunRequirements.length > 0) {
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error: missingRunRequirements.join(" "),
+      });
+      await this.persistRunResult(schedule, blockedRun, trigger);
+      return blockedRun;
+    }
+
+    const harnessMode = schedule.harnessMode;
+    const harness = harnessMode ? this.harnesses.get(harnessMode) : undefined;
 
     if (!harness) {
       const blockedRun = this.buildRunHistoryEntry({
@@ -143,7 +173,9 @@ export class ScheduleLifecycle {
         resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
         externalRunId: null,
         summary: null,
-        error: `Harness mode '${schedule.harnessMode}' is unavailable.`,
+        error: harnessMode
+          ? `Harness mode '${harnessMode}' is unavailable.`
+          : "Harness mode is required before activation.",
       });
       await this.persistRunResult(schedule, blockedRun, trigger);
       return blockedRun;
@@ -254,6 +286,23 @@ export class ScheduleLifecycle {
       harnessMode: schedule.harnessMode,
       approvalMode: schedule.approvalMode,
     };
+  }
+
+  private missingActivationRequirements(schedule: Schedule): string[] {
+    const messages: string[] = [];
+    if (schedule.runInstructions.trim().length === 0) {
+      messages.push("Run instructions are required before activation.");
+    }
+    if (!schedule.cadence) {
+      messages.push("Run cadence is required before activation.");
+    }
+    if (!schedule.targetContext) {
+      messages.push("Target context is required before activation.");
+    }
+    if (!schedule.harnessMode) {
+      messages.push("Harness mode is required before activation.");
+    }
+    return messages;
   }
 
   private async requireSchedule(scheduleId: string): Promise<Schedule> {
