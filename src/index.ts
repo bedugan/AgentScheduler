@@ -2,7 +2,9 @@ export type {
   ApprovalMode,
   CreateDraftScheduleInput,
   DueWorkScanResult,
+  ExportSchedulesInput,
   HarnessMode,
+  ImportSchedulesOptions,
   ResolvedHarnessPolicy,
   RunCadence,
   RunCounter,
@@ -11,10 +13,16 @@ export type {
   RunTrigger,
   Schedule,
   ScheduleDetailView,
+  ScheduleExportEntry,
+  ScheduleExportFile,
+  ScheduleImportResult,
+  ScheduleImportWarning,
+  ScheduleImportWarningCode,
   ScheduleStatus,
   ScheduleSummary,
   TargetContext,
 } from "./domain.js";
+export { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
 export type {
   AgentHarness,
   HarnessPreflightRequest,

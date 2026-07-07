@@ -112,3 +112,47 @@ export interface ScheduleDetailView {
 export interface DueWorkScanResult {
   startedRunIds: string[];
 }
+
+export const SCHEDULE_EXPORT_SCHEMA_VERSION = 1;
+
+export interface ScheduleExportEntry {
+  sourceScheduleId: string;
+  revision: number;
+  runInstructions: string;
+  cadence: RunCadence;
+  targetContext: TargetContext;
+  harnessMode: HarnessMode;
+  model: string;
+  approvalMode: ApprovalMode;
+  runCap: RunCapInput | null;
+}
+
+export interface ScheduleExportFile {
+  schemaVersion: typeof SCHEDULE_EXPORT_SCHEMA_VERSION;
+  exportedAt: IsoTimestamp;
+  schedules: ScheduleExportEntry[];
+}
+
+export interface ExportSchedulesInput {
+  scheduleIds?: readonly string[];
+}
+
+export type ScheduleImportWarningCode =
+  | "missing-workspace"
+  | "unavailable-harness-mode"
+  | "stale-policy-setting";
+
+export interface ScheduleImportWarning {
+  sourceScheduleId: string;
+  code: ScheduleImportWarningCode;
+  message: string;
+}
+
+export interface ScheduleImportResult {
+  schedules: Schedule[];
+  warnings: ScheduleImportWarning[];
+}
+
+export interface ImportSchedulesOptions {
+  isWorkspaceAvailable?: (uri: string) => boolean | Promise<boolean>;
+}
