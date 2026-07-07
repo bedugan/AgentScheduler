@@ -234,7 +234,10 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
       inferRunInstructions(input.naturalLanguageRequest);
     const cadence = input.cadence ?? inferCadence(input.naturalLanguageRequest);
     const targetContext = input.targetContext ?? this.currentWorkspace;
-    const harnessMode = input.harnessMode ?? "local-copilot";
+    const harnessMode =
+      input.harnessMode ??
+      inferHarnessMode(input.naturalLanguageRequest) ??
+      "local-copilot";
     const model = normalizeText(input.model) ?? this.defaultModel;
     const approvalMode = input.approvalMode ?? "default-approvals";
 
@@ -335,6 +338,28 @@ function inferCadence(request: string): RunCadence | undefined {
 
   if (/\b(every week|weekly)\b/.test(normalized)) {
     return { type: "cron", expression: "0 9 * * 1" };
+  }
+
+  return undefined;
+}
+
+function inferHarnessMode(request: string): HarnessMode | undefined {
+  const normalized = request.toLowerCase();
+
+  if (
+    /\bcloud\s+copilot\b/.test(normalized) ||
+    /\bcopilot\s+cloud\b/.test(normalized) ||
+    /\bcloud\s+(agent|execution|mode)\b/.test(normalized)
+  ) {
+    return "cloud-copilot";
+  }
+
+  if (
+    /\blocal\s+copilot\b/.test(normalized) ||
+    /\bcopilot\s+local\b/.test(normalized) ||
+    /\blocal\s+(agent|execution|mode)\b/.test(normalized)
+  ) {
+    return "local-copilot";
   }
 
   return undefined;

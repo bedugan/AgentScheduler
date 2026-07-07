@@ -50,16 +50,24 @@ export type {
   HarnessStatusResult,
 } from "./harness.js";
 export type {
+  CopilotCloudClient,
+  CopilotCloudClientAvailability,
+  CopilotCloudHarnessOptions,
+  CopilotCloudResolvedHarnessPolicy,
+  CopilotCloudStartRequest,
   CopilotLocalClient,
   CopilotLocalClientAvailability,
   CopilotLocalHarnessOptions,
   CopilotLocalResolvedHarnessPolicy,
   CopilotLocalStartRequest,
+  ResolveCopilotCloudHarnessPolicyInput,
   ResolveCopilotLocalHarnessPolicyInput,
 } from "./copilotHarness.js";
 export {
   COPILOT_APPROVAL_MODE_LABELS,
+  CopilotCloudHarness,
   CopilotLocalHarness,
+  resolveCopilotCloudHarnessPolicy,
   resolveCopilotLocalHarnessPolicy,
 } from "./copilotHarness.js";
 export type { ScheduleStore } from "./store.js";

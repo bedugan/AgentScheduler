@@ -1130,6 +1130,52 @@ describe("VS Code natural-language schedule creation", () => {
     assert.equal(detail.schedule.enabled, true);
   });
 
+  it("honors explicit Cloud Copilot Mode requests during natural-language creation", async () => {
+    const clock = new FakeClock("2026-07-07T20:30:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new FakeHarness({ mode: "local-copilot" }),
+        new FakeHarness({ mode: "cloud-copilot" }),
+      ],
+    });
+    const workspace = {
+      type: "workspace" as const,
+      uri: "file:///Users/briandugan/src/personal/AgentScheduler",
+      label: "AgentScheduler",
+    };
+    const confirmationRequests: unknown[] = [];
+    const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
+      lifecycle,
+      currentWorkspace: workspace,
+      defaultModel: "gpt-5",
+      confirmActivation: async (proposal) => {
+        confirmationRequests.push(proposal);
+        return true;
+      },
+    });
+
+    const result = await creationFlow.invokeLanguageModelTool({
+      naturalLanguageRequest:
+        "run every hour in Cloud Copilot Mode to review release branches",
+    });
+
+    assert.equal(result.outcome, "activated");
+    assert.deepEqual(result.validationMessages, []);
+    assert.deepEqual(confirmationRequests[0], {
+      runInstructions: "Review release branches.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: workspace,
+      harnessMode: "cloud-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    assert.equal(result.schedule.harnessMode, "cloud-copilot");
+  });
+
   it("creates a disabled draft with validation messages when activation requirements are missing", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T21:00:00.000Z"),
