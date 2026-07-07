@@ -40,7 +40,34 @@ export {
   type Clock,
   type IdGenerator,
 } from "./scheduleLifecycle.js";
-export { EditorControlSurface } from "./editorControlSurface.js";
+export {
+  EditorControlSurface,
+  type EditorControlSurfaceOptions,
+} from "./editorControlSurface.js";
+export {
+  defaultLocalSchedulingSetupState,
+  LocalSchedulingSetup,
+  MacOsLaunchdWakeupProvider,
+  WindowsTaskSchedulerWakeupProvider,
+} from "./localSchedulingSetup.js";
+export type {
+  LocalSchedulingSetupOptions,
+  LocalSchedulingSetupResult,
+  LocalSchedulingSetupState,
+  LocalSchedulingSetupStore,
+  LocalSchedulingStateSource,
+  WakeupCommandRunner,
+  WakeupFileWriter,
+  WakeupProvider,
+  WakeupProviderOptions,
+  WakeupProviderPlatform,
+  WakeupTriggerCommand,
+  WakeupTriggerFile,
+  WakeupTriggerIntent,
+  WakeupTriggerOperation,
+  WakeupTriggerRequest,
+  WakeupTriggerResult,
+} from "./localSchedulingSetup.js";
 export { SqliteScheduleStore } from "./sqliteScheduleStore.js";
 export type {
   NaturalLanguageScheduleActivationProposal,
@@ -57,3 +84,10 @@ export {
   naturalLanguageScheduleCreationInputSchema,
   VsCodeNaturalLanguageScheduleCreationFlow,
 } from "./vscodeNaturalLanguageScheduleCreation.js";
+export {
+  runWorkerCli,
+  type WorkerCliDependencies,
+  type WorkerCliIo,
+  type WorkerCliLifecycle,
+  type WorkerCliLocalSchedulingSetup,
+} from "./workerCli.js";

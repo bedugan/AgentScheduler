@@ -14,6 +14,12 @@ import type {
   ScheduleStatus,
   TargetContext,
 } from "./domain.js";
+import {
+  defaultLocalSchedulingSetupState,
+  type LocalSchedulingSetupState,
+  type LocalSchedulingSetupStore,
+  type WakeupProviderPlatform,
+} from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
 
 export interface SqliteScheduleStoreOptions {
@@ -57,7 +63,18 @@ interface RunHistoryRow {
   error: string | null;
 }
 
-export class SqliteScheduleStore implements ScheduleStore {
+interface LocalSchedulingSetupRow {
+  enabled: number;
+  platform: WakeupProviderPlatform | null;
+  trigger_id: string | null;
+  installed_at: string | null;
+  verified_at: string | null;
+  updated_at: string | null;
+}
+
+export class SqliteScheduleStore
+  implements ScheduleStore, LocalSchedulingSetupStore
+{
   private readonly database: DatabaseSync;
 
   constructor(options: SqliteScheduleStoreOptions) {
@@ -307,6 +324,54 @@ export class SqliteScheduleStore implements ScheduleStore {
     return row ? this.runHistoryFromRow(row) : undefined;
   }
 
+  async getLocalSchedulingSetup(): Promise<LocalSchedulingSetupState> {
+    const row = this.database
+      .prepare("SELECT * FROM local_scheduling_setup WHERE id = 'default'")
+      .get() as LocalSchedulingSetupRow | undefined;
+
+    return row ? localSchedulingSetupFromRow(row) : defaultLocalSchedulingSetupState();
+  }
+
+  async saveLocalSchedulingSetup(
+    state: LocalSchedulingSetupState,
+  ): Promise<void> {
+    this.database
+      .prepare(`
+        INSERT INTO local_scheduling_setup (
+          id,
+          enabled,
+          platform,
+          trigger_id,
+          installed_at,
+          verified_at,
+          updated_at
+        ) VALUES (
+          'default',
+          $enabled,
+          $platform,
+          $trigger_id,
+          $installed_at,
+          $verified_at,
+          $updated_at
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          enabled = excluded.enabled,
+          platform = excluded.platform,
+          trigger_id = excluded.trigger_id,
+          installed_at = excluded.installed_at,
+          verified_at = excluded.verified_at,
+          updated_at = excluded.updated_at
+      `)
+      .run({
+        enabled: state.enabled ? 1 : 0,
+        platform: state.platform,
+        trigger_id: state.triggerId,
+        installed_at: state.installedAt,
+        verified_at: state.verifiedAt,
+        updated_at: state.updatedAt,
+      });
+  }
+
   private initializeSchema(): void {
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS schedules (
@@ -352,6 +417,16 @@ export class SqliteScheduleStore implements ScheduleStore {
 
       CREATE INDEX IF NOT EXISTS idx_run_history_schedule
         ON run_history(schedule_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS local_scheduling_setup (
+        id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL,
+        platform TEXT,
+        trigger_id TEXT,
+        installed_at TEXT,
+        verified_at TEXT,
+        updated_at TEXT
+      );
     `);
   }
 
@@ -401,4 +476,17 @@ export class SqliteScheduleStore implements ScheduleStore {
 
 function parseJson<T>(value: string): T {
   return JSON.parse(value) as T;
+}
+
+function localSchedulingSetupFromRow(
+  row: LocalSchedulingSetupRow,
+): LocalSchedulingSetupState {
+  return {
+    enabled: row.enabled === 1,
+    platform: row.platform,
+    triggerId: row.trigger_id,
+    installedAt: row.installed_at,
+    verifiedAt: row.verified_at,
+    updatedAt: row.updated_at,
+  };
 }
