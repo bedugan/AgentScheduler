@@ -29,7 +29,13 @@ import {
   isStartedRunStatus,
 } from "./domain.js";
 import { nextRunAtAfter } from "./cadence.js";
-import type { AgentHarness } from "./harness.js";
+import type {
+  AgentHarness,
+  HarnessCancelResult,
+  HarnessOpenPurpose,
+  HarnessOpenResult,
+  HarnessStatusResult,
+} from "./harness.js";
 import type { LocalSchedulingStateSource } from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
 
@@ -292,6 +298,58 @@ export class ScheduleLifecycle {
     return resolvedRun;
   }
 
+  async pollRunStatus(runId: string): Promise<RunHistoryEntry> {
+    const run = await this.requireRun(runId);
+    this.requireHarnessBackedActiveRun(run, "polled for status");
+    const { schedule, harness, externalRunId } =
+      await this.requireHarnessForRun(run);
+    const requestedAt = this.nowIso();
+    const statusResult = await harness.status({
+      schedule,
+      run,
+      externalRunId,
+      requestedAt,
+    });
+    const updatedRun = this.applyHarnessRunUpdate(
+      run,
+      statusResult,
+      requestedAt,
+    );
+
+    await this.persistRunResult(schedule, updatedRun, run.trigger);
+    return updatedRun;
+  }
+
+  async cancelRun(runId: string): Promise<RunHistoryEntry> {
+    const run = await this.requireRun(runId);
+    this.requireHarnessBackedActiveRun(run, "canceled");
+    const { schedule, harness, externalRunId } =
+      await this.requireHarnessForRun(run);
+    const requestedAt = this.nowIso();
+    const cancelResult = await harness.cancel({
+      schedule,
+      run,
+      externalRunId,
+      requestedAt,
+    });
+    const canceledRun = this.applyHarnessRunUpdate(
+      run,
+      cancelResult,
+      requestedAt,
+    );
+
+    await this.persistRunResult(schedule, canceledRun, run.trigger);
+    return canceledRun;
+  }
+
+  async openRun(runId: string): Promise<HarnessOpenResult> {
+    return this.openHarnessRun(runId, "open");
+  }
+
+  async reviewRun(runId: string): Promise<HarnessOpenResult> {
+    return this.openHarnessRun(runId, "review");
+  }
+
   private async startRun(
     schedule: Schedule,
     trigger: RunTrigger,
@@ -468,6 +526,89 @@ export class ScheduleLifecycle {
 
     await this.persistRunResult(schedule, run, trigger);
     return run;
+  }
+
+  private async openHarnessRun(
+    runId: string,
+    purpose: HarnessOpenPurpose,
+  ): Promise<HarnessOpenResult> {
+    const run = await this.requireRun(runId);
+    const { schedule, harness, externalRunId } =
+      await this.requireHarnessForRun(run);
+
+    return harness.open({
+      schedule,
+      run,
+      externalRunId,
+      purpose,
+      requestedAt: this.nowIso(),
+    });
+  }
+
+  private async requireRun(runId: string): Promise<RunHistoryEntry> {
+    const run = await this.store.getRunHistoryEntry(runId);
+    if (!run) {
+      throw new Error(`Run '${runId}' was not found.`);
+    }
+    return run;
+  }
+
+  private requireHarnessBackedActiveRun(
+    run: RunHistoryEntry,
+    action: string,
+  ): void {
+    if (!isActiveRunStatus(run.status) || run.completedAt !== null) {
+      throw new Error(`Only active runs can be ${action}.`);
+    }
+    if (!run.externalRunId) {
+      throw new Error(
+        `Only runs with an external harness id can be ${action}.`,
+      );
+    }
+  }
+
+  private async requireHarnessForRun(run: RunHistoryEntry): Promise<{
+    schedule: Schedule;
+    harness: AgentHarness;
+    externalRunId: string;
+  }> {
+    if (!run.externalRunId) {
+      throw new Error("Run does not have an external harness id.");
+    }
+
+    const schedule = await this.requireSchedule(run.scheduleId);
+    const harnessMode = run.harnessMode ?? schedule.harnessMode;
+    const harness = harnessMode ? this.harnesses.get(harnessMode) : undefined;
+
+    if (!harness) {
+      throw new Error(
+        harnessMode
+          ? `Harness mode '${harnessMode}' is unavailable.`
+          : "Harness mode is required before opening a run.",
+      );
+    }
+
+    return {
+      schedule,
+      harness,
+      externalRunId: run.externalRunId,
+    };
+  }
+
+  private applyHarnessRunUpdate(
+    run: RunHistoryEntry,
+    update: HarnessStatusResult | HarnessCancelResult,
+    requestedAt: IsoTimestamp,
+  ): RunHistoryEntry {
+    return {
+      ...run,
+      status: update.status,
+      completedAt: isActiveRunStatus(update.status)
+        ? null
+        : update.completedAt ?? requestedAt,
+      summary: update.summary,
+      error: update.error,
+    };
   }
 
   private async findOccupyingRun(
