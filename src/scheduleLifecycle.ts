@@ -10,6 +10,7 @@ import type {
   ImportSchedulesOptions,
   IsoTimestamp,
   ResolvedHarnessPolicy,
+  ResolveActiveRunInput,
   RunCadence,
   RunCapInput,
   RunHistoryEntry,
@@ -22,7 +23,11 @@ import type {
   ScheduleImportWarning,
   TargetContext,
 } from "./domain.js";
-import { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
+import {
+  SCHEDULE_EXPORT_SCHEMA_VERSION,
+  isActiveRunStatus,
+  isStartedRunStatus,
+} from "./domain.js";
 import { nextRunAtAfter } from "./cadence.js";
 import type { AgentHarness } from "./harness.js";
 import type { ScheduleStore } from "./store.js";
@@ -241,7 +246,9 @@ export class ScheduleLifecycle {
 
     for (const schedule of dueSchedules) {
       const run = await this.startRun(schedule, "automatic");
-      startedRunIds.push(run.id);
+      if (isStartedRunStatus(run.status)) {
+        startedRunIds.push(run.id);
+      }
     }
 
     return { startedRunIds };
@@ -253,6 +260,32 @@ export class ScheduleLifecycle {
       schedule.status === "draft" ? "draft-manual" : "manual";
 
     return this.startRun(schedule, trigger);
+  }
+
+  async resolveActiveRun(
+    runId: string,
+    input: ResolveActiveRunInput,
+  ): Promise<RunHistoryEntry> {
+    const run = await this.store.getRunHistoryEntry(runId);
+    if (!run) {
+      throw new Error(`Run '${runId}' was not found.`);
+    }
+    if (!isActiveRunStatus(run.status) || run.completedAt !== null) {
+      throw new Error("Only active runs can be resolved.");
+    }
+
+    const schedule = await this.requireSchedule(run.scheduleId);
+    const completedAt = input.completedAt ?? this.nowIso();
+    const resolvedRun: RunHistoryEntry = {
+      ...run,
+      status: input.status,
+      completedAt,
+      summary: input.summary ?? run.summary,
+      error: input.error ?? (input.status === "failed" ? "Run failed." : null),
+    };
+
+    await this.persistRunResult(schedule, resolvedRun, run.trigger);
+    return resolvedRun;
   }
 
   private async startRun(
@@ -326,6 +359,32 @@ export class ScheduleLifecycle {
       return blockedRun;
     }
 
+    const occupyingRun = await this.findOccupyingRun(schedule);
+    if (occupyingRun) {
+      const reason =
+        "Run slot is occupied by an active run. AgentScheduler deferred this due run and will coalesce catch-up work for the schedule.";
+
+      if (trigger === "automatic") {
+        return this.deferRun(schedule, trigger, requestedAt, reason);
+      }
+
+      const blockedRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: requestedAt,
+        status: "blocked",
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error:
+          "Run slot is occupied by an active run. Wait for the active run to finish before starting a manual run.",
+      });
+      await this.persistRunResult(schedule, blockedRun, trigger);
+      return blockedRun;
+    }
+
+    const pendingDeferredRun = await this.store.getPendingDeferredRun(schedule.id);
     const preflight = await harness.preflight({
       schedule,
       trigger,
@@ -334,6 +393,11 @@ export class ScheduleLifecycle {
     });
 
     if (preflight.status === "blocked") {
+      await this.completePendingDeferredRun(
+        pendingDeferredRun,
+        requestedAt,
+        "Deferred run ended with a blocked catch-up attempt.",
+      );
       const blockedRun = this.buildRunHistoryEntry({
         schedule,
         trigger,
@@ -350,6 +414,34 @@ export class ScheduleLifecycle {
       return blockedRun;
     }
 
+    if (preflight.status === "deferred") {
+      return this.deferRun(
+        schedule,
+        trigger,
+        requestedAt,
+        preflight.reason,
+        preflight.resolvedHarnessPolicy,
+      );
+    }
+
+    if (preflight.status === "requires-approval") {
+      await this.completePendingDeferredRun(pendingDeferredRun, requestedAt);
+      const approvalWaitingRun = this.buildRunHistoryEntry({
+        schedule,
+        trigger,
+        startedAt: requestedAt,
+        completedAt: null,
+        status: "approval-waiting",
+        resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
+        externalRunId: null,
+        summary: preflight.reason,
+        error: null,
+      });
+      await this.persistRunResult(schedule, approvalWaitingRun, trigger);
+      return approvalWaitingRun;
+    }
+
+    await this.completePendingDeferredRun(pendingDeferredRun, requestedAt);
     const startResult = await harness.start({
       schedule,
       trigger,
@@ -371,6 +463,77 @@ export class ScheduleLifecycle {
 
     await this.persistRunResult(schedule, run, trigger);
     return run;
+  }
+
+  private async findOccupyingRun(
+    schedule: Schedule,
+  ): Promise<RunHistoryEntry | undefined> {
+    const runSlotKey = this.runSlotKeyFor(schedule);
+    if (!runSlotKey) {
+      return undefined;
+    }
+
+    const activeRuns = await this.store.listActiveRuns();
+    return activeRuns.find(
+      (run) => this.runSlotKeyFor(run) === runSlotKey,
+    );
+  }
+
+  private async deferRun(
+    schedule: Schedule,
+    trigger: RunTrigger,
+    requestedAt: IsoTimestamp,
+    reason: string,
+    resolvedHarnessPolicy: ResolvedHarnessPolicy = this.defaultPolicySnapshot(
+      schedule,
+    ),
+  ): Promise<RunHistoryEntry> {
+    const existingDeferredRun = await this.store.getPendingDeferredRun(
+      schedule.id,
+    );
+    if (existingDeferredRun) {
+      return existingDeferredRun;
+    }
+
+    const deferredRun = this.buildRunHistoryEntry({
+      schedule,
+      trigger,
+      startedAt: requestedAt,
+      completedAt: null,
+      status: "deferred",
+      resolvedHarnessPolicy,
+      externalRunId: null,
+      summary: null,
+      error: reason,
+    });
+    await this.store.saveRunHistory(deferredRun);
+    return deferredRun;
+  }
+
+  private async completePendingDeferredRun(
+    pendingDeferredRun: RunHistoryEntry | undefined,
+    completedAt: IsoTimestamp,
+    summary = "Deferred run resumed as a catch-up run.",
+  ): Promise<void> {
+    if (!pendingDeferredRun) {
+      return;
+    }
+
+    await this.store.saveRunHistory({
+      ...pendingDeferredRun,
+      completedAt,
+      summary,
+    });
+  }
+
+  private runSlotKeyFor(
+    input: Pick<Schedule | RunHistoryEntry, "targetContext" | "harnessMode">,
+  ): string | null {
+    if (!input.targetContext || !input.harnessMode) {
+      return null;
+    }
+
+    return `${input.harnessMode}:${input.targetContext.type}:${input.targetContext.uri}`;
   }
 
   private buildRunHistoryEntry(input: {
@@ -417,20 +580,46 @@ export class ScheduleLifecycle {
     let nextEnabled = schedule.enabled;
     let nextRunAt = schedule.nextRunAt;
 
+    if (isActiveRunStatus(run.status)) {
+      if (trigger === "automatic" && schedule.cadence) {
+        nextRunAt = nextRunAtAfter(schedule.cadence, new Date(run.startedAt));
+      }
+
+      await this.store.saveSchedule({
+        ...schedule,
+        nextRunAt,
+        lastRunAt: run.startedAt,
+        updatedAt: run.startedAt,
+      });
+      return;
+    }
+
     if (trigger !== "draft-manual" && run.status === "completed") {
       nextRunCounter.completed += 1;
     }
+
+    const pendingDeferredRun =
+      trigger === "automatic" && run.status === "completed"
+        ? await this.store.getPendingDeferredRun(schedule.id)
+        : undefined;
 
     if (this.hasRunCounterReachedLimit(nextRunCounter)) {
       nextStatus = "completed";
       nextEnabled = false;
       nextRunAt = null;
+      await this.completePendingDeferredRun(
+        pendingDeferredRun,
+        completedAt,
+        "Deferred run ended because the schedule completed before catch-up work started.",
+      );
     } else if (
       trigger === "automatic" &&
       run.status === "completed" &&
       schedule.cadence
     ) {
-      nextRunAt = nextRunAtAfter(schedule.cadence, new Date(completedAt));
+      nextRunAt = pendingDeferredRun
+        ? schedule.nextRunAt
+        : nextRunAtAfter(schedule.cadence, new Date(completedAt));
     }
 
     await this.store.saveSchedule({

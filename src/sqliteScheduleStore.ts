@@ -217,6 +217,22 @@ export class SqliteScheduleStore implements ScheduleStore {
           $summary,
           $error
         )
+        ON CONFLICT(id) DO UPDATE SET
+          schedule_id = excluded.schedule_id,
+          schedule_revision = excluded.schedule_revision,
+          trigger = excluded.trigger,
+          status = excluded.status,
+          started_at = excluded.started_at,
+          completed_at = excluded.completed_at,
+          run_instructions_snapshot = excluded.run_instructions_snapshot,
+          approval_mode_snapshot = excluded.approval_mode_snapshot,
+          resolved_harness_policy_json = excluded.resolved_harness_policy_json,
+          harness_mode = excluded.harness_mode,
+          model = excluded.model,
+          target_context_json = excluded.target_context_json,
+          external_run_id = excluded.external_run_id,
+          summary = excluded.summary,
+          error = excluded.error
       `)
       .run({
         id: entry.id,
@@ -238,6 +254,14 @@ export class SqliteScheduleStore implements ScheduleStore {
       });
   }
 
+  async getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined> {
+    const row = this.database
+      .prepare("SELECT * FROM run_history WHERE id = $id")
+      .get({ id }) as RunHistoryRow | undefined;
+
+    return row ? this.runHistoryFromRow(row) : undefined;
+  }
+
   async listRunHistory(scheduleId: string): Promise<RunHistoryEntry[]> {
     const rows = this.database
       .prepare(`
@@ -249,6 +273,38 @@ export class SqliteScheduleStore implements ScheduleStore {
       .all({ schedule_id: scheduleId }) as unknown as RunHistoryRow[];
 
     return rows.map((row) => this.runHistoryFromRow(row));
+  }
+
+  async listActiveRuns(): Promise<RunHistoryEntry[]> {
+    const rows = this.database
+      .prepare(`
+        SELECT *
+        FROM run_history
+        WHERE status IN ('running', 'approval-waiting')
+          AND completed_at IS NULL
+        ORDER BY started_at ASC, id ASC
+      `)
+      .all() as unknown as RunHistoryRow[];
+
+    return rows.map((row) => this.runHistoryFromRow(row));
+  }
+
+  async getPendingDeferredRun(
+    scheduleId: string,
+  ): Promise<RunHistoryEntry | undefined> {
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM run_history
+        WHERE schedule_id = $schedule_id
+          AND status = 'deferred'
+          AND completed_at IS NULL
+        ORDER BY started_at ASC, id ASC
+        LIMIT 1
+      `)
+      .get({ schedule_id: scheduleId }) as RunHistoryRow | undefined;
+
+    return row ? this.runHistoryFromRow(row) : undefined;
   }
 
   private initializeSchema(): void {

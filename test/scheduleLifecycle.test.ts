@@ -214,6 +214,116 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     }
   });
 
+  it("persists active and deferred run state in the SQLite local store across lifecycle restarts", async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
+    const databasePath = join(tempDirectory, "schedules.sqlite");
+    const idGenerator = new SequentialIdGenerator();
+
+    try {
+      let startAttempts = 0;
+      const firstHarness = new FakeHarness({
+        mode: "local-copilot",
+        startResult: (request) => {
+          startAttempts += 1;
+          return startAttempts === 1
+            ? {
+                externalRunId: "sqlite-approval-waiting-run",
+                status: "approval-waiting",
+                completedAt: null,
+                summary: "Waiting for approval.",
+              }
+            : {
+                externalRunId: "unexpected-overlap",
+                status: "completed",
+                completedAt: request.requestedAt,
+                summary: "This run should not overlap.",
+              };
+        },
+      });
+      const firstStore = new SqliteScheduleStore({ databasePath });
+      const firstLifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+        idGenerator,
+        localSchedulingEnabled: true,
+        store: firstStore,
+        harnesses: [firstHarness],
+      });
+      const targetContext = {
+        type: "workspace" as const,
+        uri: "file:///tmp/agent-scheduler",
+      };
+      const firstSchedule = await firstLifecycle.createDraftSchedule({
+        runInstructions: "Persist an approval-waiting run.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext,
+        harnessMode: "local-copilot",
+        model: "gpt-5-mini",
+        approvalMode: "default-approvals",
+      });
+      const secondSchedule = await firstLifecycle.createDraftSchedule({
+        runInstructions: "Persist one deferred catch-up run.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext,
+        harnessMode: "local-copilot",
+        model: "gpt-5-mini",
+        approvalMode: "default-approvals",
+      });
+      await firstLifecycle.activateSchedule(firstSchedule.id);
+      await firstLifecycle.activateSchedule(secondSchedule.id);
+
+      const firstClock = new FakeClock("2026-07-07T17:00:00.000Z");
+      const runLifecycle = new ScheduleLifecycle({
+        clock: firstClock,
+        idGenerator,
+        localSchedulingEnabled: true,
+        store: firstStore,
+        harnesses: [firstHarness],
+      });
+      assert.deepEqual((await runLifecycle.scanDueWork()).startedRunIds, [
+        "run_3",
+      ]);
+      firstStore.close();
+
+      const secondHarness = new FakeHarness({ mode: "local-copilot" });
+      const secondStore = new SqliteScheduleStore({ databasePath });
+      const secondClock = new FakeClock("2026-07-07T17:10:00.000Z");
+      const secondLifecycle = new ScheduleLifecycle({
+        clock: secondClock,
+        idGenerator,
+        localSchedulingEnabled: true,
+        store: secondStore,
+        harnesses: [secondHarness],
+      });
+
+      assert.deepEqual((await secondLifecycle.scanDueWork()).startedRunIds, []);
+      assert.equal(secondHarness.startRequests.length, 0);
+
+      await secondLifecycle.resolveActiveRun("run_3", {
+        status: "completed",
+        summary: "Approved run completed after restart.",
+      });
+      assert.deepEqual((await secondLifecycle.scanDueWork()).startedRunIds, [
+        "run_5",
+      ]);
+
+      const secondDetail = await secondLifecycle.openScheduleDetail(
+        secondSchedule.id,
+      );
+      assert.equal(secondDetail.previousRuns[0]?.id, "run_5");
+      assert.equal(secondDetail.previousRuns[0]?.status, "completed");
+      assert.equal(secondDetail.previousRuns[1]?.id, "run_4");
+      assert.equal(secondDetail.previousRuns[1]?.status, "deferred");
+      assert.equal(
+        secondDetail.previousRuns[1]?.completedAt,
+        "2026-07-07T17:10:00.000Z",
+      );
+
+      secondStore.close();
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("does not consider disabled draft schedules during automatic due work scans", async () => {
     const clock = new FakeClock("2026-07-07T19:00:00.000Z");
     const fakeHarness = new FakeHarness({ mode: "local-copilot" });
@@ -540,6 +650,381 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.equal(detail.previousRuns.length, 1);
     assert.equal(detail.previousRuns[0]?.trigger, "automatic");
     assert.equal(detail.nextRunAt, "2026-07-07T12:45:00.000Z");
+  });
+
+  it("defers and coalesces automatic runs while a run slot is occupied", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      startResult: (request) => ({
+        externalRunId: `approval-${request.schedule.id}`,
+        status: "approval-waiting",
+        completedAt: null,
+        summary: "Waiting for user approval.",
+      }),
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+    const targetContext = {
+      type: "workspace" as const,
+      uri: "file:///tmp/agent-scheduler",
+    };
+
+    const firstSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Start first and wait for approval.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const secondSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Defer while the first run occupies the slot.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(firstSchedule.id);
+    await lifecycle.activateSchedule(secondSchedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_3"]);
+    assert.equal(fakeHarness.startRequests.length, 1);
+
+    const firstDetail = await lifecycle.openScheduleDetail(firstSchedule.id);
+    assert.equal(firstDetail.previousRuns[0]?.status, "approval-waiting");
+
+    const secondDetail = await lifecycle.openScheduleDetail(secondSchedule.id);
+    assert.equal(secondDetail.previousRuns.length, 1);
+    assert.equal(secondDetail.previousRuns[0]?.status, "deferred");
+    assert.equal(secondDetail.previousRuns[0]?.completedAt, null);
+    assert.equal(
+      secondDetail.previousRuns[0]?.error,
+      "Run slot is occupied by an active run. AgentScheduler deferred this due run and will coalesce catch-up work for the schedule.",
+    );
+
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(fakeHarness.startRequests.length, 1);
+    assert.equal(
+      (await lifecycle.openScheduleDetail(secondSchedule.id)).previousRuns
+        .length,
+      1,
+    );
+  });
+
+  it("keeps approval-waiting runs active until they resolve, then starts deferred catch-up work", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    let startAttempts = 0;
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      startResult: (request) => {
+        startAttempts += 1;
+        return startAttempts === 1
+          ? {
+              externalRunId: `approval-${request.schedule.id}`,
+              status: "approval-waiting",
+              completedAt: null,
+              summary: "Waiting for user approval.",
+            }
+          : {
+              externalRunId: `catch-up-${request.schedule.id}`,
+              status: "completed",
+              completedAt: request.requestedAt,
+              summary: "Catch-up run completed.",
+            };
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+    const targetContext = {
+      type: "workspace" as const,
+      uri: "file:///tmp/agent-scheduler",
+    };
+
+    const firstSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Wait for approval before completing.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const secondSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run one catch-up after approval resolves.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(firstSchedule.id);
+    await lifecycle.activateSchedule(secondSchedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_3"]);
+
+    clock.set("2026-07-07T17:10:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(fakeHarness.startRequests.length, 1);
+
+    const resolvedRun = await lifecycle.resolveActiveRun("run_3", {
+      status: "completed",
+      summary: "Approved run completed.",
+    });
+    assert.equal(resolvedRun.status, "completed");
+    assert.equal(resolvedRun.completedAt, "2026-07-07T17:10:00.000Z");
+
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_5"]);
+    assert.equal(fakeHarness.startRequests.length, 2);
+
+    const secondDetail = await lifecycle.openScheduleDetail(secondSchedule.id);
+    assert.equal(secondDetail.previousRuns.length, 2);
+    assert.equal(secondDetail.previousRuns[0]?.id, "run_5");
+    assert.equal(secondDetail.previousRuns[0]?.status, "completed");
+    assert.equal(secondDetail.previousRuns[1]?.id, "run_4");
+    assert.equal(secondDetail.previousRuns[1]?.status, "deferred");
+    assert.equal(
+      secondDetail.previousRuns[1]?.completedAt,
+      "2026-07-07T17:10:00.000Z",
+    );
+  });
+
+  it("starts one same-schedule catch-up after an approval-waiting run spans its next due time", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    let startAttempts = 0;
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      startResult: (request) => {
+        startAttempts += 1;
+        return startAttempts === 1
+          ? {
+              externalRunId: "approval-waiting-run",
+              status: "approval-waiting",
+              completedAt: null,
+              summary: "Waiting for approval.",
+            }
+          : {
+              externalRunId: "same-schedule-catch-up",
+              status: "completed",
+              completedAt: request.requestedAt,
+              summary: "Same-schedule catch-up completed.",
+            };
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Stay active long enough to miss the next interval.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_2"]);
+
+    clock.set("2026-07-07T18:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(
+      (await lifecycle.openScheduleDetail(schedule.id)).previousRuns.length,
+      2,
+    );
+
+    clock.set("2026-07-07T18:10:00.000Z");
+    await lifecycle.resolveActiveRun("run_2", {
+      status: "completed",
+      summary: "Approved run completed.",
+    });
+
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_4"]);
+    assert.equal(fakeHarness.startRequests.length, 2);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns.length, 3);
+    assert.equal(detail.previousRuns[0]?.id, "run_4");
+    assert.equal(detail.previousRuns[0]?.status, "completed");
+    assert.equal(detail.previousRuns[1]?.id, "run_3");
+    assert.equal(detail.previousRuns[1]?.status, "deferred");
+    assert.equal(
+      detail.previousRuns[1]?.completedAt,
+      "2026-07-07T18:10:00.000Z",
+    );
+    assert.equal(detail.previousRuns[2]?.id, "run_2");
+    assert.equal(detail.previousRuns[2]?.status, "completed");
+  });
+
+  it("records blocked preflight errors without falling back to another harness", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const localHarness = new FakeHarness({
+      mode: "local-copilot",
+      preflightResult: {
+        status: "blocked",
+        reason: "Local Copilot CLI is not authenticated.",
+        resolvedHarnessPolicy: {
+          harnessMode: "local-copilot",
+          approvalMode: "default-approvals",
+        },
+      },
+    });
+    const cloudHarness = new FakeHarness({ mode: "cloud-copilot" });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [localHarness, cloudHarness],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Do not fall back when local Copilot is unavailable.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(localHarness.preflightRequests.length, 1);
+    assert.equal(localHarness.startRequests.length, 0);
+    assert.equal(cloudHarness.preflightRequests.length, 0);
+    assert.equal(cloudHarness.startRequests.length, 0);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns.length, 1);
+    assert.equal(detail.previousRuns[0]?.status, "blocked");
+    assert.equal(
+      detail.previousRuns[0]?.error,
+      "Local Copilot CLI is not authenticated.",
+    );
+    assert.deepEqual(detail.previousRuns[0]?.resolvedHarnessPolicy, {
+      harnessMode: "local-copilot",
+      approvalMode: "default-approvals",
+    });
+  });
+
+  it("records requires-approval preflight outcomes as approval-waiting active runs", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      preflightResult: {
+        status: "requires-approval",
+        reason: "Approval is waiting in VS Code.",
+        resolvedHarnessPolicy: {
+          harnessMode: "local-copilot",
+          approvalMode: "default-approvals",
+        },
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Wait for approval before starting.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, ["run_2"]);
+    assert.equal(fakeHarness.startRequests.length, 0);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns[0]?.status, "approval-waiting");
+    assert.equal(
+      detail.previousRuns[0]?.summary,
+      "Approval is waiting in VS Code.",
+    );
+    assert.equal(detail.previousRuns[0]?.completedAt, null);
+  });
+
+  it("coalesces deferred preflight outcomes into one pending deferred run", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      preflightResult: {
+        status: "deferred",
+        reason: "Harness is temporarily busy.",
+        resolvedHarnessPolicy: {
+          harnessMode: "local-copilot",
+          approvalMode: "default-approvals",
+        },
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Defer when preflight asks the scheduler to wait.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(fakeHarness.preflightRequests.length, 2);
+    assert.equal(fakeHarness.startRequests.length, 0);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns.length, 1);
+    assert.equal(detail.previousRuns[0]?.status, "deferred");
+    assert.equal(detail.previousRuns[0]?.error, "Harness is temporarily busy.");
+    assert.equal(detail.previousRuns[0]?.completedAt, null);
   });
 
   it("keeps the idle due scan path to one local due query under 50 ms", async () => {

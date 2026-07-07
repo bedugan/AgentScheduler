@@ -11,7 +11,18 @@ export type ScheduleStatus = "draft" | "active" | "paused" | "completed";
 
 export type RunTrigger = "draft-manual" | "manual" | "automatic";
 
-export type RunStatus = "completed" | "failed" | "blocked";
+export type RunStatus =
+  | "running"
+  | "approval-waiting"
+  | "completed"
+  | "failed"
+  | "blocked"
+  | "deferred";
+
+export type ActiveRunStatus = Extract<
+  RunStatus,
+  "running" | "approval-waiting"
+>;
 
 export interface CronCadence {
   type: "cron";
@@ -96,6 +107,13 @@ export interface RunHistoryEntry {
   error: string | null;
 }
 
+export interface ResolveActiveRunInput {
+  status: Extract<RunStatus, "completed" | "failed">;
+  completedAt?: IsoTimestamp;
+  summary?: string | null;
+  error?: string | null;
+}
+
 export interface ScheduleSummary {
   id: string;
   status: ScheduleStatus;
@@ -166,4 +184,14 @@ export interface ScheduleImportResult {
 
 export interface ImportSchedulesOptions {
   isWorkspaceAvailable?: (uri: string) => boolean | Promise<boolean>;
+}
+
+export function isActiveRunStatus(
+  status: RunStatus,
+): status is ActiveRunStatus {
+  return status === "running" || status === "approval-waiting";
+}
+
+export function isStartedRunStatus(status: RunStatus): boolean {
+  return status !== "blocked" && status !== "deferred";
 }
