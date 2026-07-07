@@ -14,6 +14,11 @@ import type {
   HarnessStartRequest,
   HarnessStartResult,
 } from "./harness.js";
+import {
+  defaultLocalSchedulingSetupState,
+  type LocalSchedulingSetupState,
+  type LocalSchedulingSetupStore,
+} from "./localSchedulingSetup.js";
 import { cloneStoreValue, type ScheduleStore } from "./store.js";
 
 export class FakeClock implements Clock {
@@ -133,6 +138,22 @@ type FakeHarnessPreflightResult =
 type FakeHarnessStartResult =
   | HarnessStartResult
   | ((request: HarnessStartRequest) => HarnessStartResult);
+
+export class InMemoryLocalSchedulingSetupStore
+  implements LocalSchedulingSetupStore
+{
+  private state = defaultLocalSchedulingSetupState();
+
+  async getLocalSchedulingSetup(): Promise<LocalSchedulingSetupState> {
+    return cloneStoreValue(this.state);
+  }
+
+  async saveLocalSchedulingSetup(
+    state: LocalSchedulingSetupState,
+  ): Promise<void> {
+    this.state = cloneStoreValue(state);
+  }
+}
 
 export class FakeHarness implements AgentHarness {
   readonly mode: HarnessMode;

@@ -30,6 +30,7 @@ import {
 } from "./domain.js";
 import { nextRunAtAfter } from "./cadence.js";
 import type { AgentHarness } from "./harness.js";
+import type { LocalSchedulingStateSource } from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
 
 export interface Clock {
@@ -46,6 +47,7 @@ export interface ScheduleLifecycleOptions {
   clock?: Clock;
   idGenerator?: IdGenerator;
   localSchedulingEnabled?: boolean;
+  localSchedulingSetup?: LocalSchedulingStateSource;
 }
 
 export class SystemClock implements Clock {
@@ -65,6 +67,7 @@ export class ScheduleLifecycle {
   private readonly clock: Clock;
   private readonly idGenerator: IdGenerator;
   private readonly localSchedulingEnabled: boolean;
+  private readonly localSchedulingSetup: LocalSchedulingStateSource | undefined;
   private readonly harnesses: Map<string, AgentHarness>;
 
   constructor(options: ScheduleLifecycleOptions) {
@@ -72,6 +75,7 @@ export class ScheduleLifecycle {
     this.clock = options.clock ?? new SystemClock();
     this.idGenerator = options.idGenerator ?? new RandomIdGenerator();
     this.localSchedulingEnabled = options.localSchedulingEnabled ?? false;
+    this.localSchedulingSetup = options.localSchedulingSetup;
     this.harnesses = new Map(
       options.harnesses.map((harness) => [harness.mode, harness]),
     );
@@ -237,7 +241,7 @@ export class ScheduleLifecycle {
   }
 
   async scanDueWork(): Promise<DueWorkScanResult> {
-    if (!this.localSchedulingEnabled) {
+    if (!(await this.isLocalSchedulingEnabled())) {
       return { startedRunIds: [] };
     }
 
@@ -385,11 +389,12 @@ export class ScheduleLifecycle {
     }
 
     const pendingDeferredRun = await this.store.getPendingDeferredRun(schedule.id);
+    const localSchedulingEnabled = await this.isLocalSchedulingEnabled();
     const preflight = await harness.preflight({
       schedule,
       trigger,
       requestedAt,
-      localSchedulingEnabled: this.localSchedulingEnabled,
+      localSchedulingEnabled,
     });
 
     if (preflight.status === "blocked") {
@@ -797,6 +802,14 @@ export class ScheduleLifecycle {
 
   private nowIso(): IsoTimestamp {
     return this.clock.now().toISOString();
+  }
+
+  private async isLocalSchedulingEnabled(): Promise<boolean> {
+    if (this.localSchedulingSetup) {
+      return this.localSchedulingSetup.isLocalSchedulingEnabled();
+    }
+
+    return this.localSchedulingEnabled;
   }
 }
 
