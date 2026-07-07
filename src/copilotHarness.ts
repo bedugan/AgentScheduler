@@ -30,6 +30,11 @@ type CopilotPermissionBehavior =
   | "bypasses-approval-prompts"
   | "runs-with-autopilot";
 
+type CopilotCloudPermissionBehavior =
+  | "uses-cloud-default-approvals"
+  | "bypasses-cloud-approval-prompts"
+  | "runs-with-cloud-autopilot";
+
 export interface CopilotLocalResolvedHarnessPolicy
   extends ResolvedHarnessPolicy {
   provider: "copilot";
@@ -49,6 +54,25 @@ export interface ResolveCopilotLocalHarnessPolicyInput {
   unattended: boolean;
 }
 
+export interface CopilotCloudResolvedHarnessPolicy
+  extends ResolvedHarnessPolicy {
+  provider: "copilot";
+  harnessMode: "cloud-copilot";
+  approvalMode: ApprovalMode;
+  approvalModeLabel: (typeof COPILOT_APPROVAL_MODE_LABELS)[ApprovalMode];
+  cloudCopilotMode: {
+    approvalPreset: CopilotApprovalPreset;
+    permissionBehavior: CopilotCloudPermissionBehavior;
+    cloudSession: true;
+    unattended: boolean;
+  };
+}
+
+export interface ResolveCopilotCloudHarnessPolicyInput {
+  approvalMode: ApprovalMode;
+  unattended: boolean;
+}
+
 export type CopilotLocalClientAvailability =
   | {
       status: "available";
@@ -63,6 +87,19 @@ export interface CopilotLocalStartRequest extends HarnessStartRequest {
   resolvedHarnessPolicy: CopilotLocalResolvedHarnessPolicy;
 }
 
+export type CopilotCloudClientAvailability =
+  | {
+      status: "available";
+    }
+  | {
+      status: "unavailable";
+      reason: string;
+    };
+
+export interface CopilotCloudStartRequest extends HarnessStartRequest {
+  resolvedHarnessPolicy: CopilotCloudResolvedHarnessPolicy;
+}
+
 export interface CopilotLocalClient {
   checkAvailability(
     schedule: Schedule,
@@ -73,8 +110,22 @@ export interface CopilotLocalClient {
   open(request: HarnessOpenRequest): Promise<HarnessOpenResult>;
 }
 
+export interface CopilotCloudClient {
+  checkAvailability(
+    schedule: Schedule,
+  ): Promise<CopilotCloudClientAvailability>;
+  start(request: CopilotCloudStartRequest): Promise<HarnessStartResult>;
+  status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;
+  cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult>;
+  open(request: HarnessOpenRequest): Promise<HarnessOpenResult>;
+}
+
 export interface CopilotLocalHarnessOptions {
   client: CopilotLocalClient;
+}
+
+export interface CopilotCloudHarnessOptions {
+  client: CopilotCloudClient;
 }
 
 export class CopilotLocalHarness implements AgentHarness {
@@ -143,6 +194,59 @@ export class CopilotLocalHarness implements AgentHarness {
   }
 }
 
+export class CopilotCloudHarness implements AgentHarness {
+  readonly mode = "cloud-copilot" as const;
+
+  private readonly client: CopilotCloudClient;
+
+  constructor(options: CopilotCloudHarnessOptions) {
+    this.client = options.client;
+  }
+
+  async preflight(
+    request: HarnessPreflightRequest,
+  ): Promise<HarnessPreflightResult> {
+    const resolvedHarnessPolicy = resolveCopilotCloudHarnessPolicy({
+      approvalMode: request.schedule.approvalMode,
+      unattended: isUnattendedRun(request),
+    });
+    const availability = await this.client.checkAvailability(request.schedule);
+
+    if (availability.status === "unavailable") {
+      return {
+        status: "blocked",
+        reason: availability.reason,
+        resolvedHarnessPolicy,
+      };
+    }
+
+    return {
+      status: "ready",
+      resolvedHarnessPolicy,
+    };
+  }
+
+  async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
+    return this.client.start({
+      ...request,
+      resolvedHarnessPolicy:
+        request.resolvedHarnessPolicy as CopilotCloudResolvedHarnessPolicy,
+    });
+  }
+
+  async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {
+    return this.client.status(request);
+  }
+
+  async cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult> {
+    return this.client.cancel(request);
+  }
+
+  async open(request: HarnessOpenRequest): Promise<HarnessOpenResult> {
+    return this.client.open(request);
+  }
+}
+
 export function resolveCopilotLocalHarnessPolicy(
   input: ResolveCopilotLocalHarnessPolicyInput,
 ): CopilotLocalResolvedHarnessPolicy {
@@ -155,6 +259,24 @@ export function resolveCopilotLocalHarnessPolicy(
     approvalModeLabel: COPILOT_APPROVAL_MODE_LABELS[input.approvalMode],
     localCopilotMode: {
       ...localCopilotMode,
+      unattended: input.unattended,
+    },
+  };
+}
+
+export function resolveCopilotCloudHarnessPolicy(
+  input: ResolveCopilotCloudHarnessPolicyInput,
+): CopilotCloudResolvedHarnessPolicy {
+  const cloudCopilotMode = cloudCopilotModePolicyFor(input.approvalMode);
+
+  return {
+    provider: "copilot",
+    harnessMode: "cloud-copilot",
+    approvalMode: input.approvalMode,
+    approvalModeLabel: COPILOT_APPROVAL_MODE_LABELS[input.approvalMode],
+    cloudCopilotMode: {
+      ...cloudCopilotMode,
+      cloudSession: true,
       unattended: input.unattended,
     },
   };
@@ -183,6 +305,32 @@ function localCopilotModePolicyFor(
     approvalPreset: "default",
     permissionBehavior: "uses-copilot-default-approvals",
     requiresApprovalSurface: true,
+  };
+}
+
+function cloudCopilotModePolicyFor(
+  approvalMode: ApprovalMode,
+): Omit<
+  CopilotCloudResolvedHarnessPolicy["cloudCopilotMode"],
+  "cloudSession" | "unattended"
+> {
+  if (approvalMode === "bypass-approvals") {
+    return {
+      approvalPreset: "bypass",
+      permissionBehavior: "bypasses-cloud-approval-prompts",
+    };
+  }
+
+  if (approvalMode === "autopilot") {
+    return {
+      approvalPreset: "autopilot",
+      permissionBehavior: "runs-with-cloud-autopilot",
+    };
+  }
+
+  return {
+    approvalPreset: "default",
+    permissionBehavior: "uses-cloud-default-approvals",
   };
 }
 

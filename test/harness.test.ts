@@ -3,9 +3,14 @@ import { describe, it } from "node:test";
 
 import {
   COPILOT_APPROVAL_MODE_LABELS,
+  CopilotCloudHarness,
   CopilotLocalHarness,
   ScheduleLifecycle,
+  resolveCopilotCloudHarnessPolicy,
   resolveCopilotLocalHarnessPolicy,
+  type CopilotCloudClient,
+  type CopilotCloudClientAvailability,
+  type CopilotCloudStartRequest,
   type CopilotLocalClient,
   type CopilotLocalClientAvailability,
   type CopilotLocalStartRequest,
@@ -376,6 +381,228 @@ describe("Copilot Local harness", () => {
   });
 });
 
+describe("Copilot Cloud harness", () => {
+  it("uses Copilot approval wording and maps approval modes to cloud execution policy", () => {
+    assert.deepEqual(
+      resolveCopilotCloudHarnessPolicy({
+        approvalMode: "default-approvals",
+        unattended: true,
+      }),
+      {
+        provider: "copilot",
+        harnessMode: "cloud-copilot",
+        approvalMode: "default-approvals",
+        approvalModeLabel: "Default Approvals",
+        cloudCopilotMode: {
+          approvalPreset: "default",
+          permissionBehavior: "uses-cloud-default-approvals",
+          cloudSession: true,
+          unattended: true,
+        },
+      },
+    );
+
+    assert.deepEqual(
+      resolveCopilotCloudHarnessPolicy({
+        approvalMode: "bypass-approvals",
+        unattended: true,
+      }),
+      {
+        provider: "copilot",
+        harnessMode: "cloud-copilot",
+        approvalMode: "bypass-approvals",
+        approvalModeLabel: "Bypass Approvals",
+        cloudCopilotMode: {
+          approvalPreset: "bypass",
+          permissionBehavior: "bypasses-cloud-approval-prompts",
+          cloudSession: true,
+          unattended: true,
+        },
+      },
+    );
+
+    assert.deepEqual(
+      resolveCopilotCloudHarnessPolicy({
+        approvalMode: "autopilot",
+        unattended: true,
+      }),
+      {
+        provider: "copilot",
+        harnessMode: "cloud-copilot",
+        approvalMode: "autopilot",
+        approvalModeLabel: "Autopilot",
+        cloudCopilotMode: {
+          approvalPreset: "autopilot",
+          permissionBehavior: "runs-with-cloud-autopilot",
+          cloudSession: true,
+          unattended: true,
+        },
+      },
+    );
+  });
+
+  it("records unavailable Cloud Copilot Mode as a blocked run without falling back", async () => {
+    const clock = new FakeClock("2026-07-07T17:05:00.000Z");
+    const client = new RecordingCopilotCloudClient({
+      availability: {
+        status: "unavailable",
+        reason: "GitHub Copilot cloud agents are not available for this account.",
+      },
+    });
+    const cloudHarness = new CopilotCloudHarness({ client });
+    const localHarness = new FakeHarness({ mode: "local-copilot" });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [localHarness, cloudHarness],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run in Cloud Copilot Mode when due.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "cloud-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    await lifecycle.activateSchedule(schedule.id);
+
+    clock.set("2026-07-07T18:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+    assert.equal(client.availabilityRequests.length, 1);
+    assert.equal(client.startRequests.length, 0);
+    assert.equal(localHarness.preflightRequests.length, 0);
+    assert.equal(localHarness.startRequests.length, 0);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns.length, 1);
+    assert.equal(detail.previousRuns[0]?.status, "blocked");
+    assert.equal(
+      detail.previousRuns[0]?.error,
+      "GitHub Copilot cloud agents are not available for this account.",
+    );
+    assert.equal(detail.previousRuns[0]?.harnessMode, "cloud-copilot");
+    assert.equal(
+      detail.previousRuns[0]?.runInstructionsSnapshot,
+      "Run in Cloud Copilot Mode when due.",
+    );
+    assert.equal(
+      detail.previousRuns[0]?.approvalModeSnapshot,
+      "default-approvals",
+    );
+    assert.deepEqual(detail.previousRuns[0]?.resolvedHarnessPolicy, {
+      provider: "copilot",
+      harnessMode: "cloud-copilot",
+      approvalMode: "default-approvals",
+      approvalModeLabel: "Default Approvals",
+      cloudCopilotMode: {
+        approvalPreset: "default",
+        permissionBehavior: "uses-cloud-default-approvals",
+        cloudSession: true,
+        unattended: true,
+      },
+    });
+  });
+
+  it("snapshots cloud policy and delegates start, status, cancellation, open, and review", async () => {
+    const client = new RecordingCopilotCloudClient({
+      availability: {
+        status: "available",
+      },
+      startResult: {
+        externalRunId: "copilot-cloud-run-1",
+        status: "running",
+        completedAt: null,
+        summary: "Copilot cloud run started.",
+      },
+      statusResult: {
+        status: "approval-waiting",
+        completedAt: null,
+        summary: "Copilot cloud run is waiting for approval.",
+        error: null,
+      },
+      cancelResult: {
+        status: "canceled",
+        completedAt: "2026-07-07T18:12:00.000Z",
+        summary: "Copilot cloud run was canceled.",
+        error: null,
+      },
+    });
+    const harness = new CopilotCloudHarness({ client });
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T18:10:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [harness],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run through Cloud Copilot Mode.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "cloud-copilot",
+      model: "gpt-5",
+      approvalMode: "autopilot",
+    });
+
+    const run = await lifecycle.startManualRun(schedule.id);
+
+    assert.equal(run.status, "running");
+    assert.equal(run.harnessMode, "cloud-copilot");
+    assert.equal(run.runInstructionsSnapshot, "Run through Cloud Copilot Mode.");
+    assert.equal(run.approvalModeSnapshot, "autopilot");
+    assert.deepEqual(run.resolvedHarnessPolicy, {
+      provider: "copilot",
+      harnessMode: "cloud-copilot",
+      approvalMode: "autopilot",
+      approvalModeLabel: "Autopilot",
+      cloudCopilotMode: {
+        approvalPreset: "autopilot",
+        permissionBehavior: "runs-with-cloud-autopilot",
+        cloudSession: true,
+        unattended: false,
+      },
+    });
+    assert.equal(client.startRequests.length, 1);
+    assert.equal(client.startRequests[0]?.runInstructions, schedule.runInstructions);
+    assert.deepEqual(
+      client.startRequests[0]?.resolvedHarnessPolicy,
+      run.resolvedHarnessPolicy,
+    );
+
+    const polledRun = await lifecycle.pollRunStatus(run.id);
+    assert.equal(polledRun.status, "approval-waiting");
+    assert.equal(client.statusRequests[0]?.externalRunId, "copilot-cloud-run-1");
+
+    const openResult = await lifecycle.openRun(run.id);
+    const reviewResult = await lifecycle.reviewRun(run.id);
+    assert.deepEqual(openResult, {
+      status: "opened",
+      target: "https://github.com/copilot/agents/copilot-cloud-run-1?view=open",
+    });
+    assert.deepEqual(reviewResult, {
+      status: "opened",
+      target: "https://github.com/copilot/agents/copilot-cloud-run-1?view=review",
+    });
+    assert.deepEqual(
+      client.openRequests.map((request) => request.purpose),
+      ["open", "review"],
+    );
+
+    const canceledRun = await lifecycle.cancelRun(run.id);
+    assert.equal(canceledRun.status, "canceled");
+    assert.equal(canceledRun.summary, "Copilot cloud run was canceled.");
+    assert.equal(client.cancelRequests[0]?.externalRunId, "copilot-cloud-run-1");
+  });
+});
+
 class RecordingCopilotLocalClient implements CopilotLocalClient {
   readonly availabilityRequests: Schedule[] = [];
   readonly startRequests: CopilotLocalStartRequest[] = [];
@@ -452,6 +679,86 @@ class RecordingCopilotLocalClient implements CopilotLocalClient {
     return {
       status: "opened" as const,
       target: `vscode://github.copilot/chat/${request.externalRunId}?mode=${request.purpose}`,
+    };
+  }
+}
+
+class RecordingCopilotCloudClient implements CopilotCloudClient {
+  readonly availabilityRequests: Schedule[] = [];
+  readonly startRequests: CopilotCloudStartRequest[] = [];
+  readonly statusRequests: HarnessStatusRequest[] = [];
+  readonly cancelRequests: HarnessCancelRequest[] = [];
+  readonly openRequests: HarnessOpenRequest[] = [];
+
+  private readonly availability: CopilotCloudClientAvailability;
+  private readonly startResult: HarnessStartResult | undefined;
+  private readonly statusResult: HarnessStatusResult | undefined;
+  private readonly cancelResult: HarnessCancelResult | undefined;
+
+  constructor(options: {
+    availability: CopilotCloudClientAvailability;
+    startResult?: Awaited<ReturnType<CopilotCloudClient["start"]>>;
+    statusResult?: Awaited<ReturnType<CopilotCloudClient["status"]>>;
+    cancelResult?: Awaited<ReturnType<CopilotCloudClient["cancel"]>>;
+  }) {
+    this.availability = options.availability;
+    this.startResult = options.startResult;
+    this.statusResult = options.statusResult;
+    this.cancelResult = options.cancelResult;
+  }
+
+  async checkAvailability(schedule: Schedule): Promise<CopilotCloudClientAvailability> {
+    this.availabilityRequests.push(structuredClone(schedule));
+    return structuredClone(this.availability);
+  }
+
+  async start(request: CopilotCloudStartRequest): Promise<HarnessStartResult> {
+    this.startRequests.push(structuredClone(request));
+    const defaultResult: HarnessStartResult = {
+      externalRunId: "copilot-cloud-run-1",
+      status: "running",
+      completedAt: null,
+      summary: "Copilot cloud run started.",
+    };
+
+    return structuredClone(
+      this.startResult ?? defaultResult,
+    );
+  }
+
+  async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {
+    this.statusRequests.push(structuredClone(request));
+    const defaultResult: HarnessStatusResult = {
+      status: "running",
+      completedAt: null,
+      summary: "Copilot cloud run is running.",
+      error: null,
+    };
+
+    return structuredClone(
+      this.statusResult ?? defaultResult,
+    );
+  }
+
+  async cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult> {
+    this.cancelRequests.push(structuredClone(request));
+    const defaultResult: HarnessCancelResult = {
+      status: "canceled",
+      completedAt: request.requestedAt,
+      summary: "Copilot cloud run was canceled.",
+      error: null,
+    };
+
+    return structuredClone(
+      this.cancelResult ?? defaultResult,
+    );
+  }
+
+  async open(request: HarnessOpenRequest) {
+    this.openRequests.push(structuredClone(request));
+    return {
+      status: "opened" as const,
+      target: `https://github.com/copilot/agents/${request.externalRunId}?view=${request.purpose}`,
     };
   }
 }
