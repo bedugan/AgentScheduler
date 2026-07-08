@@ -567,30 +567,34 @@ describe("local scheduling setup", () => {
       assert.equal(scan.startedRunIds.length, 1);
       assert.equal(scan.diagnostics.dueScheduleCount, 1);
       assert.equal(scan.diagnostics.outcomes.completed, 1);
-      assert.deepEqual(runner.calls, [
-        {
-          command: "/worker/bin/copilot",
-          args: ["--version"],
-          options: { timeoutMs: 5_000 },
-        },
-        {
-          command: "/worker/bin/copilot",
-          args: [
-            "-C",
-            "/tmp/agent-scheduler",
-            "--model",
-            "gpt-5",
-            "--output-format",
-            "json",
-            "--no-color",
-            "--no-ask-user",
-            "--allow-all-tools",
-            "-p",
-            "Run from the worker CLI due scan.",
-          ],
-          options: { timeoutMs: 1_800_000 },
-        },
+      assert.equal(runner.calls.length, 2);
+      assert.deepEqual(runner.calls[0], {
+        command: "/worker/bin/copilot",
+        args: ["--version"],
+        options: { timeoutMs: 5_000 },
+      });
+      assert.equal(runner.calls[1]?.command, "/worker/bin/copilot");
+      assert.deepEqual(runner.calls[1]?.args.slice(0, -1), [
+        "-C",
+        "/tmp/agent-scheduler",
+        "--model",
+        "gpt-5",
+        "--output-format",
+        "json",
+        "--no-color",
+        "--no-ask-user",
+        "--allow-all-tools",
+        "-p",
       ]);
+      assert.equal(runner.calls[1]?.options?.timeoutMs, 1_800_000);
+      assert.match(
+        runner.calls[1]?.args.at(-1) ?? "",
+        /AgentScheduler execution frame/,
+      );
+      assert.match(
+        runner.calls[1]?.args.at(-1) ?? "",
+        /Run from the worker CLI due scan\./,
+      );
 
       const history = await workerHistory(databasePath, "schedule_due_from_cli");
       assert.equal(history.length, 1);
