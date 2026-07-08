@@ -22,6 +22,7 @@ import {
   type VsCodeQuickPickOptionsLike,
   type VsCodeScheduleEditor,
   type VsCodeWebviewPanelLike,
+  type VsCodeWebviewLike,
   type VsCodeWindowLike,
 } from "../src/vscodeExtensionAdapter.js";
 import {
@@ -181,8 +182,12 @@ describe("VS Code extension adapter", () => {
     const panel = window.panels[0];
     assert.equal(panel?.viewType, SCHEDULE_DETAIL_VIEW_TYPE);
     assert.equal(panel?.title, "AgentScheduler Schedule");
+    assert.deepEqual(panel?.options, {
+      enableScripts: true,
+      retainContextWhenHidden: true,
+    });
     assert.match(panel?.webview.html ?? "", /Editable Fields/);
-    assert.match(panel?.webview.html ?? "", /name="model" value="gpt-5"/);
+    assert.match(panel?.webview.html ?? "", /name="model"[^>]*value="gpt-5"/);
     assert.match(panel?.webview.html ?? "", /data-action="activate"/);
     assert.match(
       panel?.webview.html ?? "",
@@ -235,7 +240,211 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /Fake harness completed the draft run\./);
     assert.match(html, /data-action="run-now" data-state="enabled"/);
     assert.match(html, /Local Scheduling/);
-    assert.match(html, /name="approval-mode" value="default-approvals"/);
+    assert.match(html, /name="approvalMode"/);
+    assert.match(html, /value="default-approvals" selected/);
+  });
+
+  it("saves Schedule Detail edits through the Editor Control Surface and refreshes the panel", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "cloud-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const panel = requiredPanel(window);
+
+    await panel.webview.postMessageFromWebview({
+      type: "save",
+      scheduleId: detail.schedule.id,
+      fields: {
+        runInstructions: "Review issue #24 and update the schedule.",
+        cadenceExpression: "*/15 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "cloud-copilot",
+        model: "gpt-5.1",
+        approvalMode: "autopilot",
+        runCapMaxRuns: "3",
+      },
+    });
+
+    const saved = await store.getSchedule(detail.schedule.id);
+    assert.equal(saved?.revision, 2);
+    assert.equal(
+      saved?.runInstructions,
+      "Review issue #24 and update the schedule.",
+    );
+    assert.deepEqual(saved?.cadence, {
+      type: "cron",
+      expression: "*/15 * * * *",
+    });
+    assert.deepEqual(saved?.targetContext, {
+      type: "workspace",
+      uri: "file:///Users/ada/src/AgentScheduler",
+      label: "AgentScheduler",
+    });
+    assert.equal(saved?.harnessMode, "cloud-copilot");
+    assert.equal(saved?.model, "gpt-5.1");
+    assert.equal(saved?.approvalMode, "autopilot");
+    assert.deepEqual(saved?.runCounter, { completed: 0, limit: 3 });
+
+    assert.match(panel.webview.html, /Review issue #24 and update the schedule\./);
+    assert.match(panel.webview.html, /name="model"[^>]*value="gpt-5\.1"/);
+    assert.match(panel.webview.html, /name="runCapMaxRuns"[^>]*value="3"/);
+    assert.doesNotMatch(panel.webview.html, /role="alert"/);
+  });
+
+  it("activates a draft schedule from the Schedule Detail panel and refreshes action state", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const panel = requiredPanel(window);
+
+    await panel.webview.postMessageFromWebview({
+      type: "save",
+      scheduleId: detail.schedule.id,
+      fields: {
+        runInstructions: "Run the activation smoke test.",
+        cadenceExpression: "0 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+        runCapMaxRuns: "",
+      },
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "activate",
+      scheduleId: detail.schedule.id,
+    });
+
+    const activated = await store.getSchedule(detail.schedule.id);
+    assert.equal(activated?.status, "active");
+    assert.equal(activated?.enabled, true);
+    assert.equal(activated?.nextRunAt, "2026-07-07T17:00:00.000Z");
+    assert.equal(activated?.runCounter.limit, null);
+
+    assert.match(panel.webview.html, /<dd>active<\/dd>/);
+    assert.match(
+      panel.webview.html,
+      /data-action="activate" data-state="disabled" disabled/,
+    );
+    assert.match(
+      panel.webview.html,
+      /Automatic runs are inactive until local scheduling setup is enabled\./,
+    );
+  });
+
+  it("shows lifecycle validation failures inline in the Schedule Detail panel", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const panel = requiredPanel(window);
+
+    await panel.webview.postMessageFromWebview({
+      type: "activate",
+      scheduleId: detail.schedule.id,
+    });
+
+    const draft = await store.getSchedule(detail.schedule.id);
+    assert.equal(draft?.status, "draft");
+    assert.match(panel.webview.html, /role="alert"/);
+    assert.match(
+      panel.webview.html,
+      /Run instructions are required before activation\./,
+    );
+    assert.equal(window.errorMessages.length, 0);
   });
 });
 
@@ -258,6 +467,12 @@ function commandCallback(
   return callback;
 }
 
+function requiredPanel(window: RecordingWindow): RecordingPanel {
+  const panel = window.panels.at(-1);
+  assert.ok(panel, "Expected a Schedule Detail panel.");
+  return panel;
+}
+
 class RecordingCommands implements VsCodeCommandsLike {
   readonly registrations = new Map<string, (...args: unknown[]) => unknown>();
 
@@ -278,6 +493,30 @@ interface RecordingPanel extends VsCodeWebviewPanelLike {
   viewType: string;
   showOptions: unknown;
   options: unknown;
+  webview: RecordingWebview;
+}
+
+class RecordingWebview implements VsCodeWebviewLike {
+  html = "";
+  private readonly messageHandlers: Array<(message: unknown) => unknown> = [];
+
+  onDidReceiveMessage(
+    listener: (message: unknown) => unknown,
+  ): VsCodeDisposableLike {
+    this.messageHandlers.push(listener);
+    return {
+      dispose: () => {
+        const index = this.messageHandlers.indexOf(listener);
+        if (index !== -1) {
+          this.messageHandlers.splice(index, 1);
+        }
+      },
+    };
+  }
+
+  async postMessageFromWebview(message: unknown): Promise<void> {
+    await Promise.all(this.messageHandlers.map((handler) => handler(message)));
+  }
 }
 
 class RecordingWindow implements VsCodeWindowLike {
@@ -300,7 +539,7 @@ class RecordingWindow implements VsCodeWindowLike {
       title,
       showOptions,
       options,
-      webview: { html: "" },
+      webview: new RecordingWebview(),
     };
     this.panels.push(panel);
     return panel;
@@ -332,6 +571,14 @@ class EmptyScheduleEditor implements VsCodeScheduleEditor {
 
   async openScheduleDetail(): Promise<ScheduleDetailView> {
     throw new Error("openScheduleDetail should not be called.");
+  }
+
+  async saveScheduleDetailEdits(): Promise<ScheduleDetailView> {
+    throw new Error("saveScheduleDetailEdits should not be called.");
+  }
+
+  async activateSchedule(): Promise<ScheduleDetailView> {
+    throw new Error("activateSchedule should not be called.");
   }
 
   async listSchedules(): Promise<[]> {
