@@ -130,6 +130,11 @@ describe("Copilot Local harness", () => {
         localCopilotMode: {
           approvalPreset: "default",
           permissionBehavior: "uses-copilot-default-approvals",
+          cli: {
+            promptFlag: "-p",
+            outputFormat: "json",
+            permissionFlags: [],
+          },
           requiresApprovalSurface: true,
           unattended: true,
         },
@@ -149,6 +154,11 @@ describe("Copilot Local harness", () => {
         localCopilotMode: {
           approvalPreset: "bypass",
           permissionBehavior: "bypasses-approval-prompts",
+          cli: {
+            promptFlag: "-p",
+            outputFormat: "json",
+            permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+          },
           requiresApprovalSurface: false,
           unattended: true,
         },
@@ -168,6 +178,11 @@ describe("Copilot Local harness", () => {
         localCopilotMode: {
           approvalPreset: "autopilot",
           permissionBehavior: "runs-with-autopilot",
+          cli: {
+            promptFlag: "-p",
+            outputFormat: "json",
+            permissionFlags: ["--no-ask-user", "--autopilot", "--allow-all"],
+          },
           requiresApprovalSurface: false,
           unattended: true,
         },
@@ -205,6 +220,11 @@ describe("Copilot Local harness", () => {
       localCopilotMode: {
         approvalPreset: "default",
         permissionBehavior: "uses-copilot-default-approvals",
+        cli: {
+          promptFlag: "-p",
+          outputFormat: "json",
+          permissionFlags: [],
+        },
         requiresApprovalSurface: true,
         unattended: true,
       },
@@ -261,6 +281,11 @@ describe("Copilot Local harness", () => {
       localCopilotMode: {
         approvalPreset: "default",
         permissionBehavior: "uses-copilot-default-approvals",
+        cli: {
+          promptFlag: "-p",
+          outputFormat: "json",
+          permissionFlags: [],
+        },
         requiresApprovalSurface: true,
         unattended: true,
       },
@@ -325,6 +350,11 @@ describe("Copilot Local harness", () => {
       localCopilotMode: {
         approvalPreset: "bypass",
         permissionBehavior: "bypasses-approval-prompts",
+        cli: {
+          promptFlag: "-p",
+          outputFormat: "json",
+          permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+        },
         requiresApprovalSurface: false,
         unattended: false,
       },

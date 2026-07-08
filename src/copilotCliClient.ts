@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import type {
   ScheduleHarnessModeAvailability,
+  TargetContext,
 } from "./domain.js";
 import {
   HARNESS_MODE_LABELS,
@@ -26,9 +28,11 @@ import type {
 } from "./harness.js";
 
 export const DEFAULT_COPILOT_CLI_COMMAND = "copilot";
+export const DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS = 30 * 60 * 1_000;
+const DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS = 5_000;
 
 export const COPILOT_CLI_MISSING_REASON =
-  "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH.";
+  "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH. OS wakeup triggers can use a different PATH than your interactive shell; set COPILOT_CLI_PATH or install `copilot` in a worker-visible path.";
 
 export const COPILOT_CLI_AUTH_UNAVAILABLE_REASON =
   "GitHub Copilot CLI is installed but not authenticated. Run `copilot login` in an interactive shell, or configure `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` for unattended worker contexts.";
@@ -41,10 +45,15 @@ export interface CopilotCliCommandResult {
   errorMessage?: string;
 }
 
+export interface CopilotCliCommandRunOptions {
+  timeoutMs?: number;
+}
+
 export interface CopilotCliCommandRunner {
   run(
     command: string,
     args: readonly string[],
+    options?: CopilotCliCommandRunOptions,
   ): Promise<CopilotCliCommandResult>;
 }
 
@@ -52,6 +61,7 @@ export interface CopilotCliLocalClientOptions {
   command?: string;
   runner?: CopilotCliCommandRunner;
   cachedAvailability?: CopilotLocalClientAvailability;
+  runTimeoutMs?: number;
 }
 
 export interface CreateDefaultCopilotLocalHarnessOptions {
@@ -61,6 +71,7 @@ export interface CreateDefaultCopilotLocalHarnessOptions {
 export class CopilotCliLocalClient implements CopilotLocalClient {
   private readonly command: string;
   private readonly runner: CopilotCliCommandRunner;
+  private readonly runTimeoutMs: number;
   private cachedAvailability: CopilotLocalClientAvailability | undefined;
 
   constructor(options: CopilotCliLocalClientOptions = {}) {
@@ -69,6 +80,8 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
       process.env.COPILOT_CLI_PATH ??
       DEFAULT_COPILOT_CLI_COMMAND;
     this.runner = options.runner ?? new ExecFileCopilotCliCommandRunner();
+    this.runTimeoutMs =
+      options.runTimeoutMs ?? DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS;
     this.cachedAvailability = options.cachedAvailability;
   }
 
@@ -81,19 +94,22 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
       return this.cachedAvailability;
     }
 
-    const result = await this.runner.run(this.command, ["--version"]);
+    const result = await this.runner.run(this.command, ["--version"], {
+      timeoutMs: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
+    });
     this.cachedAvailability = classifyCopilotCliAvailability(result);
     return this.cachedAvailability;
   }
 
   async start(request: CopilotLocalStartRequest): Promise<HarnessStartResult> {
-    return {
-      externalRunId: `copilot-cli-unimplemented:${request.schedule.id}`,
-      status: "failed",
-      completedAt: request.requestedAt,
-      summary:
-        "Copilot CLI is available, but Local Copilot Mode execution is not wired yet.",
-    };
+    const result = await this.runner.run(
+      this.command,
+      copilotPromptArgsFor(request),
+      {
+        timeoutMs: this.runTimeoutMs,
+      },
+    );
+    return harnessStartResultForCopilotCliCommand(request, result);
   }
 
   async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {
@@ -146,7 +162,7 @@ export function detectCopilotCliAvailabilitySync(
 ): CopilotLocalClientAvailability {
   const result = spawnSync(command, ["--version"], {
     encoding: "utf8",
-    timeout: 5_000,
+    timeout: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
   });
 
   const commandResult: CopilotCliCommandResult = {
@@ -241,25 +257,244 @@ class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
   async run(
     command: string,
     args: readonly string[],
+    options: CopilotCliCommandRunOptions = {},
   ): Promise<CopilotCliCommandResult> {
     return new Promise((resolve) => {
-      execFile(command, [...args], { timeout: 5_000 }, (error, stdout, stderr) => {
-        const result: CopilotCliCommandResult = {
-          exitCode: exitCodeFor(error),
-          stdout,
-          stderr,
-        };
-        if (error?.message) {
-          result.errorMessage = error.message;
-        }
-        const errorCode = (error as NodeJS.ErrnoException | null)?.code;
-        if (typeof errorCode === "string") {
-          result.errorCode = errorCode;
-        }
-        resolve(result);
-      });
+      execFile(
+        command,
+        [...args],
+        {
+          timeout: options.timeoutMs ?? DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
+          maxBuffer: 10 * 1024 * 1024,
+        },
+        (error, stdout, stderr) => {
+          const result: CopilotCliCommandResult = {
+            exitCode: exitCodeFor(error),
+            stdout,
+            stderr,
+          };
+          if (error?.message) {
+            result.errorMessage = error.message;
+          }
+          const errorCode = (error as NodeJS.ErrnoException | null)?.code;
+          if (typeof errorCode === "string") {
+            result.errorCode = errorCode;
+          }
+          resolve(result);
+        },
+      );
     });
   }
+}
+
+function copilotPromptArgsFor(request: CopilotLocalStartRequest): string[] {
+  const args: string[] = [];
+  const workspaceDirectory = workspaceDirectoryFor(request.schedule.targetContext);
+  if (workspaceDirectory) {
+    args.push("-C", workspaceDirectory);
+  }
+
+  const model = request.schedule.model.trim();
+  if (model) {
+    args.push("--model", model);
+  }
+
+  args.push(
+    "--output-format",
+    request.resolvedHarnessPolicy.localCopilotMode.cli.outputFormat,
+    "--no-color",
+    ...request.resolvedHarnessPolicy.localCopilotMode.cli.permissionFlags,
+    request.resolvedHarnessPolicy.localCopilotMode.cli.promptFlag,
+    request.runInstructions,
+  );
+
+  return args;
+}
+
+function harnessStartResultForCopilotCliCommand(
+  request: CopilotLocalStartRequest,
+  result: CopilotCliCommandResult,
+): HarnessStartResult {
+  const parsed = parseCopilotJsonOutput(result.stdout);
+  const processSucceeded = result.exitCode === 0;
+  const copilotSucceeded =
+    parsed.exitCode === undefined || parsed.exitCode === 0;
+  const status = processSucceeded && copilotSucceeded ? "completed" : "failed";
+
+  return {
+    externalRunId:
+      parsed.sessionId ?? `copilot-cli:${request.schedule.id}:${request.requestedAt}`,
+    status,
+    completedAt: request.requestedAt,
+    summary: summaryForCopilotCliCommand(status, result, parsed),
+  };
+}
+
+interface ParsedCopilotJsonOutput {
+  sessionId?: string;
+  exitCode?: number;
+  assistantSummary?: string;
+  errorSummary?: string;
+}
+
+function parseCopilotJsonOutput(output: string): ParsedCopilotJsonOutput {
+  const parsed: ParsedCopilotJsonOutput = {};
+
+  for (const line of output.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const event = parseJsonObject(trimmed);
+    if (!event) {
+      continue;
+    }
+
+    const assistantSummary = assistantSummaryFromEvent(event);
+    if (assistantSummary) {
+      parsed.assistantSummary = assistantSummary;
+    }
+
+    const errorSummary = errorSummaryFromEvent(event);
+    if (errorSummary) {
+      parsed.errorSummary = errorSummary;
+    }
+
+    if (event.type === "result") {
+      const sessionId = stringProperty(event, "sessionId");
+      if (sessionId) {
+        parsed.sessionId = sessionId;
+      }
+      const exitCode = numberProperty(event, "exitCode");
+      if (exitCode !== undefined) {
+        parsed.exitCode = exitCode;
+      }
+    }
+  }
+
+  return parsed;
+}
+
+function summaryForCopilotCliCommand(
+  status: HarnessStartResult["status"],
+  result: CopilotCliCommandResult,
+  parsed: ParsedCopilotJsonOutput,
+): string | null {
+  if (parsed.assistantSummary) {
+    return parsed.assistantSummary;
+  }
+
+  if (status === "failed") {
+    return (
+      parsed.errorSummary ??
+      firstNonEmptyLine(result.stderr) ??
+      result.errorMessage ??
+      firstNonEmptyLine(result.stdout) ??
+      "Copilot CLI run failed."
+    );
+  }
+
+  return firstNonEmptyLine(result.stdout) ?? "Copilot CLI run completed.";
+}
+
+function parseJsonObject(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function assistantSummaryFromEvent(
+  event: Record<string, unknown>,
+): string | undefined {
+  if (event.type !== "assistant") {
+    return undefined;
+  }
+
+  return textFromContent(event.message) ?? textFromContent(event.data);
+}
+
+function errorSummaryFromEvent(
+  event: Record<string, unknown>,
+): string | undefined {
+  if (event.type !== "error") {
+    return undefined;
+  }
+
+  return (
+    stringProperty(event, "message") ??
+    textFromContent(event.error) ??
+    textFromContent(event.data)
+  );
+}
+
+function textFromContent(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return normalizedText(value);
+  }
+
+  if (Array.isArray(value)) {
+    return normalizedText(
+      value
+        .map((entry) => textFromContent(entry))
+        .filter((entry): entry is string => Boolean(entry))
+        .join("\n"),
+    );
+  }
+
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  return (
+    textFromContent(value.content) ??
+    textFromContent(value.text) ??
+    textFromContent(value.data) ??
+    textFromContent(value.message)
+  );
+}
+
+function normalizedText(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function stringProperty(
+  value: Record<string, unknown>,
+  propertyName: string,
+): string | undefined {
+  const property = value[propertyName];
+  return typeof property === "string" && property.trim().length > 0
+    ? property
+    : undefined;
+}
+
+function numberProperty(
+  value: Record<string, unknown>,
+  propertyName: string,
+): number | undefined {
+  const property = value[propertyName];
+  return typeof property === "number" ? property : undefined;
+}
+
+function workspaceDirectoryFor(targetContext: TargetContext | null): string | null {
+  if (!targetContext || targetContext.type !== "workspace") {
+    return null;
+  }
+
+  try {
+    const targetUrl = new URL(targetContext.uri);
+    return targetUrl.protocol === "file:" ? fileURLToPath(targetUrl) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function exitCodeFor(error: Error | null): number | null {

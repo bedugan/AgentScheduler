@@ -46,6 +46,11 @@ export interface CopilotLocalResolvedHarnessPolicy
   localCopilotMode: {
     approvalPreset: CopilotApprovalPreset;
     permissionBehavior: CopilotPermissionBehavior;
+    cli: {
+      promptFlag: "-p";
+      outputFormat: "json";
+      permissionFlags: readonly string[];
+    };
     requiresApprovalSurface: boolean;
     unattended: boolean;
   };
@@ -306,6 +311,11 @@ function localCopilotModePolicyFor(
     return {
       approvalPreset: "bypass",
       permissionBehavior: "bypasses-approval-prompts",
+      cli: {
+        promptFlag: "-p",
+        outputFormat: "json",
+        permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+      },
       requiresApprovalSurface: false,
     };
   }
@@ -314,6 +324,11 @@ function localCopilotModePolicyFor(
     return {
       approvalPreset: "autopilot",
       permissionBehavior: "runs-with-autopilot",
+      cli: {
+        promptFlag: "-p",
+        outputFormat: "json",
+        permissionFlags: ["--no-ask-user", "--autopilot", "--allow-all"],
+      },
       requiresApprovalSurface: false,
     };
   }
@@ -321,6 +336,11 @@ function localCopilotModePolicyFor(
   return {
     approvalPreset: "default",
     permissionBehavior: "uses-copilot-default-approvals",
+    cli: {
+      promptFlag: "-p",
+      outputFormat: "json",
+      permissionFlags: [],
+    },
     requiresApprovalSurface: true,
   };
 }

@@ -6,10 +6,15 @@ import { performance } from "node:perf_hooks";
 import { describe, it } from "node:test";
 
 import {
+  CopilotCliLocalClient,
+  CopilotLocalHarness,
   EditorControlSurface,
   ScheduleLifecycle,
   SqliteScheduleStore,
   VsCodeNaturalLanguageScheduleCreationFlow,
+  type CopilotCliCommandResult,
+  type CopilotCliCommandRunOptions,
+  type CopilotCliCommandRunner,
 } from "../src/index.js";
 import type { Schedule } from "../src/index.js";
 import {
@@ -1075,6 +1080,99 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     });
   });
 
+  it("starts manual Local Copilot Mode runs through the Copilot CLI client", async () => {
+    const runner = new RecordingCopilotCliCommandRunner({
+      exitCode: 0,
+      stdout: [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            data: {
+              content: [{ type: "text", text: "Manual CLI run completed." }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "result",
+          sessionId: "manual-cli-session",
+          exitCode: 0,
+        }),
+      ].join("\n"),
+      stderr: "",
+    });
+    const harness = new CopilotLocalHarness({
+      client: new CopilotCliLocalClient({
+        command: "/custom/copilot",
+        runner,
+        cachedAvailability: {
+          status: "available",
+          approvalSurfaceAvailable: false,
+        },
+      }),
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [harness],
+    });
+
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run the concrete Copilot CLI client.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "bypass-approvals",
+    });
+
+    const run = await lifecycle.startManualRun(schedule.id);
+
+    assert.equal(run.status, "completed");
+    assert.equal(run.externalRunId, "manual-cli-session");
+    assert.equal(run.summary, "Manual CLI run completed.");
+    assert.deepEqual(run.resolvedHarnessPolicy, {
+      provider: "copilot",
+      harnessMode: "local-copilot",
+      approvalMode: "bypass-approvals",
+      approvalModeLabel: "Bypass Approvals",
+      localCopilotMode: {
+        approvalPreset: "bypass",
+        permissionBehavior: "bypasses-approval-prompts",
+        cli: {
+          promptFlag: "-p",
+          outputFormat: "json",
+          permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+        },
+        requiresApprovalSurface: false,
+        unattended: false,
+      },
+    });
+    assert.deepEqual(runner.calls, [
+      {
+        command: "/custom/copilot",
+        args: [
+          "-C",
+          "/tmp/agent-scheduler",
+          "--model",
+          "gpt-5",
+          "--output-format",
+          "json",
+          "--no-color",
+          "--no-ask-user",
+          "--allow-all-tools",
+          "-p",
+          "Run the concrete Copilot CLI client.",
+        ],
+        options: { timeoutMs: 1_800_000 },
+      },
+    ]);
+  });
+
   it("blocks activation when a registered harness reports itself unavailable", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:05:00.000Z"),
@@ -1247,6 +1345,25 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     );
   });
 });
+
+class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
+  readonly calls: Array<{
+    command: string;
+    args: string[];
+    options: CopilotCliCommandRunOptions | undefined;
+  }> = [];
+
+  constructor(private readonly result: CopilotCliCommandResult) {}
+
+  async run(
+    command: string,
+    args: readonly string[],
+    options?: CopilotCliCommandRunOptions,
+  ): Promise<CopilotCliCommandResult> {
+    this.calls.push({ command, args: [...args], options });
+    return structuredClone(this.result);
+  }
+}
 
 describe("VS Code natural-language schedule creation", () => {
   it("activates a complete request after one confirmation with VS Code defaults", async () => {

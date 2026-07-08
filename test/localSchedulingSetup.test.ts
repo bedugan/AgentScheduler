@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
+  COPILOT_CLI_AUTH_UNAVAILABLE_REASON,
+  COPILOT_CLI_MISSING_REASON,
+  CopilotCliLocalClient,
+  CopilotLocalHarness,
   EditorControlSurface,
   LocalSchedulingSetup,
   MacOsLaunchdWakeupProvider,
@@ -14,8 +18,14 @@ import {
   runWorkerCli,
 } from "../src/index.js";
 import type {
+  CopilotCliCommandResult,
+  CopilotCliCommandRunOptions,
+  CopilotCliCommandRunner,
+  DueWorkScanResult,
   LocalSchedulingSetupResult,
   LocalSchedulingSetupState,
+  RunHistoryEntry,
+  Schedule,
   WakeupProvider,
   WakeupTriggerIntent,
   WakeupTriggerOperation,
@@ -488,97 +498,378 @@ describe("local scheduling setup", () => {
     }
   });
 
-  it("runs worker CLI due scans from the SQLite store used by the wakeup trigger", async () => {
-    const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
-    const databasePath = join(tempDirectory, "schedules.sqlite");
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-
-    try {
-      const store = new SqliteScheduleStore({ databasePath });
-      await store.saveLocalSchedulingSetup({
-        enabled: true,
-        platform: "windows",
-        triggerId: "AgentSchedulerLocalWakeup",
-        installedAt: "2026-07-07T16:00:00.000Z",
-        verifiedAt: null,
-        updatedAt: "2026-07-07T16:00:00.000Z",
+  it("keeps worker CLI no-due scans from starting Copilot CLI", async () => {
+    await withWorkerStore(async (databasePath) => {
+      await seedWorkerStore(databasePath, []);
+      const runner = new RecordingCopilotCliCommandRunner({
+        exitCode: 0,
+        stdout: "GitHub Copilot CLI 1.0.69",
+        stderr: "",
       });
-      await store.saveSchedule({
-        id: "schedule_due_from_cli",
-        revision: 1,
-        status: "active",
-        enabled: true,
-        runInstructions: "Run from the worker CLI due scan.",
-        cadence: { type: "cron", expression: "0 * * * *" },
-        targetContext: {
-          type: "workspace",
-          uri: "file:///tmp/agent-scheduler",
-        },
-        harnessMode: "local-copilot",
-        model: "gpt-5",
-        approvalMode: "default-approvals",
-        runCounter: { completed: 0, limit: null },
-        nextRunAt: "2000-01-01T00:00:00.000Z",
-        lastRunAt: null,
-        createdAt: "2026-07-07T16:00:00.000Z",
-        updatedAt: "2026-07-07T16:00:00.000Z",
-      });
-      store.close();
 
-      assert.equal(
-        await runWorkerCli(
-          ["scan-due-work", "--store", databasePath],
-          {
-            stdout,
-            stderr,
-          },
-          { harnesses: [] },
-        ),
-        0,
-      );
+      const scan = await runWorkerScan(databasePath, runner);
 
-      assert.equal(stderr.length, 0);
-      const scan = JSON.parse(stdout[0] ?? "{}") as {
-        startedRunIds: string[];
-        diagnostics: {
-          localScheduling: { enabled: boolean };
-          wakeupProvider: {
-            configured: boolean;
-            platform: string | null;
-            triggerId: string | null;
-            status: string;
-          };
-          dueScheduleCount: number;
-          outcomes: { blocked: number };
-        };
-      };
+      assert.deepEqual(runner.calls, []);
       assert.deepEqual(scan.startedRunIds, []);
       assert.equal(scan.diagnostics.localScheduling.enabled, true);
-      assert.deepEqual(scan.diagnostics.wakeupProvider, {
-        configured: true,
-        platform: "windows",
-        triggerId: "AgentSchedulerLocalWakeup",
-        status: "installed",
+      assert.equal(scan.diagnostics.dueScheduleCount, 0);
+      assert.deepEqual(scan.diagnostics.outcomes, {
+        started: 0,
+        completed: 0,
+        blocked: 0,
+        deferred: 0,
+        approvalWaiting: 0,
+        failed: 0,
       });
-      assert.equal(scan.diagnostics.dueScheduleCount, 1);
-      assert.equal(scan.diagnostics.outcomes.blocked, 1);
+    });
+  });
 
-      const reopenedStore = new SqliteScheduleStore({ databasePath });
-      const history = await reopenedStore.listRunHistory("schedule_due_from_cli");
+  it("runs due worker schedules through Copilot CLI from the target workspace", async () => {
+    await withWorkerStore(async (databasePath) => {
+      await seedWorkerStore(databasePath, [
+        workerSchedule({
+          id: "schedule_due_from_cli",
+          approvalMode: "bypass-approvals",
+          runInstructions: "Run from the worker CLI due scan.",
+        }),
+      ]);
+      const runner = new RecordingCopilotCliCommandRunner([
+        {
+          exitCode: 0,
+          stdout: "GitHub Copilot CLI 1.0.69",
+          stderr: "",
+        },
+        {
+          exitCode: 0,
+          stdout: [
+            JSON.stringify({
+              type: "assistant",
+              message: {
+                data: {
+                  content: [
+                    { type: "text", text: "Worker CLI run completed." },
+                  ],
+                },
+              },
+            }),
+            JSON.stringify({
+              type: "result",
+              sessionId: "worker-cli-session",
+              exitCode: 0,
+            }),
+          ].join("\n"),
+          stderr: "",
+        },
+      ]);
+
+      const scan = await runWorkerScan(databasePath, runner);
+
+      assert.equal(scan.startedRunIds.length, 1);
+      assert.equal(scan.diagnostics.dueScheduleCount, 1);
+      assert.equal(scan.diagnostics.outcomes.completed, 1);
+      assert.deepEqual(runner.calls, [
+        {
+          command: "/worker/bin/copilot",
+          args: ["--version"],
+          options: { timeoutMs: 5_000 },
+        },
+        {
+          command: "/worker/bin/copilot",
+          args: [
+            "-C",
+            "/tmp/agent-scheduler",
+            "--model",
+            "gpt-5",
+            "--output-format",
+            "json",
+            "--no-color",
+            "--no-ask-user",
+            "--allow-all-tools",
+            "-p",
+            "Run from the worker CLI due scan.",
+          ],
+          options: { timeoutMs: 1_800_000 },
+        },
+      ]);
+
+      const history = await workerHistory(databasePath, "schedule_due_from_cli");
       assert.equal(history.length, 1);
       assert.equal(history[0]?.trigger, "automatic");
+      assert.equal(history[0]?.status, "completed");
+      assert.equal(history[0]?.externalRunId, "worker-cli-session");
+      assert.equal(history[0]?.summary, "Worker CLI run completed.");
+      assert.equal(history[0]?.error, null);
+      assert.deepEqual(history[0]?.resolvedHarnessPolicy, {
+        provider: "copilot",
+        harnessMode: "local-copilot",
+        approvalMode: "bypass-approvals",
+        approvalModeLabel: "Bypass Approvals",
+        localCopilotMode: {
+          approvalPreset: "bypass",
+          permissionBehavior: "bypasses-approval-prompts",
+          cli: {
+            promptFlag: "-p",
+            outputFormat: "json",
+            permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+          },
+          requiresApprovalSurface: false,
+          unattended: true,
+        },
+      });
+    });
+  });
+
+  it("blocks worker due runs with fetch guidance when Copilot CLI is missing from PATH", async () => {
+    await withWorkerStore(async (databasePath) => {
+      await seedWorkerStore(databasePath, [
+        workerSchedule({
+          id: "schedule_missing_cli",
+          approvalMode: "bypass-approvals",
+          runInstructions: "Run only if the worker can find Copilot CLI.",
+        }),
+      ]);
+      const runner = new RecordingCopilotCliCommandRunner({
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        errorCode: "ENOENT",
+        errorMessage: "spawn copilot ENOENT",
+      });
+
+      const scan = await runWorkerScan(databasePath, runner);
+
+      assert.deepEqual(scan.startedRunIds, []);
+      assert.equal(scan.diagnostics.outcomes.blocked, 1);
+      assert.deepEqual(runner.calls, [
+        {
+          command: "/worker/bin/copilot",
+          args: ["--version"],
+          options: { timeoutMs: 5_000 },
+        },
+      ]);
+
+      const history = await workerHistory(databasePath, "schedule_missing_cli");
       assert.equal(history[0]?.status, "blocked");
-      assert.match(
-        history[0]?.error ?? "",
-        /Local Copilot Mode is unavailable in this VS Code environment/,
+      assert.equal(history[0]?.error, COPILOT_CLI_MISSING_REASON);
+      assert.match(history[0]?.error ?? "", /gh copilot/);
+      assert.match(history[0]?.error ?? "", /OS wakeup triggers/);
+      assert.match(history[0]?.error ?? "", /COPILOT_CLI_PATH/);
+    });
+  });
+
+  it("blocks worker due runs with unattended auth guidance when Copilot CLI cannot authenticate", async () => {
+    await withWorkerStore(async (databasePath) => {
+      await seedWorkerStore(databasePath, [
+        workerSchedule({
+          id: "schedule_missing_auth",
+          approvalMode: "bypass-approvals",
+          runInstructions: "Run only if the worker can authenticate Copilot CLI.",
+        }),
+      ]);
+      const runner = new RecordingCopilotCliCommandRunner({
+        exitCode: null,
+        stdout: "",
+        stderr: "ERROR: SecItemCopyMatching failed -50",
+      });
+
+      const scan = await runWorkerScan(databasePath, runner);
+
+      assert.deepEqual(scan.startedRunIds, []);
+      assert.equal(scan.diagnostics.outcomes.blocked, 1);
+      const history = await workerHistory(databasePath, "schedule_missing_auth");
+      assert.equal(history[0]?.status, "blocked");
+      assert.equal(history[0]?.error, COPILOT_CLI_AUTH_UNAVAILABLE_REASON);
+      assert.match(history[0]?.error ?? "", /copilot login/);
+      assert.match(history[0]?.error ?? "", /COPILOT_GITHUB_TOKEN/);
+    });
+  });
+
+  it("blocks unattended worker Default Approvals before starting Copilot CLI", async () => {
+    await withWorkerStore(async (databasePath) => {
+      await seedWorkerStore(databasePath, [
+        workerSchedule({
+          id: "schedule_default_approvals",
+          approvalMode: "default-approvals",
+          runInstructions: "Run only if approvals can be shown.",
+        }),
+      ]);
+      const runner = new RecordingCopilotCliCommandRunner({
+        exitCode: 0,
+        stdout: "GitHub Copilot CLI 1.0.69",
+        stderr: "",
+      });
+
+      const scan = await runWorkerScan(databasePath, runner);
+
+      assert.deepEqual(scan.startedRunIds, []);
+      assert.equal(scan.diagnostics.outcomes.blocked, 1);
+      assert.deepEqual(runner.calls, [
+        {
+          command: "/worker/bin/copilot",
+          args: ["--version"],
+          options: { timeoutMs: 5_000 },
+        },
+      ]);
+
+      const history = await workerHistory(
+        databasePath,
+        "schedule_default_approvals",
       );
-      reopenedStore.close();
-    } finally {
-      await rm(tempDirectory, { recursive: true, force: true });
-    }
+      assert.equal(history[0]?.status, "blocked");
+      assert.match(history[0]?.error ?? "", /Default Approvals/);
+      assert.match(history[0]?.error ?? "", /approval surface/);
+      assert.deepEqual(history[0]?.resolvedHarnessPolicy, {
+        provider: "copilot",
+        harnessMode: "local-copilot",
+        approvalMode: "default-approvals",
+        approvalModeLabel: "Default Approvals",
+        localCopilotMode: {
+          approvalPreset: "default",
+          permissionBehavior: "uses-copilot-default-approvals",
+          cli: {
+            promptFlag: "-p",
+            outputFormat: "json",
+            permissionFlags: [],
+          },
+          requiresApprovalSurface: true,
+          unattended: true,
+        },
+      });
+    });
   });
 });
+
+async function withWorkerStore(
+  testBody: (databasePath: string) => Promise<void>,
+): Promise<void> {
+  const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
+  const databasePath = join(tempDirectory, "schedules.sqlite");
+
+  try {
+    await testBody(databasePath);
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+}
+
+async function seedWorkerStore(
+  databasePath: string,
+  schedules: readonly Schedule[],
+): Promise<void> {
+  const store = new SqliteScheduleStore({ databasePath });
+  try {
+    await store.saveLocalSchedulingSetup({
+      enabled: true,
+      platform: "windows",
+      triggerId: "AgentSchedulerLocalWakeup",
+      installedAt: "2026-07-07T16:00:00.000Z",
+      verifiedAt: null,
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    });
+    for (const schedule of schedules) {
+      await store.saveSchedule(schedule);
+    }
+  } finally {
+    store.close();
+  }
+}
+
+async function runWorkerScan(
+  databasePath: string,
+  runner: RecordingCopilotCliCommandRunner,
+): Promise<DueWorkScanResult> {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+
+  assert.equal(
+    await runWorkerCli(
+      ["scan-due-work", "--store", databasePath],
+      { stdout, stderr },
+      { createCopilotLocalHarness: () => workerCopilotHarness(runner) },
+    ),
+    0,
+  );
+  assert.equal(stderr.length, 0);
+  return JSON.parse(stdout[0] ?? "{}") as DueWorkScanResult;
+}
+
+function workerCopilotHarness(
+  runner: RecordingCopilotCliCommandRunner,
+): CopilotLocalHarness {
+  return new CopilotLocalHarness({
+    client: new CopilotCliLocalClient({
+      command: "/worker/bin/copilot",
+      runner,
+    }),
+  });
+}
+
+async function workerHistory(
+  databasePath: string,
+  scheduleId: string,
+): Promise<RunHistoryEntry[]> {
+  const store = new SqliteScheduleStore({ databasePath });
+  try {
+    return await store.listRunHistory(scheduleId);
+  } finally {
+    store.close();
+  }
+}
+
+function workerSchedule(input: {
+  id: string;
+  approvalMode: Schedule["approvalMode"];
+  runInstructions: string;
+}): Schedule {
+  return {
+    id: input.id,
+    revision: 1,
+    status: "active",
+    enabled: true,
+    runInstructions: input.runInstructions,
+    cadence: { type: "cron", expression: "0 * * * *" },
+    targetContext: {
+      type: "workspace",
+      uri: "file:///tmp/agent-scheduler",
+    },
+    harnessMode: "local-copilot",
+    model: "gpt-5",
+    approvalMode: input.approvalMode,
+    runCounter: { completed: 0, limit: null },
+    nextRunAt: "2000-01-01T00:00:00.000Z",
+    lastRunAt: null,
+    createdAt: "2026-07-07T16:00:00.000Z",
+    updatedAt: "2026-07-07T16:00:00.000Z",
+  };
+}
+
+class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
+  readonly calls: Array<{
+    command: string;
+    args: string[];
+    options: CopilotCliCommandRunOptions | undefined;
+  }> = [];
+  private readonly results: CopilotCliCommandResult[];
+
+  constructor(result: CopilotCliCommandResult | CopilotCliCommandResult[]) {
+    this.results = Array.isArray(result) ? result : [result];
+  }
+
+  async run(
+    command: string,
+    args: readonly string[],
+    options?: CopilotCliCommandRunOptions,
+  ): Promise<CopilotCliCommandResult> {
+    this.calls.push({ command, args: [...args], options });
+    const result =
+      this.results[Math.min(this.calls.length - 1, this.results.length - 1)] ??
+      this.results[0];
+    if (!result) {
+      throw new Error("RecordingCopilotCliCommandRunner has no results.");
+    }
+    return structuredClone(result);
+  }
+}
 
 class RecordingWakeupProvider implements WakeupProvider {
   readonly platform = "windows";
