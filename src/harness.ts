@@ -6,6 +6,7 @@ import type {
   RunStatus,
   RunTrigger,
   Schedule,
+  ScheduleHarnessModeAvailability,
 } from "./domain.js";
 
 export interface HarnessPreflightRequest {
@@ -109,6 +110,7 @@ export type HarnessOpenResult =
 
 export interface AgentHarness {
   readonly mode: HarnessMode;
+  availability?(): ScheduleHarnessModeAvailability;
   preflight(request: HarnessPreflightRequest): Promise<HarnessPreflightResult>;
   start(request: HarnessStartRequest): Promise<HarnessStartResult>;
   status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;

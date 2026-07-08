@@ -1075,6 +1075,50 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     });
   });
 
+  it("blocks activation when a registered harness reports itself unavailable", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          availability: {
+            mode: "local-copilot",
+            label: "Local Copilot Mode",
+            available: false,
+            reason:
+              "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH.",
+          },
+        }),
+      ],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Try to activate without Copilot CLI.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "bypass-approvals",
+    });
+
+    await assert.rejects(
+      () => lifecycle.activateSchedule(schedule.id),
+      /GitHub Copilot CLI was not found/,
+    );
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.harnessAvailability.selected?.available, false);
+    assert.match(
+      detail.harnessAvailability.message,
+      /GitHub Copilot CLI was not found/,
+    );
+  });
+
   it("records requires-approval preflight outcomes as approval-waiting active runs", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const fakeHarness = new FakeHarness({

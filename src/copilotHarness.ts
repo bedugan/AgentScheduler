@@ -2,7 +2,9 @@ import type {
   ApprovalMode,
   ResolvedHarnessPolicy,
   Schedule,
+  ScheduleHarnessModeAvailability,
 } from "./domain.js";
+import { HARNESS_MODE_LABELS } from "./domain.js";
 import type {
   AgentHarness,
   HarnessCancelRequest,
@@ -122,6 +124,7 @@ export interface CopilotCloudClient {
 
 export interface CopilotLocalHarnessOptions {
   client: CopilotLocalClient;
+  availability?: () => ScheduleHarnessModeAvailability;
 }
 
 export interface CopilotCloudHarnessOptions {
@@ -132,9 +135,23 @@ export class CopilotLocalHarness implements AgentHarness {
   readonly mode = "local-copilot" as const;
 
   private readonly client: CopilotLocalClient;
+  private readonly availabilityProvider:
+    | (() => ScheduleHarnessModeAvailability)
+    | undefined;
 
   constructor(options: CopilotLocalHarnessOptions) {
     this.client = options.client;
+    this.availabilityProvider = options.availability;
+  }
+
+  availability(): ScheduleHarnessModeAvailability {
+    return (
+      this.availabilityProvider?.() ?? {
+        mode: this.mode,
+        label: HARNESS_MODE_LABELS[this.mode],
+        available: true,
+      }
+    );
   }
 
   async preflight(

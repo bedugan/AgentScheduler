@@ -527,10 +527,14 @@ describe("local scheduling setup", () => {
       store.close();
 
       assert.equal(
-        await runWorkerCli(["scan-due-work", "--store", databasePath], {
-          stdout,
-          stderr,
-        }),
+        await runWorkerCli(
+          ["scan-due-work", "--store", databasePath],
+          {
+            stdout,
+            stderr,
+          },
+          { harnesses: [] },
+        ),
         0,
       );
 
