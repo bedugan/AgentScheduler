@@ -12,15 +12,23 @@ import {
   NEW_SCHEDULE_COMMAND,
   OPEN_SCHEDULE_COMMAND,
   SCHEDULE_DETAIL_VIEW_TYPE,
+  SCHEDULE_LIST_VIEW_ID,
   SQLITE_LOCAL_STORE_FILENAME,
+  ScheduleTreeDataProvider,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
+  scheduleTreeItemForSummary,
   sqliteLocalStorePath,
   type VsCodeCommandsLike,
   type VsCodeDisposableLike,
+  type VsCodeEventEmitterFactory,
+  type VsCodeEventEmitterLike,
+  type VsCodeEventLike,
   type VsCodeQuickPickItemLike,
   type VsCodeQuickPickOptionsLike,
   type VsCodeScheduleEditor,
+  type ScheduleTreeNode,
+  type VsCodeTreeDataProviderLike,
   type VsCodeWebviewPanelLike,
   type VsCodeWebviewLike,
   type VsCodeWindowLike,
@@ -39,7 +47,10 @@ describe("VS Code extension adapter", () => {
     ) as {
       main?: string;
       activationEvents?: string[];
-      contributes?: { commands?: Array<{ command: string; title: string }> };
+      contributes?: {
+        commands?: Array<{ command: string; title: string }>;
+        views?: Record<string, Array<{ id: string; name: string }>>;
+      };
       extensionKind?: string[];
       engines?: { vscode?: string };
     };
@@ -50,11 +61,18 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual(manifest.activationEvents, [
       `onCommand:${NEW_SCHEDULE_COMMAND}`,
       `onCommand:${OPEN_SCHEDULE_COMMAND}`,
+      `onView:${SCHEDULE_LIST_VIEW_ID}`,
     ]);
     assert.deepEqual(
       manifest.contributes?.commands?.map((command) => command.command),
       [NEW_SCHEDULE_COMMAND, OPEN_SCHEDULE_COMMAND],
     );
+    assert.deepEqual(manifest.contributes?.views?.explorer, [
+      {
+        id: SCHEDULE_LIST_VIEW_ID,
+        name: "AgentScheduler",
+      },
+    ]);
   });
 
   it("selects the SQLite Local Store under VS Code global storage", () => {
@@ -103,6 +121,61 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("maps schedules and the empty state into Schedule List tree items", async () => {
+    const provider = new ScheduleTreeDataProvider(
+      new StaticScheduleEditor([]),
+      new RecordingEventEmitterFactory(),
+    );
+    const emptyChildren = await provider.getChildren();
+
+    assert.deepEqual(emptyChildren, [{ kind: "empty" }]);
+    assert.deepEqual(provider.getTreeItem(emptyChildren[0]!), {
+      label: "No schedules yet",
+      description: "Create a Draft Schedule",
+      tooltip: "Run AgentScheduler: New Schedule to create a Draft Schedule.",
+      command: {
+        command: NEW_SCHEDULE_COMMAND,
+        title: "New Schedule",
+      },
+      contextValue: "agentScheduler.emptyScheduleList",
+    });
+
+    const item = scheduleTreeItemForSummary({
+      id: "schedule_1",
+      status: "active",
+      enabled: true,
+      nextRunAt: "2026-07-07T17:00:00.000Z",
+      lastRunAt: null,
+      runCounter: { completed: 0, limit: 3 },
+      runInstructions:
+        "Review all open release blockers and summarize the highest-risk follow-up items.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    assert.equal(
+      item.label,
+      "Review all open release blockers and summarize the highes...",
+    );
+    assert.equal(
+      item.description,
+      "active / next: 2026-07-07T17:00:00.000Z",
+    );
+    assert.match(item.tooltip ?? "", /Status: active/);
+    assert.deepEqual(item.command, {
+      command: OPEN_SCHEDULE_COMMAND,
+      title: "Open Schedule",
+      arguments: ["schedule_1"],
+    });
+  });
+
   it("registers create and open commands at the adapter boundary", () => {
     const context = recordingContext();
     const commands = new RecordingCommands();
@@ -121,6 +194,98 @@ describe("VS Code extension adapter", () => {
       OPEN_SCHEDULE_COMMAND,
     ]);
     assert.equal(context.subscriptions.length, 2);
+  });
+
+  it("registers the Schedule List tree and refreshes it after schedule mutations", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const eventEmitterFactory = new RecordingEventEmitterFactory();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      eventEmitterFactory,
+    });
+    const provider = window.requiredTreeProvider(SCHEDULE_LIST_VIEW_ID);
+    const refreshes: Array<ScheduleTreeNode | undefined> = [];
+    provider.onDidChangeTreeData?.((event) => {
+      refreshes.push(event);
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const panel = requiredPanel(window);
+
+    await panel.webview.postMessageFromWebview({
+      type: "save",
+      scheduleId: detail.schedule.id,
+      fields: {
+        runInstructions: "Exercise tree refresh triggers.",
+        cadenceExpression: "0 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+        runCapMaxRuns: "1",
+      },
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "activate",
+      scheduleId: detail.schedule.id,
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "pause",
+      scheduleId: detail.schedule.id,
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "resume",
+      scheduleId: detail.schedule.id,
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: detail.schedule.id,
+    });
+    await panel.webview.postMessageFromWebview({
+      type: "restart",
+      scheduleId: detail.schedule.id,
+    });
+
+    assert.equal(refreshes.length, 7);
+    assert.deepEqual(refreshes, [
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    const children = await provider.getChildren();
+    assert.equal(children[0]?.kind, "schedule");
   });
 
   it("creates a real draft schedule and opens its Schedule Detail webview", async () => {
@@ -242,6 +407,70 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /Local Scheduling/);
     assert.match(html, /name="approvalMode"/);
     assert.match(html, /value="default-approvals" selected/);
+  });
+
+  it("routes Schedule List selections through Open Schedule and focuses an existing detail panel", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const detail = await editor.createDraftSchedule({
+      runInstructions: "Open this schedule from the tree.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor },
+      viewColumn: 1,
+      eventEmitterFactory: new RecordingEventEmitterFactory(),
+    });
+    const treeItem = scheduleTreeItemForSummary({
+      id: detail.schedule.id,
+      status: detail.schedule.status,
+      enabled: detail.schedule.enabled,
+      nextRunAt: detail.schedule.nextRunAt,
+      lastRunAt: detail.schedule.lastRunAt,
+      runCounter: detail.schedule.runCounter,
+      runInstructions: detail.schedule.runInstructions,
+      cadence: detail.schedule.cadence,
+      targetContext: detail.schedule.targetContext,
+      harnessMode: detail.schedule.harnessMode,
+      model: detail.schedule.model,
+      approvalMode: detail.schedule.approvalMode,
+    });
+
+    await commandCallback(commands, treeItem.command?.command ?? "")(
+      ...(treeItem.command?.arguments ?? []),
+    );
+    await commandCallback(commands, treeItem.command?.command ?? "")(
+      ...(treeItem.command?.arguments ?? []),
+    );
+
+    assert.equal(window.panels.length, 1);
+    assert.equal(window.panels[0]?.revealCalls, 1);
+    assert.match(
+      window.panels[0]?.webview.html ?? "",
+      /Open this schedule from the tree\./,
+    );
   });
 
   it("saves Schedule Detail edits through the Editor Control Surface and refreshes the panel", async () => {
@@ -724,6 +953,39 @@ interface RecordingPanel extends VsCodeWebviewPanelLike {
   showOptions: unknown;
   options: unknown;
   webview: RecordingWebview;
+  revealCalls: number;
+  reveal(showOptions?: unknown): void;
+}
+
+class RecordingEventEmitter<T> implements VsCodeEventEmitterLike<T> {
+  private readonly listeners: Array<(event: T) => unknown> = [];
+  readonly event: VsCodeEventLike<T> = (listener) => {
+    this.listeners.push(listener);
+    return {
+      dispose: () => {
+        const index = this.listeners.indexOf(listener);
+        if (index !== -1) {
+          this.listeners.splice(index, 1);
+        }
+      },
+    };
+  };
+
+  fire(event: T): void {
+    for (const listener of this.listeners) {
+      listener(event);
+    }
+  }
+
+  dispose(): void {
+    this.listeners.splice(0);
+  }
+}
+
+class RecordingEventEmitterFactory implements VsCodeEventEmitterFactory {
+  createEventEmitter<T>(): VsCodeEventEmitterLike<T> {
+    return new RecordingEventEmitter<T>();
+  }
 }
 
 class RecordingWebview implements VsCodeWebviewLike {
@@ -751,6 +1013,7 @@ class RecordingWebview implements VsCodeWebviewLike {
 
 class RecordingWindow implements VsCodeWindowLike {
   readonly panels: RecordingPanel[] = [];
+  readonly treeProviders = new Map<string, VsCodeTreeDataProviderLike<unknown>>();
   readonly informationMessages: string[] = [];
   readonly errorMessages: string[] = [];
   quickPickItems: VsCodeQuickPickItemLike[] = [];
@@ -770,9 +1033,34 @@ class RecordingWindow implements VsCodeWindowLike {
       showOptions,
       options,
       webview: new RecordingWebview(),
+      revealCalls: 0,
+      reveal: () => {
+        panel.revealCalls += 1;
+      },
     };
     this.panels.push(panel);
     return panel;
+  }
+
+  registerTreeDataProvider<T>(
+    viewId: string,
+    provider: VsCodeTreeDataProviderLike<T>,
+  ): VsCodeDisposableLike {
+    this.treeProviders.set(
+      viewId,
+      provider as VsCodeTreeDataProviderLike<unknown>,
+    );
+    return {
+      dispose: () => {
+        this.treeProviders.delete(viewId);
+      },
+    };
+  }
+
+  requiredTreeProvider(viewId: string): ScheduleTreeDataProvider {
+    const provider = this.treeProviders.get(viewId);
+    assert.ok(provider, `Expected tree provider ${viewId} to be registered.`);
+    return provider as ScheduleTreeDataProvider;
   }
 
   async showQuickPick<T extends VsCodeQuickPickItemLike>(
@@ -827,7 +1115,25 @@ class EmptyScheduleEditor implements VsCodeScheduleEditor {
     throw new Error("restartCompletedSchedule should not be called.");
   }
 
-  async listSchedules(): Promise<[]> {
+  async listSchedules(): Promise<
+    Awaited<ReturnType<VsCodeScheduleEditor["listSchedules"]>>
+  > {
     return [];
+  }
+}
+
+class StaticScheduleEditor extends EmptyScheduleEditor {
+  constructor(
+    private readonly schedules: Awaited<
+      ReturnType<VsCodeScheduleEditor["listSchedules"]>
+    >,
+  ) {
+    super();
+  }
+
+  override async listSchedules(): Promise<
+    Awaited<ReturnType<VsCodeScheduleEditor["listSchedules"]>>
+  > {
+    return this.schedules;
   }
 }

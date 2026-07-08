@@ -3,6 +3,16 @@ declare module "vscode" {
     dispose(): unknown;
   }
 
+  export interface Event<T> {
+    (listener: (event: T) => unknown): Disposable;
+  }
+
+  export class EventEmitter<T> implements Disposable {
+    readonly event: Event<T>;
+    fire(event: T): void;
+    dispose(): unknown;
+  }
+
   export interface Uri {
     fsPath: string;
     toString(): string;
@@ -21,7 +31,8 @@ declare module "vscode" {
   export interface WebviewPanel {
     title: string;
     webview: Webview;
-    reveal?(): unknown;
+    reveal?(showOptions?: unknown): unknown;
+    onDidDispose?(listener: () => unknown): Disposable;
   }
 
   export interface Webview {
@@ -52,9 +63,30 @@ declare module "vscode" {
       items: readonly T[],
       options: { placeHolder: string },
     ): Promise<T | undefined>;
+    registerTreeDataProvider?<T>(
+      viewId: string,
+      provider: TreeDataProvider<T>,
+    ): Disposable;
     showInformationMessage?(message: string): Promise<unknown>;
     showErrorMessage?(message: string): Promise<unknown>;
   };
+  export interface Command {
+    command: string;
+    title: string;
+    arguments?: unknown[];
+  }
+  export interface TreeItem {
+    label: string;
+    description?: string;
+    tooltip?: string;
+    command?: Command;
+    contextValue?: string;
+  }
+  export interface TreeDataProvider<T> {
+    onDidChangeTreeData?: Event<T | undefined>;
+    getChildren(element?: T): T[] | Promise<T[]>;
+    getTreeItem(element: T): TreeItem;
+  }
   export const workspace: {
     workspaceFolders?: readonly WorkspaceFolder[];
   };

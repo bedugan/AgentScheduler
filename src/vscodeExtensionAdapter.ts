@@ -22,6 +22,7 @@ import { SqliteScheduleStore } from "./sqliteScheduleStore.js";
 
 export const NEW_SCHEDULE_COMMAND = "agentScheduler.newSchedule";
 export const OPEN_SCHEDULE_COMMAND = "agentScheduler.openSchedule";
+export const SCHEDULE_LIST_VIEW_ID = "agentScheduler.scheduleList";
 export const SCHEDULE_DETAIL_VIEW_TYPE = "agentScheduler.scheduleDetail";
 export const SQLITE_LOCAL_STORE_FILENAME = "agent-scheduler.sqlite";
 
@@ -32,6 +33,19 @@ const DEFAULT_HOURLY_CADENCE = {
 
 export interface VsCodeDisposableLike {
   dispose(): unknown;
+}
+
+export interface VsCodeEventLike<T> {
+  (listener: (event: T) => unknown): VsCodeDisposableLike;
+}
+
+export interface VsCodeEventEmitterLike<T> extends VsCodeDisposableLike {
+  event: VsCodeEventLike<T>;
+  fire(event: T): void;
+}
+
+export interface VsCodeEventEmitterFactory {
+  createEventEmitter<T>(): VsCodeEventEmitterLike<T>;
 }
 
 export interface VsCodeGlobalStorageContextLike {
@@ -76,7 +90,8 @@ export interface VsCodeQuickPickOptionsLike {
 export interface VsCodeWebviewPanelLike {
   title: string;
   webview: VsCodeWebviewLike;
-  reveal?(): unknown;
+  reveal?(showOptions?: unknown): unknown;
+  onDidDispose?(listener: () => unknown): VsCodeDisposableLike;
 }
 
 export interface VsCodeWebviewLike {
@@ -100,8 +115,32 @@ export interface VsCodeWindowLike {
     items: readonly T[],
     options: VsCodeQuickPickOptionsLike,
   ): Promise<T | undefined>;
+  registerTreeDataProvider?<T>(
+    viewId: string,
+    provider: VsCodeTreeDataProviderLike<T>,
+  ): VsCodeDisposableLike;
   showInformationMessage?(message: string): Promise<unknown>;
   showErrorMessage?(message: string): Promise<unknown>;
+}
+
+export interface VsCodeCommandLike {
+  command: string;
+  title: string;
+  arguments?: unknown[];
+}
+
+export interface VsCodeTreeItemLike {
+  label: string;
+  description?: string;
+  tooltip?: string;
+  command?: VsCodeCommandLike;
+  contextValue?: string;
+}
+
+export interface VsCodeTreeDataProviderLike<T> {
+  onDidChangeTreeData?: VsCodeEventLike<T | undefined>;
+  getChildren(element?: T): Promise<T[]> | T[];
+  getTreeItem(element: T): VsCodeTreeItemLike;
 }
 
 export interface VsCodeScheduleEditor {
@@ -133,11 +172,21 @@ export interface RegisterVsCodeScheduleCommandsOptions {
   workspace: VsCodeWorkspaceLike;
   services: VsCodeSchedulerServices;
   viewColumn: unknown;
+  eventEmitterFactory?: VsCodeEventEmitterFactory;
 }
 
 interface ScheduleQuickPickItem extends VsCodeQuickPickItemLike {
   scheduleId: string;
 }
+
+export type ScheduleTreeNode =
+  | {
+      kind: "schedule";
+      schedule: ScheduleSummary;
+    }
+  | {
+      kind: "empty";
+    };
 
 interface ScheduleDetailRenderState {
   errorMessage?: string;
@@ -229,7 +278,17 @@ export function currentWorkspaceTargetContext(
 export function registerVsCodeScheduleCommands(
   options: RegisterVsCodeScheduleCommandsOptions,
 ): VsCodeDisposableLike[] {
-  const controller = new VsCodeScheduleCommandController(options);
+  const scheduleTreeProvider =
+    options.eventEmitterFactory && options.window.registerTreeDataProvider
+      ? new ScheduleTreeDataProvider(
+          options.services.editor,
+          options.eventEmitterFactory,
+        )
+      : undefined;
+  const controller = new VsCodeScheduleCommandController({
+    ...options,
+    scheduleTreeProvider,
+  });
   const disposables = [
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
       controller.createNewSchedule(),
@@ -238,6 +297,15 @@ export function registerVsCodeScheduleCommands(
       controller.openSchedule(scheduleId),
     ),
   ];
+  if (scheduleTreeProvider && options.window.registerTreeDataProvider) {
+    disposables.push(
+      options.window.registerTreeDataProvider(
+        SCHEDULE_LIST_VIEW_ID,
+        scheduleTreeProvider,
+      ),
+      scheduleTreeProvider,
+    );
+  }
 
   options.context.subscriptions.push(...disposables);
   return disposables;
@@ -725,6 +793,53 @@ function quickPickItemForSchedule(
   };
 }
 
+export function scheduleTreeItemForSummary(
+  schedule: ScheduleSummary,
+): VsCodeTreeItemLike {
+  return {
+    label: conciseInstructionLabel(schedule.runInstructions),
+    description: `${schedule.status} / next: ${
+      schedule.nextRunAt ?? "not scheduled"
+    }`,
+    tooltip: scheduleTreeTooltip(schedule),
+    command: {
+      command: OPEN_SCHEDULE_COMMAND,
+      title: "Open Schedule",
+      arguments: [schedule.id],
+    },
+    contextValue: "agentScheduler.schedule",
+  };
+}
+
+function emptyScheduleTreeItem(): VsCodeTreeItemLike {
+  return {
+    label: "No schedules yet",
+    description: "Create a Draft Schedule",
+    tooltip: "Run AgentScheduler: New Schedule to create a Draft Schedule.",
+    command: {
+      command: NEW_SCHEDULE_COMMAND,
+      title: "New Schedule",
+    },
+    contextValue: "agentScheduler.emptyScheduleList",
+  };
+}
+
+function conciseInstructionLabel(runInstructions: string): string {
+  const firstLine = runInstructions.trim().split(/\r?\n/)[0]?.trim() ?? "";
+  if (firstLine.length === 0) {
+    return "Untitled Schedule";
+  }
+  return firstLine.length > 60 ? `${firstLine.slice(0, 57)}...` : firstLine;
+}
+
+function scheduleTreeTooltip(schedule: ScheduleSummary): string {
+  return [
+    conciseInstructionLabel(schedule.runInstructions),
+    `Status: ${schedule.status}`,
+    `Next run: ${schedule.nextRunAt ?? "not scheduled"}`,
+  ].join("\n");
+}
+
 function updateScheduleInputFromWebviewFields(
   fields: ScheduleDetailFormFields,
 ): UpdateScheduleInput {
@@ -841,19 +956,71 @@ function errorMessageFor(error: unknown): string {
   return error instanceof Error ? error.message : "Command failed.";
 }
 
+export class ScheduleTreeDataProvider
+  implements VsCodeTreeDataProviderLike<ScheduleTreeNode>
+{
+  readonly onDidChangeTreeData: VsCodeEventLike<ScheduleTreeNode | undefined>;
+
+  private readonly changeEmitter: VsCodeEventEmitterLike<
+    ScheduleTreeNode | undefined
+  >;
+
+  constructor(
+    private readonly editor: VsCodeScheduleEditor,
+    eventEmitterFactory: VsCodeEventEmitterFactory,
+  ) {
+    this.changeEmitter =
+      eventEmitterFactory.createEventEmitter<ScheduleTreeNode | undefined>();
+    this.onDidChangeTreeData = this.changeEmitter.event;
+  }
+
+  async getChildren(element?: ScheduleTreeNode): Promise<ScheduleTreeNode[]> {
+    if (element) {
+      return [];
+    }
+
+    const schedules = await this.editor.listSchedules();
+    return schedules.length > 0
+      ? schedules.map((schedule) => ({ kind: "schedule", schedule }))
+      : [{ kind: "empty" }];
+  }
+
+  getTreeItem(element: ScheduleTreeNode): VsCodeTreeItemLike {
+    return element.kind === "schedule"
+      ? scheduleTreeItemForSummary(element.schedule)
+      : emptyScheduleTreeItem();
+  }
+
+  refresh(): void {
+    this.changeEmitter.fire(undefined);
+  }
+
+  dispose(): void {
+    this.changeEmitter.dispose();
+  }
+}
+
+interface VsCodeScheduleCommandControllerOptions
+  extends RegisterVsCodeScheduleCommandsOptions {
+  scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
+}
+
 class VsCodeScheduleCommandController {
   private readonly context: VsCodeExtensionContextLike;
   private readonly window: VsCodeWindowLike;
   private readonly workspace: VsCodeWorkspaceLike;
   private readonly editor: VsCodeScheduleEditor;
   private readonly viewColumn: unknown;
+  private readonly scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
+  private readonly scheduleDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
 
-  constructor(options: RegisterVsCodeScheduleCommandsOptions) {
+  constructor(options: VsCodeScheduleCommandControllerOptions) {
     this.context = options.context;
     this.window = options.window;
     this.workspace = options.workspace;
     this.editor = options.services.editor;
     this.viewColumn = options.viewColumn;
+    this.scheduleTreeProvider = options.scheduleTreeProvider;
   }
 
   async createNewSchedule(): Promise<ScheduleDetailView> {
@@ -862,6 +1029,7 @@ class VsCodeScheduleCommandController {
         buildNewDraftScheduleInput(this.workspace),
       );
       this.openScheduleDetailPanel(detail);
+      this.refreshScheduleTree();
       return detail;
     });
   }
@@ -883,6 +1051,13 @@ class VsCodeScheduleCommandController {
   }
 
   private openScheduleDetailPanel(detail: ScheduleDetailView): void {
+    const existingPanel = this.scheduleDetailPanels.get(detail.schedule.id);
+    if (existingPanel) {
+      existingPanel.reveal?.(this.viewColumn);
+      this.renderScheduleDetailPanel(existingPanel, detail);
+      return;
+    }
+
     const panel = this.window.createWebviewPanel(
       SCHEDULE_DETAIL_VIEW_TYPE,
       scheduleDetailTitle(detail),
@@ -892,7 +1067,14 @@ class VsCodeScheduleCommandController {
         retainContextWhenHidden: true,
       },
     );
+    this.scheduleDetailPanels.set(detail.schedule.id, panel);
     this.renderScheduleDetailPanel(panel, detail);
+    const disposeSubscription = panel.onDidDispose?.(() => {
+      this.scheduleDetailPanels.delete(detail.schedule.id);
+    });
+    if (disposeSubscription) {
+      this.context.subscriptions.push(disposeSubscription);
+    }
     const messageSubscription = panel.webview.onDidReceiveMessage?.((message) =>
       this.handleScheduleDetailWebviewMessage(panel, message),
     );
@@ -947,6 +1129,7 @@ class VsCodeScheduleCommandController {
             )
           : await this.runScheduleDetailAction(message.scheduleId, message.type);
       this.renderScheduleDetailPanel(panel, detail);
+      this.refreshScheduleTree();
     } catch (error) {
       await this.renderScheduleDetailError(
         panel,
@@ -973,6 +1156,10 @@ class VsCodeScheduleCommandController {
       case "restart":
         return this.editor.restartCompletedSchedule(scheduleId);
     }
+  }
+
+  private refreshScheduleTree(): void {
+    this.scheduleTreeProvider?.refresh();
   }
 
   private async renderScheduleDetailError(
