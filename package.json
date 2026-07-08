@@ -9,7 +9,8 @@
   },
   "activationEvents": [
     "onCommand:agentScheduler.newSchedule",
-    "onCommand:agentScheduler.openSchedule"
+    "onCommand:agentScheduler.openSchedule",
+    "onView:agentScheduler.scheduleList"
   ],
   "contributes": {
     "commands": [
@@ -23,7 +24,15 @@
         "title": "Open Schedule",
         "category": "AgentScheduler"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "agentScheduler.scheduleList",
+          "name": "AgentScheduler"
+        }
+      ]
+    }
   },
   "extensionKind": [
     "ui"

@@ -15,6 +15,9 @@ export function activate(context: vscode.ExtensionContext): void {
     workspace: vscode.workspace,
     services,
     viewColumn: vscode.ViewColumn.One,
+    eventEmitterFactory: {
+      createEventEmitter: <T>() => new vscode.EventEmitter<T>(),
+    },
   });
 
   context.subscriptions.push({
