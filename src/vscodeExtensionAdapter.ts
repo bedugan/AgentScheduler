@@ -6,6 +6,8 @@ import type {
   CreateDraftScheduleInput,
   HarnessMode,
   RunCadence,
+  RunHistoryEntry,
+  ScheduleDetailActionKind,
   ScheduleDetailAction,
   ScheduleDetailPreviousRun,
   ScheduleDetailView,
@@ -112,6 +114,10 @@ export interface VsCodeScheduleEditor {
     input: UpdateScheduleInput,
   ): Promise<ScheduleDetailView>;
   activateSchedule(scheduleId: string): Promise<ScheduleDetailView>;
+  runScheduleNow(scheduleId: string): Promise<RunHistoryEntry>;
+  pauseSchedule(scheduleId: string): Promise<ScheduleDetailView>;
+  resumeSchedule(scheduleId: string): Promise<ScheduleDetailView>;
+  restartCompletedSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   listSchedules(): Promise<ScheduleSummary[]>;
 }
 
@@ -155,7 +161,7 @@ type ScheduleDetailWebviewMessage =
       fields: ScheduleDetailFormFields;
     }
   | {
-      type: "activate";
+      type: ScheduleDetailActionKind;
       scheduleId: string;
     };
 
@@ -592,15 +598,19 @@ function renderScheduleDetailScript(nonce: string): string {
     });
   });
 
-  const activateButton = document.querySelector('button[data-action="activate"]');
-  activateButton?.addEventListener("click", () => {
-    if (activateButton.hasAttribute("disabled")) {
-      return;
-    }
+  const actionButtons = document.querySelectorAll(
+    'button[data-action]:not([data-action="save"])',
+  );
+  actionButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.hasAttribute("disabled")) {
+        return;
+      }
 
-    vscode.postMessage({
-      type: "activate",
-      scheduleId: form.dataset.scheduleId,
+      vscode.postMessage({
+        type: button.dataset.action,
+        scheduleId: form.dataset.scheduleId,
+      });
     });
   });
 })();
@@ -631,6 +641,7 @@ function renderPreviousRuns(previousRuns: ScheduleDetailPreviousRun[]): string {
           <th>Trigger</th>
           <th>Started</th>
           <th>Completed</th>
+          <th>Details</th>
           <th>Outcome</th>
         </tr>
       </thead>
@@ -646,8 +657,13 @@ function renderPreviousRun(run: ScheduleDetailPreviousRun): string {
           <td>${escapeHtml(run.trigger)}</td>
           <td>${escapeHtml(run.startedAt)}</td>
           <td>${escapeHtml(run.completedAt ?? "Active")}</td>
+          <td>${escapeHtml(previousRunDetail(run))}</td>
           <td>${escapeHtml(run.outcome.description)}</td>
         </tr>`;
+}
+
+function previousRunDetail(run: ScheduleDetailPreviousRun): string {
+  return run.error ?? run.summary ?? "";
 }
 
 function scheduleDetailTitle(view: ScheduleDetailView): string {
@@ -750,9 +766,9 @@ function parseScheduleDetailWebviewMessage(
     return undefined;
   }
 
-  if (message.type === "activate") {
+  if (isScheduleDetailActionKind(message.type)) {
     return {
-      type: "activate",
+      type: message.type,
       scheduleId: message.scheduleId,
     };
   }
@@ -766,6 +782,18 @@ function parseScheduleDetailWebviewMessage(
   }
 
   return undefined;
+}
+
+function isScheduleDetailActionKind(
+  value: unknown,
+): value is ScheduleDetailActionKind {
+  return (
+    value === "activate" ||
+    value === "run-now" ||
+    value === "pause" ||
+    value === "resume" ||
+    value === "restart"
+  );
 }
 
 function parseHarnessMode(value: string): HarnessMode | null {
@@ -917,7 +945,7 @@ class VsCodeScheduleCommandController {
               message.scheduleId,
               updateScheduleInputFromWebviewFields(message.fields),
             )
-          : await this.editor.activateSchedule(message.scheduleId);
+          : await this.runScheduleDetailAction(message.scheduleId, message.type);
       this.renderScheduleDetailPanel(panel, detail);
     } catch (error) {
       await this.renderScheduleDetailError(
@@ -925,6 +953,25 @@ class VsCodeScheduleCommandController {
         message.scheduleId,
         errorMessageFor(error),
       );
+    }
+  }
+
+  private async runScheduleDetailAction(
+    scheduleId: string,
+    action: ScheduleDetailActionKind,
+  ): Promise<ScheduleDetailView> {
+    switch (action) {
+      case "activate":
+        return this.editor.activateSchedule(scheduleId);
+      case "run-now":
+        await this.editor.runScheduleNow(scheduleId);
+        return this.editor.openScheduleDetail(scheduleId);
+      case "pause":
+        return this.editor.pauseSchedule(scheduleId);
+      case "resume":
+        return this.editor.resumeSchedule(scheduleId);
+      case "restart":
+        return this.editor.restartCompletedSchedule(scheduleId);
     }
   }
 
