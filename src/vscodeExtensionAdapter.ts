@@ -1,13 +1,17 @@
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
 import type {
+  ApprovalMode,
   CreateDraftScheduleInput,
+  HarnessMode,
   RunCadence,
   ScheduleDetailAction,
   ScheduleDetailPreviousRun,
   ScheduleDetailView,
   ScheduleSummary,
   TargetContext,
+  UpdateScheduleInput,
   WorkspaceTargetContext,
 } from "./domain.js";
 import { EditorControlSurface } from "./editorControlSurface.js";
@@ -69,10 +73,15 @@ export interface VsCodeQuickPickOptionsLike {
 
 export interface VsCodeWebviewPanelLike {
   title: string;
-  webview: {
-    html: string;
-  };
+  webview: VsCodeWebviewLike;
   reveal?(): unknown;
+}
+
+export interface VsCodeWebviewLike {
+  html: string;
+  onDidReceiveMessage?(
+    listener: (message: unknown) => unknown,
+  ): VsCodeDisposableLike;
 }
 
 export interface VsCodeWindowLike {
@@ -98,6 +107,11 @@ export interface VsCodeScheduleEditor {
     input: CreateDraftScheduleInput,
   ): Promise<ScheduleDetailView>;
   openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView>;
+  saveScheduleDetailEdits(
+    scheduleId: string,
+    input: UpdateScheduleInput,
+  ): Promise<ScheduleDetailView>;
+  activateSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   listSchedules(): Promise<ScheduleSummary[]>;
 }
 
@@ -118,6 +132,32 @@ export interface RegisterVsCodeScheduleCommandsOptions {
 interface ScheduleQuickPickItem extends VsCodeQuickPickItemLike {
   scheduleId: string;
 }
+
+interface ScheduleDetailRenderState {
+  errorMessage?: string;
+}
+
+interface ScheduleDetailFormFields {
+  runInstructions?: unknown;
+  cadenceExpression?: unknown;
+  targetContextUri?: unknown;
+  targetContextLabel?: unknown;
+  harnessMode?: unknown;
+  model?: unknown;
+  approvalMode?: unknown;
+  runCapMaxRuns?: unknown;
+}
+
+type ScheduleDetailWebviewMessage =
+  | {
+      type: "save";
+      scheduleId: string;
+      fields: ScheduleDetailFormFields;
+    }
+  | {
+      type: "activate";
+      scheduleId: string;
+    };
 
 export function sqliteLocalStorePath(
   context: VsCodeGlobalStorageContextLike,
@@ -199,7 +239,9 @@ export function registerVsCodeScheduleCommands(
 
 export function renderScheduleDetailWebviewHtml(
   view: ScheduleDetailView,
+  state: ScheduleDetailRenderState = {},
 ): string {
+  const scriptNonce = randomBytes(16).toString("base64");
   const overviewRows: Array<[string, string]> = [
     ["Status", view.overview.status],
     ["Enabled", view.overview.enabled ? "Yes" : "No"],
@@ -218,7 +260,7 @@ export function renderScheduleDetailWebviewHtml(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}';">
   <title>${escapeHtml(scheduleDetailTitle(view))}</title>
   <style>
     :root {
@@ -288,7 +330,7 @@ export function renderScheduleDetailWebviewHtml(
       overflow-wrap: anywhere;
     }
 
-    textarea, input {
+    textarea, input, select {
       box-sizing: border-box;
       width: 100%;
       border: 1px solid var(--vscode-input-border);
@@ -299,9 +341,26 @@ export function renderScheduleDetailWebviewHtml(
       font: inherit;
     }
 
+    select {
+      color: var(--vscode-dropdown-foreground);
+      background: var(--vscode-dropdown-background);
+      border-color: var(--vscode-dropdown-border);
+    }
+
     textarea {
       min-height: 96px;
       resize: vertical;
+    }
+
+    .form-actions {
+      margin-top: 12px;
+    }
+
+    .inline-error {
+      border: 1px solid var(--vscode-inputValidation-errorBorder);
+      padding: 8px 10px;
+      color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
+      background: var(--vscode-inputValidation-errorBackground);
     }
 
     .actions {
@@ -348,6 +407,8 @@ export function renderScheduleDetailWebviewHtml(
     <span class="muted">${escapeHtml(view.schedule.id)}</span>
   </header>
 
+  ${state.errorMessage ? renderInlineError(state.errorMessage) : ""}
+
   <section aria-labelledby="overview-heading">
     <h2 id="overview-heading">Overview</h2>
     <dl class="grid">
@@ -362,26 +423,79 @@ export function renderScheduleDetailWebviewHtml(
     </dl>
   </section>
 
-  <section aria-labelledby="fields-heading">
-    <h2 id="fields-heading">Editable Fields</h2>
-    <div class="grid">
-      <div class="field">
-        <label for="run-instructions">Run Instructions</label>
-        <textarea id="run-instructions" name="runInstructions">${escapeHtml(
-          view.runInstructions.value,
-        )}</textarea>
+  <form id="schedule-detail-form" data-schedule-id="${escapeHtml(view.schedule.id)}">
+    <section aria-labelledby="fields-heading">
+      <h2 id="fields-heading">Editable Fields</h2>
+      <div class="grid">
+        <div class="field">
+          <label for="run-instructions">Run Instructions</label>
+          <textarea id="run-instructions" name="runInstructions">${escapeHtml(
+            view.runInstructions.value,
+          )}</textarea>
+        </div>
+        ${renderInput(
+          "cadence-expression",
+          "Cadence",
+          "cadenceExpression",
+          cadenceInputValue(view.overview.cadence),
+        )}
+        ${renderInput(
+          "target-context-uri",
+          "Target Context URI",
+          "targetContextUri",
+          targetContextInputValue(view.overview.targetContext),
+        )}
+        ${renderInput(
+          "target-context-label",
+          "Target Context Label",
+          "targetContextLabel",
+          targetContextLabelInputValue(view.overview.targetContext),
+        )}
+        ${renderSelect("harness-mode", "Harness Mode", "harnessMode", [
+          ["", "Not selected", view.overview.harnessMode === null],
+          [
+            "local-copilot",
+            "Local Copilot Mode",
+            view.overview.harnessMode === "local-copilot",
+          ],
+          [
+            "cloud-copilot",
+            "Cloud Copilot Mode",
+            view.overview.harnessMode === "cloud-copilot",
+          ],
+        ])}
+        ${renderInput("model", "Model", "model", view.overview.model)}
+        ${renderSelect("approval-mode", "Approval Mode", "approvalMode", [
+          [
+            "default-approvals",
+            "Default Approvals",
+            view.overview.approvalMode === "default-approvals",
+          ],
+          [
+            "bypass-approvals",
+            "Bypass Approvals",
+            view.overview.approvalMode === "bypass-approvals",
+          ],
+          [
+            "autopilot",
+            "Autopilot",
+            view.overview.approvalMode === "autopilot",
+          ],
+        ])}
+        ${renderInput(
+          "run-cap-max-runs",
+          "Maximum Run Count",
+          "runCapMaxRuns",
+          runCapInputValue(view.runCounter),
+          "number",
+          ' min="1"',
+        )}
       </div>
-      ${renderInput("cadence", "Cadence", cadenceInputValue(view.overview.cadence))}
-      ${renderInput(
-        "target-context",
-        "Target Context",
-        targetContextInputValue(view.overview.targetContext),
-      )}
-      ${renderInput("harness-mode", "Harness Mode", view.overview.harnessMode ?? "")}
-      ${renderInput("model", "Model", view.overview.model)}
-      ${renderInput("approval-mode", "Approval Mode", view.overview.approvalMode)}
-    </div>
-  </section>
+      <div class="form-actions">
+        <button type="submit" data-action="save">Save Changes</button>
+      </div>
+    </section>
+  </form>
 
   <section aria-labelledby="actions-heading">
     <h2 id="actions-heading">Actions</h2>
@@ -400,15 +514,97 @@ export function renderScheduleDetailWebviewHtml(
     <h2 id="previous-runs-heading">Previous Runs</h2>
     ${renderPreviousRuns(view.previousRuns)}
   </section>
+  ${renderScheduleDetailScript(scriptNonce)}
 </body>
 </html>`;
 }
 
-function renderInput(id: string, label: string, value: string): string {
+function renderInlineError(message: string): string {
+  return `<div role="alert" class="inline-error">${escapeHtml(message)}</div>`;
+}
+
+function renderInput(
+  id: string,
+  label: string,
+  name: string,
+  value: string,
+  type = "text",
+  attributes = "",
+): string {
   return `<div class="field">
         <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
-        <input id="${escapeHtml(id)}" name="${escapeHtml(id)}" value="${escapeHtml(value)}">
+        <input id="${escapeHtml(id)}" name="${escapeHtml(
+          name,
+        )}" type="${escapeHtml(type)}" value="${escapeHtml(value)}"${attributes}>
       </div>`;
+}
+
+function renderSelect(
+  id: string,
+  label: string,
+  name: string,
+  options: Array<[string, string, boolean]>,
+): string {
+  return `<div class="field">
+        <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
+        <select id="${escapeHtml(id)}" name="${escapeHtml(name)}">
+          ${options
+            .map(
+              ([value, optionLabel, selected]) =>
+                `<option value="${escapeHtml(value)}"${
+                  selected ? " selected" : ""
+                }>${escapeHtml(optionLabel)}</option>`,
+            )
+            .join("\n")}
+        </select>
+      </div>`;
+}
+
+function renderScheduleDetailScript(nonce: string): string {
+  return `<script nonce="${escapeHtml(nonce)}">
+(() => {
+  const vscode = acquireVsCodeApi();
+  const form = document.querySelector("#schedule-detail-form");
+  if (!form) {
+    return;
+  }
+
+  const valueFor = (name) => {
+    const field = form.elements.namedItem(name);
+    return field && "value" in field ? field.value : "";
+  };
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    vscode.postMessage({
+      type: "save",
+      scheduleId: form.dataset.scheduleId,
+      fields: {
+        runInstructions: valueFor("runInstructions"),
+        cadenceExpression: valueFor("cadenceExpression"),
+        targetContextUri: valueFor("targetContextUri"),
+        targetContextLabel: valueFor("targetContextLabel"),
+        harnessMode: valueFor("harnessMode"),
+        model: valueFor("model"),
+        approvalMode: valueFor("approvalMode"),
+        runCapMaxRuns: valueFor("runCapMaxRuns"),
+      },
+    });
+  });
+
+  const activateButton = document.querySelector('button[data-action="activate"]');
+  activateButton?.addEventListener("click", () => {
+    if (activateButton.hasAttribute("disabled")) {
+      return;
+    }
+
+    vscode.postMessage({
+      type: "activate",
+      scheduleId: form.dataset.scheduleId,
+    });
+  });
+})();
+</script>`;
 }
 
 function renderAction(action: ScheduleDetailAction): string {
@@ -477,12 +673,20 @@ function targetContextInputValue(targetContext: TargetContext | null): string {
   return targetContext?.uri ?? "";
 }
 
+function targetContextLabelInputValue(targetContext: TargetContext | null): string {
+  return targetContext?.label ?? "";
+}
+
 function cadenceLabel(cadence: RunCadence | null): string {
   return cadence ? `cron: ${cadence.expression}` : "No cadence selected";
 }
 
 function cadenceInputValue(cadence: RunCadence | null): string {
   return cadence?.expression ?? "";
+}
+
+function runCapInputValue(runCounter: ScheduleDetailView["runCounter"]): string {
+  return runCounter.limit === null ? "" : String(runCounter.limit);
 }
 
 function escapeHtml(value: string): string {
@@ -503,6 +707,110 @@ function quickPickItemForSchedule(
     detail: schedule.targetContext?.uri ?? schedule.id,
     scheduleId: schedule.id,
   };
+}
+
+function updateScheduleInputFromWebviewFields(
+  fields: ScheduleDetailFormFields,
+): UpdateScheduleInput {
+  const cadenceExpression = stringField(fields, "cadenceExpression").trim();
+  const targetContextUri = stringField(fields, "targetContextUri").trim();
+  const targetContextLabel = stringField(fields, "targetContextLabel").trim();
+  const harnessMode = stringField(fields, "harnessMode").trim();
+  const approvalMode = stringField(fields, "approvalMode").trim();
+  const runCapMaxRuns = stringField(fields, "runCapMaxRuns").trim();
+
+  return {
+    runInstructions: stringField(fields, "runInstructions"),
+    cadence:
+      cadenceExpression.length > 0
+        ? { type: "cron", expression: cadenceExpression }
+        : null,
+    targetContext:
+      targetContextUri.length > 0
+        ? {
+            type: "workspace",
+            uri: targetContextUri,
+            ...(targetContextLabel.length > 0 && { label: targetContextLabel }),
+          }
+        : null,
+    harnessMode: parseHarnessMode(harnessMode),
+    model: stringField(fields, "model").trim(),
+    approvalMode: parseApprovalMode(approvalMode),
+    runCap:
+      runCapMaxRuns.length > 0
+        ? { maxRuns: parsePositiveInteger(runCapMaxRuns, "Maximum Run Count") }
+        : null,
+  };
+}
+
+function parseScheduleDetailWebviewMessage(
+  message: unknown,
+): ScheduleDetailWebviewMessage | undefined {
+  if (!isRecord(message) || typeof message.scheduleId !== "string") {
+    return undefined;
+  }
+
+  if (message.type === "activate") {
+    return {
+      type: "activate",
+      scheduleId: message.scheduleId,
+    };
+  }
+
+  if (message.type === "save" && isRecord(message.fields)) {
+    return {
+      type: "save",
+      scheduleId: message.scheduleId,
+      fields: message.fields,
+    };
+  }
+
+  return undefined;
+}
+
+function parseHarnessMode(value: string): HarnessMode | null {
+  if (value.length === 0) {
+    return null;
+  }
+  if (value === "local-copilot" || value === "cloud-copilot") {
+    return value;
+  }
+  throw new Error(`Unsupported Harness Mode '${value}'.`);
+}
+
+function parseApprovalMode(value: string): ApprovalMode {
+  if (
+    value === "default-approvals" ||
+    value === "bypass-approvals" ||
+    value === "autopilot"
+  ) {
+    return value;
+  }
+  throw new Error(`Unsupported Approval Mode '${value}'.`);
+}
+
+function parsePositiveInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function stringField(
+  fields: ScheduleDetailFormFields,
+  key: keyof ScheduleDetailFormFields,
+): string {
+  const value = fields[key];
+  return typeof value === "string" ? value : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function errorMessageFor(error: unknown): string {
+  return error instanceof Error ? error.message : "Command failed.";
 }
 
 class VsCodeScheduleCommandController {
@@ -552,11 +860,17 @@ class VsCodeScheduleCommandController {
       scheduleDetailTitle(detail),
       this.viewColumn,
       {
-        enableScripts: false,
+        enableScripts: true,
         retainContextWhenHidden: true,
       },
     );
-    panel.webview.html = renderScheduleDetailWebviewHtml(detail);
+    this.renderScheduleDetailPanel(panel, detail);
+    const messageSubscription = panel.webview.onDidReceiveMessage?.((message) =>
+      this.handleScheduleDetailWebviewMessage(panel, message),
+    );
+    if (messageSubscription) {
+      this.context.subscriptions.push(messageSubscription);
+    }
   }
 
   private async pickScheduleId(): Promise<string | undefined> {
@@ -578,14 +892,61 @@ class VsCodeScheduleCommandController {
     return picked?.scheduleId;
   }
 
+  private renderScheduleDetailPanel(
+    panel: VsCodeWebviewPanelLike,
+    detail: ScheduleDetailView,
+    state: ScheduleDetailRenderState = {},
+  ): void {
+    panel.title = scheduleDetailTitle(detail);
+    panel.webview.html = renderScheduleDetailWebviewHtml(detail, state);
+  }
+
+  private async handleScheduleDetailWebviewMessage(
+    panel: VsCodeWebviewPanelLike,
+    rawMessage: unknown,
+  ): Promise<void> {
+    const message = parseScheduleDetailWebviewMessage(rawMessage);
+    if (!message) {
+      return;
+    }
+
+    try {
+      const detail =
+        message.type === "save"
+          ? await this.editor.saveScheduleDetailEdits(
+              message.scheduleId,
+              updateScheduleInputFromWebviewFields(message.fields),
+            )
+          : await this.editor.activateSchedule(message.scheduleId);
+      this.renderScheduleDetailPanel(panel, detail);
+    } catch (error) {
+      await this.renderScheduleDetailError(
+        panel,
+        message.scheduleId,
+        errorMessageFor(error),
+      );
+    }
+  }
+
+  private async renderScheduleDetailError(
+    panel: VsCodeWebviewPanelLike,
+    scheduleId: string,
+    errorMessage: string,
+  ): Promise<void> {
+    try {
+      const detail = await this.editor.openScheduleDetail(scheduleId);
+      this.renderScheduleDetailPanel(panel, detail, { errorMessage });
+    } catch {
+      await this.window.showErrorMessage?.(`AgentScheduler: ${errorMessage}`);
+    }
+  }
+
   private async runCommand<T>(command: () => Promise<T>): Promise<T> {
     try {
       return await command();
     } catch (error) {
       await this.window.showErrorMessage?.(
-        `AgentScheduler: ${
-          error instanceof Error ? error.message : "Command failed."
-        }`,
+        `AgentScheduler: ${errorMessageFor(error)}`,
       );
       throw error;
     }

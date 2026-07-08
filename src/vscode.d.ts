@@ -20,10 +20,15 @@ declare module "vscode" {
 
   export interface WebviewPanel {
     title: string;
-    webview: {
-      html: string;
-    };
+    webview: Webview;
     reveal?(): unknown;
+  }
+
+  export interface Webview {
+    html: string;
+    onDidReceiveMessage(
+      listener: (message: unknown) => unknown,
+    ): Disposable;
   }
 
   export const commands: {
