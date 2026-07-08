@@ -29,15 +29,21 @@ export type {
   ScheduleDetailView,
   ScheduleExportEntry,
   ScheduleExportFile,
+  ScheduleDetailHarnessAvailabilityState,
   ScheduleImportResult,
   ScheduleImportWarning,
   ScheduleImportWarningCode,
+  ScheduleHarnessModeAvailability,
   ScheduleStatus,
   ScheduleSummary,
   TargetContext,
   UpdateScheduleInput,
 } from "./domain.js";
-export { SCHEDULE_EXPORT_SCHEMA_VERSION } from "./domain.js";
+export {
+  HARNESS_MODE_LABELS,
+  SCHEDULE_EXPORT_SCHEMA_VERSION,
+  SUPPORTED_HARNESS_MODES,
+} from "./domain.js";
 export type {
   AgentHarness,
   HarnessCancelRequest,
