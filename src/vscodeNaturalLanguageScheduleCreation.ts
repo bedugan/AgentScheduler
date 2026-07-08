@@ -421,8 +421,22 @@ function inferHarnessMode(request: string): HarnessMode | undefined {
 }
 
 function inferRunInstructions(request: string): string | undefined {
-  const match = /\bto\s+(.+)$/i.exec(request);
-  return normalizeSentence(match?.[1] ?? request);
+  const singleRunRequest = stripCadenceControlText(request);
+  const match = /\bto\s+(.+)$/i.exec(singleRunRequest);
+  return normalizeSentence(match?.[1] ?? singleRunRequest);
+}
+
+function stripCadenceControlText(request: string): string {
+  const normalized = request.trim().replace(/\s+/g, " ");
+  const cadencePattern =
+    "(?:every\\s+hour|hourly|every\\s+[1-9]\\d?\\s+minutes?|every\\s+day|daily|every\\s+week|weekly)";
+  const recurrencePrefix = new RegExp(
+    `^(?:(?:run|do|perform)\\s+)?${cadencePattern}\\s+(?:and|to)\\s+(.+)$`,
+    "i",
+  );
+  const match = recurrencePrefix.exec(normalized);
+
+  return match?.[1] ?? normalized;
 }
 
 function normalizeSentence(value: string | undefined): string | undefined {
