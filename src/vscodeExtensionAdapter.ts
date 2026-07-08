@@ -48,6 +48,7 @@ export const CREATE_SCHEDULE_CHAT_PARTICIPANT_ID = "agentScheduler.schedule";
 export const CREATE_SCHEDULE_CHAT_SLASH_COMMAND = "createSchedule";
 export const NEW_SCHEDULE_COMMAND = "agentScheduler.newSchedule";
 export const OPEN_SCHEDULE_COMMAND = "agentScheduler.openSchedule";
+export const DELETE_SCHEDULE_COMMAND = "agentScheduler.deleteSchedule";
 export const SCHEDULE_LIST_VIEW_ID = "agentScheduler.scheduleList";
 export const SCHEDULE_DETAIL_VIEW_TYPE = "agentScheduler.scheduleDetail";
 export const SQLITE_LOCAL_STORE_FILENAME = "agent-scheduler.sqlite";
@@ -178,6 +179,7 @@ export interface VsCodeWebviewPanelLike {
   title: string;
   webview: VsCodeWebviewLike;
   reveal?(showOptions?: unknown): unknown;
+  dispose?(): unknown;
   onDidDispose?(listener: () => unknown): VsCodeDisposableLike;
 }
 
@@ -208,6 +210,7 @@ export interface VsCodeWindowLike {
     provider: VsCodeTreeDataProviderLike<T>,
   ): VsCodeDisposableLike;
   showInformationMessage?(message: string, ...items: unknown[]): Promise<unknown>;
+  showWarningMessage?(message: string, ...items: unknown[]): Promise<unknown>;
   showErrorMessage?(message: string): Promise<unknown>;
 }
 
@@ -250,6 +253,7 @@ export interface VsCodeScheduleEditor {
   pauseSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   resumeSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   restartCompletedSchedule(scheduleId: string): Promise<ScheduleDetailView>;
+  deleteSchedule(scheduleId: string): Promise<void>;
   listSchedules(): Promise<ScheduleSummary[]>;
   listHarnessModeAvailability(): Promise<ScheduleHarnessModeAvailability[]>;
 }
@@ -490,6 +494,9 @@ export function registerVsCodeScheduleCommands(
     ),
     options.commands.registerCommand(OPEN_SCHEDULE_COMMAND, (scheduleId) =>
       controller.openSchedule(scheduleId),
+    ),
+    options.commands.registerCommand(DELETE_SCHEDULE_COMMAND, (target) =>
+      controller.deleteSchedule(target),
     ),
   ];
   if (scheduleCreationFlow) {
@@ -1192,6 +1199,20 @@ function quickPickItemForSchedule(
   };
 }
 
+function scheduleIdFromDeleteTarget(target: unknown): string | undefined {
+  if (typeof target === "string" && target.trim().length > 0) {
+    return target;
+  }
+  if (isRecord(target) && target.kind === "schedule") {
+    const schedule = target.schedule;
+    if (isRecord(schedule) && typeof schedule.id === "string") {
+      return schedule.id;
+    }
+  }
+
+  return undefined;
+}
+
 export function scheduleTreeItemForSummary(
   schedule: ScheduleSummary,
 ): VsCodeTreeItemLike {
@@ -1258,6 +1279,7 @@ function scheduleTreeAutomaticRunsInactive(schedule: ScheduleSummary): boolean {
 }
 
 const CREATE_ACTIVE_SCHEDULE_ACTION = "Create Active Schedule";
+const DELETE_SCHEDULE_ACTION = "Delete Schedule";
 
 async function confirmNaturalLanguageScheduleActivation(
   window: VsCodeWindowLike,
@@ -1528,7 +1550,8 @@ function isScheduleDetailActionKind(
     value === "run-now" ||
     value === "pause" ||
     value === "resume" ||
-    value === "restart"
+    value === "restart" ||
+    value === "delete"
   );
 }
 
@@ -1701,6 +1724,17 @@ class VsCodeScheduleCommandController {
     });
   }
 
+  async deleteSchedule(target: unknown): Promise<void> {
+    return this.runCommand(async () => {
+      const scheduleId = scheduleIdFromDeleteTarget(target);
+      if (!scheduleId) {
+        throw new Error("Schedule id is required to delete a schedule.");
+      }
+
+      await this.confirmAndDeleteSchedule(scheduleId);
+    });
+  }
+
   async invokeScheduleCreationTool(input: unknown): Promise<unknown> {
     const result = await this.createScheduleFromNaturalLanguage(
       input,
@@ -1819,6 +1853,11 @@ class VsCodeScheduleCommandController {
     }
 
     try {
+      if (message.type === "delete") {
+        await this.confirmAndDeleteSchedule(message.scheduleId);
+        return;
+      }
+
       const detail =
         message.type === "save"
           ? await this.editor.saveScheduleDetailEdits(
@@ -1855,6 +1894,8 @@ class VsCodeScheduleCommandController {
         return this.editor.resumeSchedule(scheduleId);
       case "restart":
         return this.editor.restartCompletedSchedule(scheduleId);
+      case "delete":
+        throw new Error("Delete is handled through the confirmation flow.");
     }
   }
 
@@ -1913,6 +1954,35 @@ class VsCodeScheduleCommandController {
     } catch {
       await this.window.showErrorMessage?.(`AgentScheduler: ${errorMessage}`);
     }
+  }
+
+  private async confirmAndDeleteSchedule(scheduleId: string): Promise<void> {
+    const confirmed = await this.confirmScheduleDeletion(scheduleId);
+    if (!confirmed) {
+      return;
+    }
+
+    await this.editor.deleteSchedule(scheduleId);
+    this.scheduleDetailPanels.get(scheduleId)?.dispose?.();
+    this.scheduleDetailPanels.delete(scheduleId);
+    this.refreshScheduleTree();
+  }
+
+  private async confirmScheduleDeletion(scheduleId: string): Promise<boolean> {
+    const detail = await this.editor.openScheduleDetail(scheduleId);
+    const selected = await this.window.showWarningMessage?.(
+      "Delete AgentScheduler schedule?",
+      {
+        modal: true,
+        detail: [
+          "This permanently removes the schedule and its local run history.",
+          "Future automatic runs for this schedule will stop. The shared Local Scheduling wakeup trigger is not removed.",
+          `Schedule: ${scheduleDetailTitle(detail)} (${scheduleId})`,
+        ].join("\n"),
+      },
+      DELETE_SCHEDULE_ACTION,
+    );
+    return selected === DELETE_SCHEDULE_ACTION;
   }
 
   private async listScheduleModelOptions(): Promise<readonly ScheduleModelOption[]> {

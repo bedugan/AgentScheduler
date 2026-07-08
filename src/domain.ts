@@ -159,7 +159,8 @@ export type ScheduleDetailActionKind =
   | "run-now"
   | "pause"
   | "resume"
-  | "restart";
+  | "restart"
+  | "delete";
 
 export interface ScheduleDetailAction {
   kind: ScheduleDetailActionKind;
@@ -174,6 +175,7 @@ export interface ScheduleDetailActions {
   pause: ScheduleDetailAction;
   resume: ScheduleDetailAction;
   restart: ScheduleDetailAction;
+  delete: ScheduleDetailAction;
 }
 
 export interface ScheduleDetailHistoryLink {

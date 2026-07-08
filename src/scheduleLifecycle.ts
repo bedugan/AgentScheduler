@@ -276,6 +276,20 @@ export class ScheduleLifecycle {
     return restartedSchedule;
   }
 
+  async deleteSchedule(scheduleId: string): Promise<void> {
+    await this.requireSchedule(scheduleId);
+    const activeRun = (await this.store.listActiveRuns()).find(
+      (run) => run.scheduleId === scheduleId,
+    );
+    if (activeRun) {
+      throw new Error(
+        "Schedule cannot be deleted while it has a running or approval-waiting run. Cancel or resolve the active run before deleting the schedule.",
+      );
+    }
+
+    await this.store.deleteSchedule(scheduleId);
+  }
+
   async updateSchedule(
     scheduleId: string,
     input: UpdateScheduleInput,
@@ -369,7 +383,7 @@ export class ScheduleLifecycle {
         approvalMode: schedule.approvalMode,
         runCounter: this.runCounterViewFor(schedule),
       },
-      actions: this.scheduleActionsFor(schedule),
+      actions: this.scheduleActionsFor(schedule, previousRuns),
       previousRuns: previousRuns.map((run) => this.previousRunViewFor(run)),
       runCounter: schedule.runCounter,
       nextRunAt: schedule.nextRunAt,
@@ -961,10 +975,16 @@ export class ScheduleLifecycle {
     };
   }
 
-  private scheduleActionsFor(schedule: Schedule): ScheduleDetailView["actions"] {
+  private scheduleActionsFor(
+    schedule: Schedule,
+    previousRuns: RunHistoryEntry[] = [],
+  ): ScheduleDetailView["actions"] {
     const runNowStatusEnabled = schedule.status === "draft" || schedule.enabled;
     const harnessUnavailableReason = this.selectedHarnessUnavailableReason(schedule);
     const runNowEnabled = runNowStatusEnabled && !harnessUnavailableReason;
+    const activeRunBlocksDeletion = previousRuns.some(
+      (run) => isActiveRunStatus(run.status) && run.completedAt === null,
+    );
     return {
       activate: {
         kind: "activate",
@@ -1013,6 +1033,15 @@ export class ScheduleLifecycle {
         enabled: schedule.status === "completed",
         ...(schedule.status !== "completed" && {
           disabledReason: "Only completed schedules can be restarted.",
+        }),
+      },
+      delete: {
+        kind: "delete",
+        label: "Delete Schedule",
+        enabled: !activeRunBlocksDeletion,
+        ...(activeRunBlocksDeletion && {
+          disabledReason:
+            "Resolve or cancel the active run before deleting this schedule.",
         }),
       },
     };

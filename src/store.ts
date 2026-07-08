@@ -5,6 +5,7 @@ export interface ScheduleStore {
   getSchedule(id: string): Promise<Schedule | undefined>;
   listSchedules(): Promise<Schedule[]>;
   listDueSchedules(now: IsoTimestamp): Promise<Schedule[]>;
+  deleteSchedule(id: string): Promise<void>;
   saveRunHistory(entry: RunHistoryEntry): Promise<void>;
   getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined>;
   listRunHistory(scheduleId: string): Promise<RunHistoryEntry[]>;
