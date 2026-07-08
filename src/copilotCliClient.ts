@@ -305,10 +305,23 @@ function copilotPromptArgsFor(request: CopilotLocalStartRequest): string[] {
     "--no-color",
     ...request.resolvedHarnessPolicy.localCopilotMode.cli.permissionFlags,
     request.resolvedHarnessPolicy.localCopilotMode.cli.promptFlag,
-    request.runInstructions,
+    copilotExecutionPromptFor(request.runInstructions),
   );
 
   return args;
+}
+
+function copilotExecutionPromptFor(runInstructions: string): string {
+  return [
+    "AgentScheduler execution frame:",
+    "This is one occurrence of an AgentScheduler run.",
+    "AgentScheduler owns recurrence, run caps, and local scheduling for this schedule.",
+    "Perform the current run once in the target context, report the result through the normal Copilot CLI response, and obey the resolved harness policy.",
+    "Do not create or register OS scheduled tasks, scheduled jobs, launch agents, systemd timers, cron entries, background loops, detached processes, daemons, timers, watchers, or files solely to implement recurrence.",
+    "",
+    "User Run Instructions:",
+    runInstructions,
+  ].join("\n");
 }
 
 function harnessStartResultForCopilotCliCommand(
