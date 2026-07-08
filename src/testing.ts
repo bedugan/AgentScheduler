@@ -5,6 +5,7 @@ import type {
   ResolvedHarnessPolicy,
   RunHistoryEntry,
   Schedule,
+  ScheduleHarnessModeAvailability,
 } from "./domain.js";
 import { isActiveRunStatus } from "./domain.js";
 import type {
@@ -191,6 +192,7 @@ export class FakeHarness implements AgentHarness {
   private readonly statusResult: FakeHarnessStatusResult | null;
   private readonly cancelResult: FakeHarnessCancelResult | null;
   private readonly openResult: FakeHarnessOpenResult | null;
+  private readonly availabilityResult: ScheduleHarnessModeAvailability | null;
 
   constructor(options: {
     mode: HarnessMode;
@@ -200,6 +202,7 @@ export class FakeHarness implements AgentHarness {
     statusResult?: FakeHarnessStatusResult;
     cancelResult?: FakeHarnessCancelResult;
     openResult?: FakeHarnessOpenResult;
+    availability?: ScheduleHarnessModeAvailability;
   }) {
     this.mode = options.mode;
     this.policyOverride = options.resolvedPolicy ?? null;
@@ -208,6 +211,20 @@ export class FakeHarness implements AgentHarness {
     this.statusResult = options.statusResult ?? null;
     this.cancelResult = options.cancelResult ?? null;
     this.openResult = options.openResult ?? null;
+    this.availabilityResult = options.availability ?? null;
+  }
+
+  availability(): ScheduleHarnessModeAvailability {
+    return (
+      this.availabilityResult ?? {
+        mode: this.mode,
+        label:
+          this.mode === "local-copilot"
+            ? "Local Copilot Mode"
+            : "Cloud Copilot Mode",
+        available: true,
+      }
+    );
   }
 
   async preflight(

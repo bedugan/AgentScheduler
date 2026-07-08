@@ -1282,13 +1282,19 @@ export class ScheduleLifecycle {
       return "Choose an available harness mode before activating or running this schedule.";
     }
 
-    return !this.harnesses.has(schedule.harnessMode)
-      ? unavailableHarnessModeMessage(schedule.harnessMode)
-      : undefined;
+    const availability = this.harnessModeAvailabilityFor(schedule.harnessMode);
+    return availability.available
+      ? undefined
+      : availability.reason ?? unavailableHarnessModeMessage(schedule.harnessMode);
   }
 
   harnessModeAvailabilityFor(mode: HarnessMode): ScheduleHarnessModeAvailability {
-    const available = this.harnesses.has(mode);
+    const harness = this.harnesses.get(mode);
+    if (harness?.availability) {
+      return harness.availability();
+    }
+
+    const available = !!harness;
     return {
       mode,
       label: HARNESS_MODE_LABELS[mode],

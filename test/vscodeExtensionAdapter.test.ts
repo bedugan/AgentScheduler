@@ -413,6 +413,60 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /data-action="run-now" data-state="disabled" disabled/);
   });
 
+  it("shows Copilot CLI setup guidance for unavailable registered Local Copilot Mode", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          availability: {
+            mode: "local-copilot",
+            label: "Local Copilot Mode",
+            available: false,
+            reason:
+              "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH.",
+          },
+        }),
+      ],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const html = requiredPanel(window).webview.html;
+
+    assert.equal(detail.schedule.harnessMode, null);
+    assert.doesNotMatch(html, /value="local-copilot"/);
+    assert.match(html, /gh copilot/);
+    assert.match(html, /copilot.+PATH/);
+    assert.match(html, /data-action="activate" data-state="disabled" disabled/);
+    assert.match(html, /data-action="run-now" data-state="disabled" disabled/);
+  });
+
   it("renders local and cloud harness modes only when registered", async () => {
     const localOnlyLifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:05:00.000Z"),

@@ -2,7 +2,9 @@ import type {
   ApprovalMode,
   ResolvedHarnessPolicy,
   Schedule,
+  ScheduleHarnessModeAvailability,
 } from "./domain.js";
+import { HARNESS_MODE_LABELS } from "./domain.js";
 import type {
   AgentHarness,
   HarnessCancelRequest,
@@ -44,6 +46,11 @@ export interface CopilotLocalResolvedHarnessPolicy
   localCopilotMode: {
     approvalPreset: CopilotApprovalPreset;
     permissionBehavior: CopilotPermissionBehavior;
+    cli: {
+      promptFlag: "-p";
+      outputFormat: "json";
+      permissionFlags: readonly string[];
+    };
     requiresApprovalSurface: boolean;
     unattended: boolean;
   };
@@ -122,6 +129,7 @@ export interface CopilotCloudClient {
 
 export interface CopilotLocalHarnessOptions {
   client: CopilotLocalClient;
+  availability?: () => ScheduleHarnessModeAvailability;
 }
 
 export interface CopilotCloudHarnessOptions {
@@ -132,9 +140,23 @@ export class CopilotLocalHarness implements AgentHarness {
   readonly mode = "local-copilot" as const;
 
   private readonly client: CopilotLocalClient;
+  private readonly availabilityProvider:
+    | (() => ScheduleHarnessModeAvailability)
+    | undefined;
 
   constructor(options: CopilotLocalHarnessOptions) {
     this.client = options.client;
+    this.availabilityProvider = options.availability;
+  }
+
+  availability(): ScheduleHarnessModeAvailability {
+    return (
+      this.availabilityProvider?.() ?? {
+        mode: this.mode,
+        label: HARNESS_MODE_LABELS[this.mode],
+        available: true,
+      }
+    );
   }
 
   async preflight(
@@ -289,6 +311,11 @@ function localCopilotModePolicyFor(
     return {
       approvalPreset: "bypass",
       permissionBehavior: "bypasses-approval-prompts",
+      cli: {
+        promptFlag: "-p",
+        outputFormat: "json",
+        permissionFlags: ["--no-ask-user", "--allow-all-tools"],
+      },
       requiresApprovalSurface: false,
     };
   }
@@ -297,6 +324,11 @@ function localCopilotModePolicyFor(
     return {
       approvalPreset: "autopilot",
       permissionBehavior: "runs-with-autopilot",
+      cli: {
+        promptFlag: "-p",
+        outputFormat: "json",
+        permissionFlags: ["--no-ask-user", "--autopilot", "--allow-all"],
+      },
       requiresApprovalSurface: false,
     };
   }
@@ -304,6 +336,11 @@ function localCopilotModePolicyFor(
   return {
     approvalPreset: "default",
     permissionBehavior: "uses-copilot-default-approvals",
+    cli: {
+      promptFlag: "-p",
+      outputFormat: "json",
+      permissionFlags: [],
+    },
     requiresApprovalSurface: true,
   };
 }

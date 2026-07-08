@@ -79,6 +79,24 @@ export {
   resolveCopilotCloudHarnessPolicy,
   resolveCopilotLocalHarnessPolicy,
 } from "./copilotHarness.js";
+export type {
+  CopilotCliCommandResult,
+  CopilotCliCommandRunOptions,
+  CopilotCliCommandRunner,
+  CopilotCliLocalClientOptions,
+  CreateDefaultCopilotLocalHarnessOptions,
+} from "./copilotCliClient.js";
+export {
+  COPILOT_CLI_AUTH_UNAVAILABLE_REASON,
+  COPILOT_CLI_MISSING_REASON,
+  CopilotCliLocalClient,
+  classifyCopilotCliAvailability,
+  copilotLocalHarnessAvailabilityFor,
+  createDefaultCopilotLocalHarness,
+  DEFAULT_COPILOT_CLI_COMMAND,
+  DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS,
+  detectCopilotCliAvailabilitySync,
+} from "./copilotCliClient.js";
 export type { ScheduleStore } from "./store.js";
 export {
   RandomIdGenerator,

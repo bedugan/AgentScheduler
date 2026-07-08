@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
+import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
 import type {
   ApprovalMode,
   CreateDraftScheduleInput,
@@ -333,7 +334,7 @@ export function createDefaultVsCodeSchedulerServices(
   });
   const lifecycle = new ScheduleLifecycle({
     store,
-    harnesses: [],
+    harnesses: [createDefaultCopilotLocalHarness()],
     localSchedulingSetup: {
       isLocalSchedulingEnabled: async () =>
         (await store.getLocalSchedulingSetup()).enabled,
@@ -869,6 +870,12 @@ function renderHarnessModeField(view: ScheduleDetailView): string {
   const availableModes = view.harnessAvailability.modes.filter(
     (mode) => mode.available,
   );
+  const unavailableSetupReason = view.harnessAvailability.modes.find(
+    (mode) =>
+      !mode.available &&
+      mode.reason &&
+      !/no .* harness is registered/i.test(mode.reason),
+  )?.reason;
   const selectedAvailable = availableModes.some(
     (mode) => mode.mode === selectedMode,
   );
@@ -902,7 +909,8 @@ function renderHarnessModeField(view: ScheduleDetailView): string {
     view.harnessAvailability.selected?.available === false
       ? view.harnessAvailability.selected.reason
       : availableModes.length === 0
-        ? "No Copilot harness modes are available in this VS Code environment."
+        ? (unavailableSetupReason ??
+          "No Copilot harness modes are available in this VS Code environment.")
         : undefined,
   );
 }

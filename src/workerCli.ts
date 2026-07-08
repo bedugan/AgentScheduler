@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import type { DueWorkScanResult } from "./domain.js";
+import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
+import type { AgentHarness } from "./harness.js";
 import {
   LocalSchedulingSetup,
   MacOsLaunchdWakeupProvider,
@@ -30,6 +32,8 @@ export interface WorkerCliLifecycle {
 export interface WorkerCliDependencies {
   localSchedulingSetup?: WorkerCliLocalSchedulingSetup;
   lifecycle?: WorkerCliLifecycle;
+  harnesses?: AgentHarness[];
+  createCopilotLocalHarness?: () => AgentHarness;
 }
 
 export interface WorkerCliIo {
@@ -330,7 +334,13 @@ async function runScanDueWorkCommand(
   try {
     const lifecycle = new ScheduleLifecycle({
       store,
-      harnesses: [],
+      harnesses:
+        dependencies.harnesses ??
+        [
+          (dependencies.createCopilotLocalHarness ??
+            (() =>
+              createDefaultCopilotLocalHarness({ detectAvailability: false })))(),
+        ],
       localSchedulingSetup: {
         isLocalSchedulingEnabled: async () =>
           (await store.getLocalSchedulingSetup()).enabled,

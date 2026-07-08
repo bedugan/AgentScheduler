@@ -10,7 +10,7 @@ The MVP is local-first and Copilot-focused. It supports Local Copilot Mode and C
 - The Schedule Detail editor supports draft creation, activation, manual runs, pause/resume, completed-schedule restart, deletion, model selection, local scheduling state, and previous run history.
 - Natural-Language Schedule Creation is exposed through a VS Code language model tool, the `@agentScheduler` chat participant, and the `/createSchedule` chat command.
 - Automatic runs require Local Scheduling Setup. Creating or activating a schedule does not silently install an operating-system Wakeup Trigger.
-- The default packaged VS Code services currently register the scheduler UI, storage, model catalog, and command surfaces. Real run execution still depends on an available harness implementation in the extension environment.
+- The default packaged VS Code services currently register the scheduler UI, storage, model catalog, command surfaces, and Local Copilot Mode backed by GitHub Copilot CLI. Cloud Copilot Mode still depends on an available cloud harness implementation.
 
 ## Prerequisites
 
@@ -18,6 +18,7 @@ The MVP is local-first and Copilot-focused. It supports Local Copilot Mode and C
 - Node.js `>=26`.
 - npm.
 - GitHub Copilot and VS Code language model APIs if you want model discovery or natural-language schedule creation.
+- GitHub Copilot CLI for Local Copilot Mode. Check it with `copilot --version`; if it is missing, install it or run `gh copilot` to fetch it through GitHub CLI.
 - Windows or macOS for Local Scheduling Setup. Linux wakeup providers are not part of the MVP path yet.
 
 ## Local Development
@@ -102,6 +103,36 @@ Use `Run Now` from Schedule Detail to start a Manual Run when the selected harne
 
 Draft Runs do not increment scheduler-native run caps. Manual Runs from enabled schedules do increment run caps.
 
+### Local Copilot Mode
+
+Local Copilot Mode runs through GitHub Copilot CLI. AgentScheduler invokes `copilot -p` with the schedule instructions, `--model` from the schedule, `--output-format json`, and `-C` set to the Target Context workspace when the target is a local file URI.
+
+Before using Local Copilot Mode, verify the same environment that will start the run can see the CLI:
+
+```sh
+copilot --version
+```
+
+If the command is missing, install GitHub Copilot CLI or run:
+
+```sh
+gh copilot
+```
+
+For interactive use, authenticate with:
+
+```sh
+copilot login
+```
+
+For unattended worker contexts, configure `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` if the worker cannot use the interactive login. Set `COPILOT_CLI_PATH` when `copilot` is not on the worker process `PATH`.
+
+Approval Mode maps to concrete CLI behavior:
+
+- Default Approvals uses no auto-approval flags and requires an approval surface. Unattended automatic runs block before start when no approval surface is available.
+- Bypass Approvals uses `--no-ask-user --allow-all-tools`.
+- Autopilot uses `--no-ask-user --autopilot --allow-all`.
+
 ### Pause, Resume, and Restart
 
 Use `Pause` to stop an Active Schedule from starting future runs. Use `Resume` to make a Paused Schedule active again; the next due time is recomputed from the resume time, so missed intervals do not replay.
@@ -150,6 +181,8 @@ node dist/src/workerCli.js scan-due-work --store /path/to/agent-scheduler.sqlite
 
 `--platform` accepts `windows`, `win32`, `macos`, or `darwin`. If omitted, the CLI infers the current platform on Windows and macOS. The default trigger IDs are `AgentSchedulerLocalWakeup` on Windows and `com.bedugan.AgentScheduler.local-wakeup` on macOS.
 
+Automatic Local Copilot Mode runs use the same Copilot CLI harness as manual runs. OS wakeup triggers often start with a different `PATH` than your terminal or VS Code session, so verify `copilot --version` from the worker environment or set `COPILOT_CLI_PATH` to an absolute CLI path.
+
 ## Key Concepts
 
 **Agent Run**: A scheduled prompt executed by a configured agent harness against a Target Context.
@@ -176,9 +209,13 @@ node dist/src/workerCli.js scan-due-work --store /path/to/agent-scheduler.sqlite
 
 **No Copilot harness modes are available**: The current extension environment has no registered available harness for Local Copilot Mode or Cloud Copilot Mode. Choose an available mode if one is listed, or wire/register the appropriate harness implementation before expecting runs to start.
 
+**Local Copilot Mode is unavailable because `copilot` is missing**: Install GitHub Copilot CLI, run `gh copilot`, or set `COPILOT_CLI_PATH`. For automatic runs, remember that launchd and Task Scheduler may not inherit the same `PATH` as your interactive shell.
+
+**Local Copilot Mode is unavailable because authentication is missing**: Run `copilot login` in an interactive shell, or configure `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` for unattended worker contexts.
+
 **Saved model is unavailable or legacy**: The selected model is not currently reported by VS Code chat model discovery. Pick an available model from the Model field, sign in to Copilot if needed, or enter a model ID manually when no model catalog is reported.
 
-**A run is blocked with Default Approvals**: Default Approvals may need an Approval Surface. For unattended automatic runs, use an approval mode and harness setup that can proceed without invisible prompts.
+**A run is blocked with Default Approvals**: Default Approvals may need an Approval Surface. For unattended automatic runs, use Bypass Approvals or Autopilot only when that permission behavior is acceptable for the schedule.
 
 **Delete is disabled**: The schedule has an active run. Wait for the run to finish or cancel it through the harness before deleting the schedule.
 
