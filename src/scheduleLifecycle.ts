@@ -87,6 +87,7 @@ export class ScheduleLifecycle {
   private readonly localSchedulingEnabled: boolean;
   private readonly localSchedulingSetup: LocalSchedulingStateSource | undefined;
   private readonly harnesses: Map<string, AgentHarness>;
+  private readonly manualRunReservations = new Set<string>();
 
   constructor(options: ScheduleLifecycleOptions) {
     this.store = options.store;
@@ -447,7 +448,17 @@ export class ScheduleLifecycle {
     const trigger: RunTrigger =
       schedule.status === "draft" ? "draft-manual" : "manual";
 
-    return this.startRun(schedule, trigger);
+    const reservationKeys = this.manualRunReservationKeysFor(schedule);
+    if (this.hasManualRunReservation(reservationKeys)) {
+      return this.blockManualRunForReservedSlot(schedule, trigger);
+    }
+
+    this.reserveManualRun(reservationKeys);
+    try {
+      return await this.startRun(schedule, trigger);
+    } finally {
+      this.releaseManualRunReservation(reservationKeys);
+    }
   }
 
   async resolveActiveRun(
@@ -858,6 +869,52 @@ export class ScheduleLifecycle {
     }
 
     return `${input.harnessMode}:${input.targetContext.type}:${input.targetContext.uri}`;
+  }
+
+  private manualRunReservationKeysFor(schedule: Schedule): string[] {
+    const keys = [`schedule:${schedule.id}`];
+    const runSlotKey = this.runSlotKeyFor(schedule);
+    if (runSlotKey) {
+      keys.push(`slot:${runSlotKey}`);
+    }
+    return keys;
+  }
+
+  private hasManualRunReservation(keys: readonly string[]): boolean {
+    return keys.some((key) => this.manualRunReservations.has(key));
+  }
+
+  private reserveManualRun(keys: readonly string[]): void {
+    for (const key of keys) {
+      this.manualRunReservations.add(key);
+    }
+  }
+
+  private releaseManualRunReservation(keys: readonly string[]): void {
+    for (const key of keys) {
+      this.manualRunReservations.delete(key);
+    }
+  }
+
+  private async blockManualRunForReservedSlot(
+    schedule: Schedule,
+    trigger: RunTrigger,
+  ): Promise<RunHistoryEntry> {
+    const requestedAt = this.nowIso();
+    const blockedRun = this.buildRunHistoryEntry({
+      schedule,
+      trigger,
+      startedAt: requestedAt,
+      completedAt: requestedAt,
+      status: "blocked",
+      resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
+      externalRunId: null,
+      summary: null,
+      error:
+        "Run slot is occupied by a manual run that is already starting. Wait for the active run to finish before starting another manual run.",
+    });
+    await this.persistRunResult(schedule, blockedRun, trigger);
+    return blockedRun;
   }
 
   private buildRunHistoryEntry(input: {

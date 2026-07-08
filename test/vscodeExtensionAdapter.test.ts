@@ -23,6 +23,7 @@ import {
   ScheduleTreeDataProvider,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
+  renderScheduleDetailWebviewHtml,
   scheduleTreeItemForSummary,
   sqliteLocalStorePath,
   type VsCodeCommandsLike,
@@ -1412,6 +1413,68 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /value="default-approvals" selected/);
   });
 
+  it("suppresses repeated Run Now clicks and marks the button busy before backend response", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const detail = await editor.createDraftSchedule({
+      runInstructions: "Review issue #55 and report open risks.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const html = renderScheduleDetailWebviewHtml(detail);
+    const script = scriptContentFrom(html);
+    const postedMessages: unknown[] = [];
+    const form = {
+      dataset: { scheduleId: detail.schedule.id },
+      elements: { namedItem: () => ({ value: "" }) },
+      addEventListener: () => undefined,
+    };
+    const runNowButton = new FakeWebviewButton("run-now", "Run Now");
+    const document = {
+      querySelector: (selector: string) =>
+        selector === "#schedule-detail-form" ? form : null,
+      querySelectorAll: (selector: string) =>
+        selector === 'button[data-action]:not([data-action="save"])'
+          ? [runNowButton]
+          : [],
+    };
+
+    Function("acquireVsCodeApi", "document", script)(
+      () => ({
+        postMessage: (message: unknown) => {
+          postedMessages.push(message);
+        },
+      }),
+      document,
+    );
+
+    runNowButton.click();
+    runNowButton.click();
+    runNowButton.click();
+
+    assert.deepEqual(postedMessages, [
+      { type: "run-now", scheduleId: detail.schedule.id },
+    ]);
+    assert.equal(runNowButton.disabled, true);
+    assert.equal(runNowButton.dataset.state, "busy");
+    assert.equal(runNowButton.attributes.get("aria-busy"), "true");
+    assert.equal(runNowButton.attributes.get("aria-live"), "polite");
+    assert.equal(runNowButton.textContent, "Starting...");
+  });
+
   it("routes Schedule List selections through Open Schedule and focuses an existing detail panel", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const lifecycle = new ScheduleLifecycle({
@@ -2076,6 +2139,43 @@ function requiredPanel(window: RecordingWindow): RecordingPanel {
 
 async function settleAsyncWork(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function scriptContentFrom(html: string): string {
+  const match = /<script\b[^>]*>([\s\S]*)<\/script>/.exec(html);
+  assert.ok(match?.[1], "Expected rendered Schedule Detail HTML to include a script.");
+  return match[1];
+}
+
+class FakeWebviewButton {
+  readonly dataset: { action: string; state?: string };
+  readonly attributes = new Map<string, string>();
+  disabled = false;
+  textContent: string;
+  private clickListener: (() => void) | undefined;
+
+  constructor(action: string, textContent: string) {
+    this.dataset = { action };
+    this.textContent = textContent;
+  }
+
+  addEventListener(eventName: string, listener: () => void): void {
+    if (eventName === "click") {
+      this.clickListener = listener;
+    }
+  }
+
+  hasAttribute(name: string): boolean {
+    return name === "disabled" ? this.disabled : this.attributes.has(name);
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  click(): void {
+    this.clickListener?.();
+  }
 }
 
 class RecordingCommands implements VsCodeCommandsLike {

@@ -16,7 +16,12 @@ import {
   type CopilotCliCommandRunOptions,
   type CopilotCliCommandRunner,
 } from "../src/index.js";
-import type { Schedule } from "../src/index.js";
+import type {
+  HarnessMode,
+  HarnessStartRequest,
+  HarnessStartResult,
+  Schedule,
+} from "../src/index.js";
 import {
   FakeClock,
   FakeHarness,
@@ -866,6 +871,63 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     );
   });
 
+  it("blocks concurrent manual starts for the same schedule or Run Slot before harness start completes", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const slowHarness = new SlowStartHarness("local-copilot");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [slowHarness],
+    });
+    const targetContext = {
+      type: "workspace" as const,
+      uri: "file:///tmp/agent-scheduler",
+    };
+    const firstSchedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Start one manual run slowly.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const sameSlotSchedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Attempt another manual run in the same slot.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext,
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    const firstRunPromise = lifecycle.startManualRun(firstSchedule.id);
+    await slowHarness.started;
+
+    const sameScheduleRun = await lifecycle.startManualRun(firstSchedule.id);
+    const sameSlotRun = await lifecycle.startManualRun(sameSlotSchedule.id);
+
+    assert.equal(sameScheduleRun.status, "blocked");
+    assert.match(sameScheduleRun.error ?? "", /Run slot is occupied/);
+    assert.equal(sameSlotRun.status, "blocked");
+    assert.match(sameSlotRun.error ?? "", /Run slot is occupied/);
+    assert.equal(slowHarness.startRequests.length, 1);
+
+    slowHarness.finishStart();
+    const firstRun = await firstRunPromise;
+
+    assert.equal(firstRun.status, "completed");
+    assert.equal(slowHarness.startRequests.length, 1);
+
+    const firstDetail = await lifecycle.openScheduleDetail(firstSchedule.id);
+    assert.equal(firstDetail.previousRuns.length, 2);
+    assert.deepEqual(
+      firstDetail.previousRuns.map((run) => run.status).sort(),
+      ["blocked", "completed"],
+    );
+  });
+
   it("keeps approval-waiting runs active until they resolve, then starts deferred catch-up work", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     let startAttempts = 0;
@@ -1362,6 +1424,42 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
   ): Promise<CopilotCliCommandResult> {
     this.calls.push({ command, args: [...args], options });
     return structuredClone(this.result);
+  }
+}
+
+class SlowStartHarness extends FakeHarness {
+  readonly started: Promise<void>;
+  private resolveStarted: (() => void) | undefined;
+  private releaseStart: (() => void) | undefined;
+  private readonly startGate: Promise<void>;
+
+  constructor(mode: HarnessMode) {
+    super({ mode });
+    this.started = new Promise((resolve) => {
+      this.resolveStarted = resolve;
+    });
+    this.startGate = new Promise((resolve) => {
+      this.releaseStart = resolve;
+    });
+  }
+
+  override async start(
+    request: HarnessStartRequest,
+  ): Promise<HarnessStartResult> {
+    this.startRequests.push(structuredClone(request));
+    this.resolveStarted?.();
+    await this.startGate;
+
+    return {
+      externalRunId: `slow-run-${this.startRequests.length}`,
+      status: "completed",
+      completedAt: request.requestedAt,
+      summary: "Slow harness completed the manual run.",
+    };
+  }
+
+  finishStart(): void {
+    this.releaseStart?.();
   }
 }
 

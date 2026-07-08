@@ -994,14 +994,25 @@ function renderScheduleDetailScript(nonce: string): string {
   const actionButtons = document.querySelectorAll(
     'button[data-action]:not([data-action="save"])',
   );
+  const inFlightActions = new Set();
   actionButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.hasAttribute("disabled")) {
+      const action = button.dataset.action;
+      if (!action || button.hasAttribute("disabled") || inFlightActions.has(action)) {
         return;
       }
 
+      if (action === "run-now") {
+        inFlightActions.add(action);
+        button.disabled = true;
+        button.dataset.state = "busy";
+        button.setAttribute("aria-busy", "true");
+        button.setAttribute("aria-live", "polite");
+        button.textContent = "Starting...";
+      }
+
       vscode.postMessage({
-        type: button.dataset.action,
+        type: action,
         scheduleId: form.dataset.scheduleId,
       });
     });
