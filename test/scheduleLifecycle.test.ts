@@ -1480,6 +1480,65 @@ describe("VS Code natural-language schedule creation", () => {
     assert.equal(result.schedule.harnessMode, "cloud-copilot");
   });
 
+  it("derives single-run instructions from recurrence phrasing across creation entry points", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T20:45:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const workspace = {
+      type: "workspace" as const,
+      uri: "file:///Users/briandugan/src/personal/AgentScheduler",
+      label: "AgentScheduler",
+    };
+    const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
+      lifecycle,
+      currentWorkspace: workspace,
+      defaultModel: "gpt-5",
+      confirmActivation: async () => true,
+    });
+
+    const toolResult = await creationFlow.languageModelTool.invoke({
+      naturalLanguageRequest: "Run every hour and retrieve the time",
+    });
+    const chatResult = await creationFlow.chatParticipant.handleRequest({
+      naturalLanguageRequest: "hourly to check open pull requests",
+    });
+    const slashResult = await creationFlow.slashCommand.execute({
+      naturalLanguageRequest: "run every 15 minutes and summarize CI status",
+    });
+
+    assert.equal(toolResult.outcome, "activated");
+    assert.deepEqual(toolResult.schedule.cadence, {
+      type: "cron",
+      expression: "0 * * * *",
+    });
+    assert.equal(toolResult.schedule.runInstructions, "Retrieve the time.");
+
+    assert.equal(chatResult.outcome, "activated");
+    assert.deepEqual(chatResult.schedule.cadence, {
+      type: "cron",
+      expression: "0 * * * *",
+    });
+    assert.equal(chatResult.schedule.runInstructions, "Check open pull requests.");
+
+    assert.equal(slashResult.outcome, "activated");
+    assert.deepEqual(slashResult.schedule.cadence, {
+      type: "cron",
+      expression: "*/15 * * * *",
+    });
+    assert.equal(slashResult.schedule.runInstructions, "Summarize CI status.");
+
+    for (const result of [toolResult, chatResult, slashResult]) {
+      assert.doesNotMatch(result.schedule.runInstructions, /every hour/i);
+      assert.doesNotMatch(result.schedule.runInstructions, /hourly/i);
+      assert.doesNotMatch(result.schedule.runInstructions, /every \d+ minutes/i);
+      assert.doesNotMatch(result.schedule.runInstructions, /scheduled task/i);
+    }
+  });
+
   it("creates a disabled draft with validation messages when activation requirements are missing", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T21:00:00.000Z"),
