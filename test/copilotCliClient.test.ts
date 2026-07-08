@@ -143,25 +143,29 @@ describe("Copilot CLI local client", () => {
       completedAt: "2026-07-07T16:00:00.000Z",
       summary: "Reviewed the workspace and finished.",
     });
-    assert.deepEqual(runner.calls, [
-      {
-        command: "/custom/copilot",
-        args: [
-          "-C",
-          "/Users/briandugan/src/personal/AgentScheduler",
-          "--model",
-          "gpt-5.4",
-          "--output-format",
-          "json",
-          "--no-color",
-          "--no-ask-user",
-          "--allow-all-tools",
-          "-p",
-          "Review the scheduled workspace.",
-        ],
-        options: { timeoutMs: 12_345 },
-      },
+    assert.equal(runner.calls.length, 1);
+    assert.equal(runner.calls[0]?.command, "/custom/copilot");
+    assert.deepEqual(runner.calls[0]?.args.slice(0, -1), [
+      "-C",
+      "/Users/briandugan/src/personal/AgentScheduler",
+      "--model",
+      "gpt-5.4",
+      "--output-format",
+      "json",
+      "--no-color",
+      "--no-ask-user",
+      "--allow-all-tools",
+      "-p",
     ]);
+    assert.equal(runner.calls[0]?.options?.timeoutMs, 12_345);
+
+    const prompt = runner.calls[0]?.args.at(-1) ?? "";
+    assert.match(prompt, /AgentScheduler execution frame/);
+    assert.match(prompt, /one occurrence of an AgentScheduler run/);
+    assert.match(prompt, /AgentScheduler owns recurrence, run caps, and local scheduling/);
+    assert.match(prompt, /normal Copilot CLI response/);
+    assert.match(prompt, /obey the resolved harness policy/);
+    assert.match(prompt, /Review the scheduled workspace\./);
   });
 
   it("passes autopilot schedules as autonomous all-permission CLI runs", async () => {
@@ -195,7 +199,7 @@ describe("Copilot CLI local client", () => {
       }),
     });
 
-    assert.deepEqual(runner.calls[0]?.args, [
+    assert.deepEqual(runner.calls[0]?.args.slice(0, -1), [
       "--model",
       "gpt-5",
       "--output-format",
@@ -205,8 +209,55 @@ describe("Copilot CLI local client", () => {
       "--autopilot",
       "--allow-all",
       "-p",
-      "Review the scheduled workspace.",
     ]);
+    assert.match(
+      runner.calls[0]?.args.at(-1) ?? "",
+      /Review the scheduled workspace\./,
+    );
+  });
+
+  it("frames recurrence-heavy run instructions as one Copilot CLI occurrence", async () => {
+    const runner = new RecordingCopilotCliCommandRunner({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        type: "result",
+        sessionId: "single-occurrence-session",
+        exitCode: 0,
+      }),
+      stderr: "",
+    });
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+    });
+    const schedule = createSchedule({
+      approvalMode: "bypass-approvals",
+      model: "gpt-5",
+      targetContext: null,
+      runInstructions: "Run every hour and retrieve the time.",
+    });
+
+    await client.start({
+      schedule,
+      trigger: "automatic",
+      requestedAt: "2026-07-07T17:00:00.000Z",
+      runInstructions: schedule.runInstructions,
+      resolvedHarnessPolicy: resolveCopilotLocalHarnessPolicy({
+        approvalMode: "bypass-approvals",
+        unattended: true,
+      }),
+    });
+
+    const prompt = runner.calls[0]?.args.at(-1) ?? "";
+    assert.match(prompt, /Run every hour and retrieve the time\./);
+    assert.match(prompt, /current run once in the target context/);
+    assert.match(prompt, /Do not create or register OS scheduled tasks/);
+    assert.match(prompt, /scheduled jobs/);
+    assert.match(prompt, /detached processes/);
+    assert.match(prompt, /daemons/);
+    assert.match(prompt, /timers/);
+    assert.match(prompt, /watchers/);
+    assert.match(prompt, /solely to implement recurrence/);
   });
 
   it("records a failed run when Copilot CLI exits unsuccessfully", async () => {
@@ -281,13 +332,14 @@ function createSchedule(input: {
   approvalMode: Schedule["approvalMode"];
   model: string;
   targetContext: Schedule["targetContext"];
+  runInstructions?: string;
 }): Schedule {
   return {
     id: "schedule-1",
     revision: 1,
     status: "active",
     enabled: true,
-    runInstructions: "Review the scheduled workspace.",
+    runInstructions: input.runInstructions ?? "Review the scheduled workspace.",
     cadence: { type: "cron", expression: "0 * * * *" },
     targetContext: input.targetContext,
     harnessMode: "local-copilot",
