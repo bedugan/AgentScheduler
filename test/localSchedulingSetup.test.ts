@@ -565,9 +565,9 @@ describe("local scheduling setup", () => {
       assert.equal(history.length, 1);
       assert.equal(history[0]?.trigger, "automatic");
       assert.equal(history[0]?.status, "blocked");
-      assert.equal(
-        history[0]?.error,
-        "Harness mode 'local-copilot' is unavailable.",
+      assert.match(
+        history[0]?.error ?? "",
+        /Local Copilot Mode is unavailable in this VS Code environment/,
       );
       reopenedStore.close();
     } finally {

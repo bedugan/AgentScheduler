@@ -3,6 +3,7 @@ import type {
   CreateDraftScheduleInput,
   RunHistoryDetailView,
   RunHistoryEntry,
+  ScheduleHarnessModeAvailability,
   ScheduleDetailView,
   ScheduleSummary,
   UpdateScheduleInput,
@@ -44,6 +45,10 @@ export class EditorControlSurface {
       model: schedule.model,
       approvalMode: schedule.approvalMode,
     }));
+  }
+
+  async listHarnessModeAvailability(): Promise<ScheduleHarnessModeAvailability[]> {
+    return this.lifecycle.listHarnessModeAvailability();
   }
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {

@@ -7,6 +7,16 @@ export type ApprovalMode =
 
 export type HarnessMode = "local-copilot" | "cloud-copilot";
 
+export const HARNESS_MODE_LABELS = {
+  "local-copilot": "Local Copilot Mode",
+  "cloud-copilot": "Cloud Copilot Mode",
+} as const satisfies Record<HarnessMode, string>;
+
+export const SUPPORTED_HARNESS_MODES = [
+  "local-copilot",
+  "cloud-copilot",
+] as const satisfies readonly HarnessMode[];
+
 export type ScheduleStatus = "draft" | "active" | "paused" | "completed";
 
 export type RunTrigger = "draft-manual" | "manual" | "automatic";
@@ -131,6 +141,19 @@ export interface ScheduleDetailOverview {
   runCounter: ScheduleDetailRunCounterView;
 }
 
+export interface ScheduleHarnessModeAvailability {
+  mode: HarnessMode;
+  label: string;
+  available: boolean;
+  reason?: string;
+}
+
+export interface ScheduleDetailHarnessAvailabilityState {
+  modes: ScheduleHarnessModeAvailability[];
+  selected: ScheduleHarnessModeAvailability | null;
+  message: string;
+}
+
 export type ScheduleDetailActionKind =
   | "activate"
   | "run-now"
@@ -215,6 +238,7 @@ export interface ScheduleDetailView {
   lastRunAt: IsoTimestamp | null;
   notificationState: ScheduleDetailNotificationState;
   localScheduling: ScheduleDetailLocalSchedulingState;
+  harnessAvailability: ScheduleDetailHarnessAvailabilityState;
 }
 
 export interface RunHistoryDetailView {

@@ -19,6 +19,7 @@ import type {
   RunOutcomeView,
   RunTrigger,
   Schedule,
+  ScheduleHarnessModeAvailability,
   ScheduleExportEntry,
   ScheduleExportFile,
   ScheduleDetailPreviousRun,
@@ -29,7 +30,9 @@ import type {
   UpdateScheduleInput,
 } from "./domain.js";
 import {
+  HARNESS_MODE_LABELS,
   SCHEDULE_EXPORT_SCHEMA_VERSION,
+  SUPPORTED_HARNESS_MODES,
   isActiveRunStatus,
   isStartedRunStatus,
 } from "./domain.js";
@@ -136,12 +139,22 @@ export class ScheduleLifecycle {
       updatedAt: now,
     };
 
+    if (status === "active") {
+      this.requireActivationRequirements(schedule);
+    }
+
     await this.store.saveSchedule(schedule);
     return schedule;
   }
 
   async listSchedules(): Promise<Schedule[]> {
     return this.store.listSchedules();
+  }
+
+  listHarnessModeAvailability(): ScheduleHarnessModeAvailability[] {
+    return SUPPORTED_HARNESS_MODES.map((mode) =>
+      this.harnessModeAvailabilityFor(mode),
+    );
   }
 
   async exportSchedules(
@@ -366,6 +379,7 @@ export class ScheduleLifecycle {
         desktopNotifications: "off",
       },
       localScheduling: this.localSchedulingViewFor(localSchedulingEnabled),
+      harnessAvailability: this.harnessAvailabilityViewFor(schedule),
     };
   }
 
@@ -948,24 +962,34 @@ export class ScheduleLifecycle {
   }
 
   private scheduleActionsFor(schedule: Schedule): ScheduleDetailView["actions"] {
-    const runNowEnabled = schedule.status === "draft" || schedule.enabled;
+    const runNowStatusEnabled = schedule.status === "draft" || schedule.enabled;
+    const harnessUnavailableReason = this.selectedHarnessUnavailableReason(schedule);
+    const runNowEnabled = runNowStatusEnabled && !harnessUnavailableReason;
     return {
       activate: {
         kind: "activate",
         label: "Activate Schedule",
-        enabled: schedule.status === "draft",
+        enabled: schedule.status === "draft" && !harnessUnavailableReason,
         ...(schedule.status !== "draft" && {
           disabledReason: "Only draft schedules can be activated.",
         }),
+        ...(schedule.status === "draft" &&
+          harnessUnavailableReason && {
+            disabledReason: harnessUnavailableReason,
+          }),
       },
       runNow: {
         kind: "run-now",
         label: "Run Now",
         enabled: runNowEnabled,
-        ...(!runNowEnabled && {
+        ...(!runNowStatusEnabled && {
           disabledReason:
             "Manual Run Now is only available for draft or enabled schedules.",
         }),
+        ...(runNowStatusEnabled &&
+          harnessUnavailableReason && {
+            disabledReason: harnessUnavailableReason,
+          }),
       },
       pause: {
         kind: "pause",
@@ -1047,6 +1071,25 @@ export class ScheduleLifecycle {
       message: enabled
         ? "Automatic runs are active because local scheduling setup is enabled."
         : "Automatic runs are inactive until local scheduling setup is enabled. Manual Run Now can still run from the editor when the harness is available.",
+    };
+  }
+
+  private harnessAvailabilityViewFor(
+    schedule: Schedule,
+  ): ScheduleDetailView["harnessAvailability"] {
+    const modes = this.listHarnessModeAvailability();
+    const selected = schedule.harnessMode
+      ? this.harnessModeAvailabilityFor(schedule.harnessMode)
+      : null;
+
+    return {
+      modes,
+      selected,
+      message: selected
+        ? selected.available
+          ? `${selected.label} is available for activation and manual runs.`
+          : selected.reason ?? unavailableHarnessModeMessage(selected.mode)
+        : "Choose an available harness mode before activating or running this schedule.",
     };
   }
 
@@ -1196,8 +1239,33 @@ export class ScheduleLifecycle {
     }
     if (!schedule.harnessMode) {
       messages.push("Harness mode is required before activation.");
+    } else {
+      const unavailableReason = this.selectedHarnessUnavailableReason(schedule);
+      if (unavailableReason) {
+        messages.push(unavailableReason);
+      }
     }
     return messages;
+  }
+
+  private selectedHarnessUnavailableReason(schedule: Schedule): string | undefined {
+    if (!schedule.harnessMode) {
+      return "Choose an available harness mode before activating or running this schedule.";
+    }
+
+    return !this.harnesses.has(schedule.harnessMode)
+      ? unavailableHarnessModeMessage(schedule.harnessMode)
+      : undefined;
+  }
+
+  harnessModeAvailabilityFor(mode: HarnessMode): ScheduleHarnessModeAvailability {
+    const available = this.harnesses.has(mode);
+    return {
+      mode,
+      label: HARNESS_MODE_LABELS[mode],
+      available,
+      ...(!available && { reason: unavailableHarnessModeMessage(mode) }),
+    };
   }
 
   private async requireSchedule(scheduleId: string): Promise<Schedule> {
@@ -1465,6 +1533,10 @@ type ActivationReadySchedule = Schedule & {
   targetContext: NonNullable<Schedule["targetContext"]>;
   harnessMode: NonNullable<Schedule["harnessMode"]>;
 };
+
+function unavailableHarnessModeMessage(mode: HarnessMode): string {
+  return `${HARNESS_MODE_LABELS[mode]} is unavailable in this VS Code environment because no ${HARNESS_MODE_LABELS[mode]} harness is registered. Install or enable the matching Copilot integration, or choose another available harness mode.`;
+}
 
 function formatScheduleStatuses(statuses: Schedule["status"][]): string {
   return statuses.join(" or ");

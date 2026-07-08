@@ -203,6 +203,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     const draftInput = this.buildDraftInput(input, availableModels);
     const validationMessages = [
       ...activationValidationMessages(draftInput),
+      ...harnessAvailabilityValidationMessages(this.lifecycle, draftInput),
       ...modelValidationMessages(draftInput, availableModels),
       ...riskValidationMessages(input.naturalLanguageRequest),
       ...(input.riskWarnings ?? []),
@@ -312,6 +313,23 @@ function modelValidationMessages(
   }
 
   return [];
+}
+
+function harnessAvailabilityValidationMessages(
+  lifecycle: ScheduleLifecycle,
+  input: CreateDraftScheduleInput,
+): string[] {
+  if (!input.harnessMode) {
+    return [];
+  }
+
+  const availability = lifecycle.harnessModeAvailabilityFor(input.harnessMode);
+  return availability.available
+    ? []
+    : [
+        availability.reason ??
+          `${availability.label} is unavailable in this VS Code environment.`,
+      ];
 }
 
 function riskValidationMessages(request: string): string[] {

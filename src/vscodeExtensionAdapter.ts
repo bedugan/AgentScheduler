@@ -10,6 +10,7 @@ import type {
   RunCapInput,
   ScheduleDetailActionKind,
   ScheduleDetailAction,
+  ScheduleHarnessModeAvailability,
   ScheduleDetailPreviousRun,
   ScheduleDetailView,
   ScheduleSummary,
@@ -250,6 +251,7 @@ export interface VsCodeScheduleEditor {
   resumeSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   restartCompletedSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   listSchedules(): Promise<ScheduleSummary[]>;
+  listHarnessModeAvailability(): Promise<ScheduleHarnessModeAvailability[]>;
 }
 
 export interface VsCodeSchedulerServices {
@@ -346,12 +348,13 @@ export function createDefaultVsCodeSchedulerServices(
 export function buildNewDraftScheduleInput(
   workspace: VsCodeWorkspaceLike,
   defaultModel = "gpt-5",
+  defaultHarnessMode: HarnessMode | null = "local-copilot",
 ): CreateDraftScheduleInput {
   return {
     runInstructions: "",
     cadence: DEFAULT_HOURLY_CADENCE,
     targetContext: currentWorkspaceTargetContext(workspace),
-    harnessMode: "local-copilot",
+    harnessMode: defaultHarnessMode,
     model: defaultModel,
     approvalMode: "default-approvals",
   };
@@ -537,12 +540,13 @@ export function renderScheduleDetailWebviewHtml(
     ["Enabled", view.overview.enabled ? "Yes" : "No"],
     ["Target Context", targetContextLabel(view.overview.targetContext)],
     ["Cadence", cadenceLabel(view.overview.cadence)],
-    ["Harness Mode", view.overview.harnessMode ?? "Not selected"],
+    ["Harness Mode", harnessModeOverviewLabel(view)],
     ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
     ["Approval Mode", view.overview.approvalMode],
     ["Run Counter", view.overview.runCounter.label],
     ["Next Run", view.overview.nextRunAt ?? "Not scheduled"],
     ["Last Run", view.overview.lastRunAt ?? "Never"],
+    ["Harness Availability", view.harnessAvailability.message],
   ];
 
   return `<!doctype html>
@@ -748,19 +752,7 @@ export function renderScheduleDetailWebviewHtml(
           "targetContextLabel",
           targetContextLabelInputValue(view.overview.targetContext),
         )}
-        ${renderSelect("harness-mode", "Harness Mode", "harnessMode", [
-          ["", "Not selected", view.overview.harnessMode === null],
-          [
-            "local-copilot",
-            "Local Copilot Mode",
-            view.overview.harnessMode === "local-copilot",
-          ],
-          [
-            "cloud-copilot",
-            "Cloud Copilot Mode",
-            view.overview.harnessMode === "cloud-copilot",
-          ],
-        ])}
+        ${renderHarnessModeField(view)}
         ${renderModelField(view.overview.model, state)}
         ${renderSelect("approval-mode", "Approval Mode", "approvalMode", [
           [
@@ -863,6 +855,49 @@ function renderSelect(
 
 function renderFieldNote(note: string): string {
   return `<p class="field-note">${escapeHtml(note)}</p>`;
+}
+
+function renderHarnessModeField(view: ScheduleDetailView): string {
+  const selectedMode = view.overview.harnessMode;
+  const availableModes = view.harnessAvailability.modes.filter(
+    (mode) => mode.available,
+  );
+  const selectedAvailable = availableModes.some(
+    (mode) => mode.mode === selectedMode,
+  );
+  const options: Array<[string, string, boolean]> = [
+    ["", "Not selected", selectedMode === null],
+  ];
+
+  if (selectedMode && !selectedAvailable) {
+    options.push([
+      selectedMode,
+      `${harnessModeLabel(view.harnessAvailability.selected)} (unavailable)`,
+      true,
+    ]);
+  }
+
+  options.push(
+    ...availableModes.map(
+      (mode): [string, string, boolean] => [
+        mode.mode,
+        mode.label,
+        mode.mode === selectedMode,
+      ],
+    ),
+  );
+
+  return renderSelect(
+    "harness-mode",
+    "Harness Mode",
+    "harnessMode",
+    options,
+    view.harnessAvailability.selected?.available === false
+      ? view.harnessAvailability.selected.reason
+      : availableModes.length === 0
+        ? "No Copilot harness modes are available in this VS Code environment."
+        : undefined,
+  );
 }
 
 function renderModelField(
@@ -1038,6 +1073,21 @@ function targetContextLabelInputValue(targetContext: TargetContext | null): stri
 
 function cadenceLabel(cadence: RunCadence | null): string {
   return cadence ? `cron: ${cadence.expression}` : "No cadence selected";
+}
+
+function harnessModeOverviewLabel(view: ScheduleDetailView): string {
+  const selected = view.harnessAvailability.selected;
+  if (!selected) {
+    return "Not selected";
+  }
+
+  return selected.available ? selected.label : `${selected.label} (unavailable)`;
+}
+
+function harnessModeLabel(
+  availability: ScheduleDetailView["harnessAvailability"]["selected"],
+): string {
+  return availability?.label ?? "Selected harness mode";
 }
 
 function modelOverviewLabel(
@@ -1557,8 +1607,16 @@ class VsCodeScheduleCommandController {
       const defaultModel =
         preferredScheduleModel(await this.listScheduleModelOptions())?.id ??
         "gpt-5";
+      const defaultHarnessMode =
+        (await this.editor.listHarnessModeAvailability()).find(
+          (mode) => mode.available,
+        )?.mode ?? null;
       const detail = await this.editor.createDraftSchedule(
-        buildNewDraftScheduleInput(this.workspace, defaultModel),
+        buildNewDraftScheduleInput(
+          this.workspace,
+          defaultModel,
+          defaultHarnessMode,
+        ),
       );
       await this.openScheduleDetailPanel(detail);
       this.refreshScheduleTree();

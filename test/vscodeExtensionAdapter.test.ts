@@ -352,6 +352,114 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("does not expose unavailable Copilot harness modes as runnable choices", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const html = requiredPanel(window).webview.html;
+
+    assert.equal(detail.schedule.harnessMode, null);
+    assert.doesNotMatch(html, /value="local-copilot"/);
+    assert.doesNotMatch(html, /value="cloud-copilot"/);
+    assert.match(
+      html,
+      /No Copilot harness modes are available in this VS Code environment\./,
+    );
+    assert.match(html, /data-action="activate" data-state="disabled" disabled/);
+    assert.match(html, /data-action="run-now" data-state="disabled" disabled/);
+  });
+
+  it("renders local and cloud harness modes only when registered", async () => {
+    const localOnlyLifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const localCommands = new RecordingCommands();
+    const localWindow = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: localCommands,
+      window: localWindow,
+      workspace: {},
+      services: { editor: new EditorControlSurface(localOnlyLifecycle) },
+      viewColumn: 1,
+    });
+
+    const localDetail = (await commandCallback(
+      localCommands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    assert.equal(localDetail.schedule.harnessMode, "local-copilot");
+    assert.match(requiredPanel(localWindow).webview.html, /value="local-copilot"/);
+    assert.doesNotMatch(
+      requiredPanel(localWindow).webview.html,
+      /value="cloud-copilot"/,
+    );
+
+    const cloudOnlyLifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "cloud-copilot" })],
+    });
+    const cloudCommands = new RecordingCommands();
+    const cloudWindow = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: cloudCommands,
+      window: cloudWindow,
+      workspace: {},
+      services: { editor: new EditorControlSurface(cloudOnlyLifecycle) },
+      viewColumn: 1,
+    });
+
+    const cloudDetail = (await commandCallback(
+      cloudCommands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    assert.equal(cloudDetail.schedule.harnessMode, "cloud-copilot");
+    assert.match(requiredPanel(cloudWindow).webview.html, /value="cloud-copilot"/);
+    assert.doesNotMatch(
+      requiredPanel(cloudWindow).webview.html,
+      /value="local-copilot"/,
+    );
+  });
+
   it("maps schedules and the empty state into Schedule List tree items", async () => {
     const provider = new ScheduleTreeDataProvider(
       new StaticScheduleEditor([]),
@@ -550,6 +658,58 @@ describe("VS Code extension adapter", () => {
     assert.match(
       requiredPanel(window).webview.html,
       /value="copilot-gpt-4\.1" selected/,
+    );
+  });
+
+  it("creates a draft from natural language when the requested harness is unavailable", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: new RecordingCommands(),
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest: "run every hour to review bug branches",
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "draft");
+    assert.equal(result.schedule.status, "draft");
+    assert.equal(result.schedule.enabled, false);
+    assert.deepEqual(result.validationMessages, [
+      "Local Copilot Mode is unavailable in this VS Code environment because no Local Copilot Mode harness is registered. Install or enable the matching Copilot integration, or choose another available harness mode.",
+    ]);
+    assert.equal(window.informationMessages.length, 0);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /Local Copilot Mode is unavailable in this VS Code environment/,
     );
   });
 
@@ -1280,6 +1440,58 @@ describe("VS Code extension adapter", () => {
     assert.equal(window.errorMessages.length, 0);
   });
 
+  it("blocks draft activation when the selected harness is unavailable", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [],
+    });
+    const draft = await lifecycle.createDraftSchedule({
+      runInstructions: "Try to activate without a registered harness.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(draft.id);
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "activate",
+      scheduleId: draft.id,
+    });
+
+    assert.equal((await store.getSchedule(draft.id))?.status, "draft");
+    assert.match(requiredPanel(window).webview.html, /role="alert"/);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /Local Copilot Mode is unavailable in this VS Code environment/,
+    );
+    assert.match(
+      requiredPanel(window).webview.html,
+      /data-action="activate" data-state="disabled" disabled/,
+    );
+  });
+
   it("runs schedules through the lifecycle and refreshes previous run history", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const store = new InMemoryScheduleStore();
@@ -1376,18 +1588,18 @@ describe("VS Code extension adapter", () => {
     const runs = await store.listRunHistory(schedule.id);
     assert.equal(runs.length, 1);
     assert.equal(runs[0]?.status, "blocked");
-    assert.equal(
-      runs[0]?.error,
-      "Harness mode 'local-copilot' is unavailable.",
+    assert.match(
+      runs[0]?.error ?? "",
+      /Local Copilot Mode is unavailable in this VS Code environment/,
     );
     assert.match(panel.webview.html, /blocked/);
     assert.match(
       panel.webview.html,
-      /Harness mode &#39;local-copilot&#39; is unavailable\./,
+      /Local Copilot Mode is unavailable in this VS Code environment/,
     );
     assert.match(
       panel.webview.html,
-      /Blocked: Harness mode &#39;local-copilot&#39; is unavailable\./,
+      /Blocked: Local Copilot Mode is unavailable in this VS Code environment/,
     );
     assert.match(
       panel.webview.html,
@@ -1906,6 +2118,12 @@ class EmptyScheduleEditor implements VsCodeScheduleEditor {
 
   async listSchedules(): Promise<
     Awaited<ReturnType<VsCodeScheduleEditor["listSchedules"]>>
+  > {
+    return [];
+  }
+
+  async listHarnessModeAvailability(): Promise<
+    Awaited<ReturnType<VsCodeScheduleEditor["listHarnessModeAvailability"]>>
   > {
     return [];
   }
