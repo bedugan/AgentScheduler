@@ -6,9 +6,14 @@ import { describe, it } from "node:test";
 import {
   EditorControlSurface,
   ScheduleLifecycle,
+  type NaturalLanguageScheduleCreationResult,
   type ScheduleDetailView,
 } from "../src/index.js";
 import {
+  CREATE_SCHEDULE_CHAT_PARTICIPANT_ID,
+  CREATE_SCHEDULE_CHAT_SLASH_COMMAND,
+  CREATE_SCHEDULE_COMMAND,
+  CREATE_SCHEDULE_TOOL_NAME,
   NEW_SCHEDULE_COMMAND,
   OPEN_SCHEDULE_COMMAND,
   SCHEDULE_DETAIL_VIEW_TYPE,
@@ -24,6 +29,11 @@ import {
   type VsCodeEventEmitterFactory,
   type VsCodeEventEmitterLike,
   type VsCodeEventLike,
+  type VsCodeChatLike,
+  type VsCodeChatRequestLike,
+  type VsCodeChatResponseStreamLike,
+  type VsCodeLanguageModelLike,
+  type VsCodeLanguageModelToolLike,
   type VsCodeQuickPickItemLike,
   type VsCodeQuickPickOptionsLike,
   type VsCodeScheduleEditor,
@@ -49,6 +59,16 @@ describe("VS Code extension adapter", () => {
       activationEvents?: string[];
       contributes?: {
         commands?: Array<{ command: string; title: string }>;
+        chatParticipants?: Array<{
+          id: string;
+          name: string;
+          commands?: Array<{ name: string; description: string }>;
+        }>;
+        languageModelTools?: Array<{
+          name: string;
+          toolReferenceName: string;
+          inputSchema: Record<string, unknown>;
+        }>;
         views?: Record<string, Array<{ id: string; name: string }>>;
       };
       extensionKind?: string[];
@@ -61,12 +81,89 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual(manifest.activationEvents, [
       `onCommand:${NEW_SCHEDULE_COMMAND}`,
       `onCommand:${OPEN_SCHEDULE_COMMAND}`,
+      `onCommand:${CREATE_SCHEDULE_COMMAND}`,
       `onView:${SCHEDULE_LIST_VIEW_ID}`,
+      `onLanguageModelTool:${CREATE_SCHEDULE_TOOL_NAME}`,
+      `onChatParticipant:${CREATE_SCHEDULE_CHAT_PARTICIPANT_ID}`,
     ]);
     assert.deepEqual(
       manifest.contributes?.commands?.map((command) => command.command),
-      [NEW_SCHEDULE_COMMAND, OPEN_SCHEDULE_COMMAND],
+      [NEW_SCHEDULE_COMMAND, OPEN_SCHEDULE_COMMAND, CREATE_SCHEDULE_COMMAND],
     );
+    const toolContribution = manifest.contributes?.languageModelTools?.[0];
+    assert.equal(toolContribution?.name, CREATE_SCHEDULE_TOOL_NAME);
+    assert.equal(toolContribution?.toolReferenceName, "createSchedule");
+    assert.deepEqual(
+      toolContribution?.inputSchema,
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["naturalLanguageRequest"],
+        properties: {
+          naturalLanguageRequest: {
+            type: "string",
+            description: "The user's natural-language schedule creation request.",
+          },
+          runInstructions: {
+            type: "string",
+            description: "Inline instructions to run each time the schedule fires.",
+          },
+          cadence: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "expression"],
+            properties: {
+              type: { const: "cron" },
+              expression: { type: "string" },
+            },
+          },
+          targetContext: {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "uri"],
+            properties: {
+              type: { const: "workspace" },
+              uri: { type: "string" },
+              label: { type: "string" },
+            },
+          },
+          harnessMode: {
+            type: "string",
+            enum: ["local-copilot", "cloud-copilot"],
+          },
+          model: { type: "string" },
+          approvalMode: {
+            type: "string",
+            enum: ["default-approvals", "bypass-approvals", "autopilot"],
+          },
+          runCap: {
+            type: "object",
+            additionalProperties: false,
+            required: ["maxRuns"],
+            properties: {
+              maxRuns: { type: "integer", minimum: 1 },
+            },
+          },
+          riskWarnings: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+      },
+    );
+    assert.deepEqual(manifest.contributes?.chatParticipants?.[0], {
+      id: CREATE_SCHEDULE_CHAT_PARTICIPANT_ID,
+      name: "agentScheduler",
+      fullName: "AgentScheduler",
+      description: "Create and review recurring agent schedules.",
+      isSticky: false,
+      commands: [
+        {
+          name: CREATE_SCHEDULE_CHAT_SLASH_COMMAND,
+          description: "Create an AgentScheduler schedule from natural language.",
+        },
+      ],
+    });
     assert.deepEqual(manifest.contributes?.views?.explorer, [
       {
         id: SCHEDULE_LIST_VIEW_ID,
@@ -194,6 +291,261 @@ describe("VS Code extension adapter", () => {
       OPEN_SCHEDULE_COMMAND,
     ]);
     assert.equal(context.subscriptions.length, 2);
+  });
+
+  it("registers natural-language creation surfaces and activates complete tool requests after confirmation", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel();
+    const chat = new RecordingChat();
+    window.informationMessageResponses.push("Create Active Schedule");
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      eventEmitterFactory: new RecordingEventEmitterFactory(),
+      languageModel,
+      chat,
+    });
+
+    assert.ok(commands.registrations.has(CREATE_SCHEDULE_COMMAND));
+    assert.ok(languageModel.tools.has(CREATE_SCHEDULE_TOOL_NAME));
+    assert.ok(chat.participants.has(CREATE_SCHEDULE_CHAT_PARTICIPANT_ID));
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest: "run every hour to review bug branches",
+          runCap: { maxRuns: 2 },
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "activated");
+    assert.equal(result.source, "language-model-tool");
+    assert.equal(result.schedule.status, "active");
+    assert.equal(result.schedule.enabled, true);
+    assert.equal(result.schedule.runInstructions, "Review bug branches.");
+    assert.deepEqual(result.schedule.targetContext, {
+      type: "workspace",
+      uri: "file:///Users/ada/src/AgentScheduler",
+      label: "AgentScheduler",
+    });
+    assert.equal(result.schedule.harnessMode, "local-copilot");
+    assert.equal(result.schedule.model, "gpt-5");
+    assert.equal(result.schedule.approvalMode, "default-approvals");
+    assert.deepEqual(result.schedule.runCounter, { completed: 0, limit: 2 });
+    assert.equal(window.informationMessages.length, 1);
+    assert.match(window.informationMessages[0] ?? "", /Create active/);
+    assert.equal(window.panels.length, 1);
+    assert.match(window.panels[0]?.webview.html ?? "", /Review bug branches\./);
+  });
+
+  it("creates a draft and opens Schedule Detail when creation confirmation is declined", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel();
+    window.informationMessageResponses.push(undefined);
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: new RecordingCommands(),
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest: "run every hour to review bug branches",
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "draft");
+    assert.deepEqual(result.validationMessages, ["Activation was not confirmed."]);
+    assert.equal(result.schedule.status, "draft");
+    assert.equal(result.schedule.enabled, false);
+    assert.equal(window.informationMessages.length, 1);
+    assert.equal(window.panels.length, 1);
+    assert.match(window.panels[0]?.webview.html ?? "", /Review bug branches\./);
+  });
+
+  it("creates a draft fallback for risky requests without asking for activation confirmation", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: new RecordingCommands(),
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest:
+            "run every hour to delete stale release branches",
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "draft");
+    assert.deepEqual(result.validationMessages, [
+      "Request includes potentially destructive work and must be reviewed before automatic recurrence.",
+    ]);
+    assert.equal(result.schedule.status, "draft");
+    assert.equal(result.schedule.enabled, false);
+    assert.equal(window.informationMessages.length, 0);
+    assert.equal(window.panels.length, 1);
+  });
+
+  it("routes chat, slash-command, and command fallback schedule creation through Schedule Detail", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new FakeHarness({ mode: "local-copilot" }),
+        new FakeHarness({ mode: "cloud-copilot" }),
+      ],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const chat = new RecordingChat();
+    window.informationMessageResponses.push(
+      "Create Active Schedule",
+      "Create Active Schedule",
+      "Create Active Schedule",
+    );
+    window.inputBoxResponses.push(
+      "run every hour to review security advisories",
+    );
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      chat,
+    });
+    const participant = chat.requiredParticipant(CREATE_SCHEDULE_CHAT_PARTICIPANT_ID);
+    const stream = new RecordingChatResponseStream();
+
+    const chatResult = await participant.handleRequest(
+      {
+        prompt: "run every hour in Cloud Copilot Mode to review release branches",
+      },
+      stream,
+    );
+    const slashResult = await participant.handleRequest(
+      {
+        command: CREATE_SCHEDULE_CHAT_SLASH_COMMAND,
+        prompt: "run every hour to delete stale release branches",
+      },
+      stream,
+    );
+    const commandResult = (await commandCallback(commands, CREATE_SCHEDULE_COMMAND)({
+      naturalLanguageRequest: "run every hour to review dependency updates",
+    })) as Awaited<ReturnType<RecordingChatParticipant["handleRequest"]>>;
+    const promptedCommandResult = (await commandCallback(
+      commands,
+      CREATE_SCHEDULE_COMMAND,
+    )()) as Awaited<ReturnType<RecordingChatParticipant["handleRequest"]>>;
+
+    assert.equal(chatResult.source, "chat-participant");
+    assert.equal(chatResult.outcome, "activated");
+    assert.equal(chatResult.schedule.harnessMode, "cloud-copilot");
+    assert.equal(slashResult.source, "slash-command");
+    assert.equal(slashResult.outcome, "draft");
+    assert.equal(commandResult.source, "slash-command");
+    assert.equal(commandResult.outcome, "activated");
+    assert.equal(promptedCommandResult.source, "slash-command");
+    assert.equal(promptedCommandResult.outcome, "activated");
+    assert.equal(window.inputBoxPrompts.length, 1);
+    assert.equal(window.panels.length, 4);
+    assert.match(
+      window.panels.at(-1)?.webview.html ?? "",
+      /Review security advisories\./,
+    );
+    assert.equal(stream.markdownMessages.length, 2);
+    assert.match(stream.markdownMessages[0] ?? "", /Created active schedule/);
+    assert.match(stream.markdownMessages[1] ?? "", /Created draft schedule/);
   });
 
   it("registers the Schedule List tree and refreshes it after schedule mutations", async () => {
@@ -988,6 +1340,80 @@ class RecordingEventEmitterFactory implements VsCodeEventEmitterFactory {
   }
 }
 
+class RecordingLanguageModel implements VsCodeLanguageModelLike {
+  readonly tools = new Map<string, VsCodeLanguageModelToolLike>();
+
+  registerTool(
+    name: string,
+    tool: VsCodeLanguageModelToolLike,
+  ): VsCodeDisposableLike {
+    this.tools.set(name, tool);
+    return {
+      dispose: () => {
+        this.tools.delete(name);
+      },
+    };
+  }
+
+  requiredTool(name: string): VsCodeLanguageModelToolLike {
+    const tool = this.tools.get(name);
+    assert.ok(tool, `Expected language model tool ${name} to be registered.`);
+    return tool;
+  }
+}
+
+class RecordingChatResponseStream implements VsCodeChatResponseStreamLike {
+  readonly markdownMessages: string[] = [];
+  readonly progressMessages: string[] = [];
+
+  markdown(message: string): void {
+    this.markdownMessages.push(message);
+  }
+
+  progress(message: string): void {
+    this.progressMessages.push(message);
+  }
+}
+
+class RecordingChatParticipant implements VsCodeDisposableLike {
+  constructor(
+    readonly handleRequest: (
+      request: VsCodeChatRequestLike,
+      stream: VsCodeChatResponseStreamLike,
+    ) => Promise<NaturalLanguageScheduleCreationResult>,
+  ) {}
+
+  dispose(): void {}
+}
+
+class RecordingChat implements VsCodeChatLike {
+  readonly participants = new Map<string, RecordingChatParticipant>();
+
+  createChatParticipant(
+    id: string,
+    handler: (
+      request: VsCodeChatRequestLike,
+      context: unknown,
+      stream: VsCodeChatResponseStreamLike,
+      token: unknown,
+    ) => unknown,
+  ): RecordingChatParticipant {
+    const participant = new RecordingChatParticipant(async (request, stream) => {
+      return (await handler(request, {}, stream, {})) as Awaited<
+        ReturnType<RecordingChatParticipant["handleRequest"]>
+      >;
+    });
+    this.participants.set(id, participant);
+    return participant;
+  }
+
+  requiredParticipant(id: string): RecordingChatParticipant {
+    const participant = this.participants.get(id);
+    assert.ok(participant, `Expected chat participant ${id} to be registered.`);
+    return participant;
+  }
+}
+
 class RecordingWebview implements VsCodeWebviewLike {
   html = "";
   private readonly messageHandlers: Array<(message: unknown) => unknown> = [];
@@ -1015,6 +1441,10 @@ class RecordingWindow implements VsCodeWindowLike {
   readonly panels: RecordingPanel[] = [];
   readonly treeProviders = new Map<string, VsCodeTreeDataProviderLike<unknown>>();
   readonly informationMessages: string[] = [];
+  readonly informationMessageItems: unknown[][] = [];
+  readonly informationMessageResponses: unknown[] = [];
+  readonly inputBoxPrompts: string[] = [];
+  readonly inputBoxResponses: Array<string | undefined> = [];
   readonly errorMessages: string[] = [];
   quickPickItems: VsCodeQuickPickItemLike[] = [];
 
@@ -1071,9 +1501,18 @@ class RecordingWindow implements VsCodeWindowLike {
     return items[0];
   }
 
-  async showInformationMessage(message: string): Promise<undefined> {
+  async showInformationMessage(
+    message: string,
+    ...items: unknown[]
+  ): Promise<unknown> {
     this.informationMessages.push(message);
-    return undefined;
+    this.informationMessageItems.push(items);
+    return this.informationMessageResponses.shift();
+  }
+
+  async showInputBox(options: { prompt: string }): Promise<string | undefined> {
+    this.inputBoxPrompts.push(options.prompt);
+    return this.inputBoxResponses.shift();
   }
 
   async showErrorMessage(message: string): Promise<undefined> {

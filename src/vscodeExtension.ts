@@ -18,6 +18,15 @@ export function activate(context: vscode.ExtensionContext): void {
     eventEmitterFactory: {
       createEventEmitter: <T>() => new vscode.EventEmitter<T>(),
     },
+    languageModel: vscode.lm,
+    languageModelToolResultFactory: {
+      createTextPart: (value) => new vscode.LanguageModelTextPart(value),
+      createToolResult: (parts) =>
+        new vscode.LanguageModelToolResult(
+          parts as vscode.LanguageModelTextPart[],
+        ),
+    },
+    chat: vscode.chat,
   });
 
   context.subscriptions.push({
