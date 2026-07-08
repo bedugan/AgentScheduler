@@ -37,6 +37,7 @@ import {
   type VsCodeQuickPickItemLike,
   type VsCodeQuickPickOptionsLike,
   type VsCodeScheduleEditor,
+  type ScheduleModelOption,
   type ScheduleTreeNode,
   type VsCodeTreeDataProviderLike,
   type VsCodeWebviewPanelLike,
@@ -218,6 +219,139 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("renders catalog models and defaults new schedules to an available Copilot model", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel([
+      {
+        id: "openai-gpt-5",
+        vendor: "openai",
+        family: "gpt-5",
+        version: "2026-01",
+        displayName: "OpenAI GPT-5",
+        maxInputTokens: 128000,
+      },
+      {
+        id: "copilot-gpt-4.1",
+        vendor: "copilot",
+        family: "gpt-4.1",
+        version: "2026-02",
+        displayName: "Copilot GPT-4.1",
+        maxInputTokens: 128000,
+      },
+    ]);
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+
+    assert.equal(detail.schedule.model, "copilot-gpt-4.1");
+    assert.match(
+      requiredPanel(window).webview.html,
+      /<select id="model" name="model">/,
+    );
+    assert.match(
+      requiredPanel(window).webview.html,
+      /value="copilot-gpt-4\.1" selected/,
+    );
+
+    const legacySchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Keep this legacy model editable.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "legacy-model",
+      approvalMode: "default-approvals",
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(legacySchedule.id);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /legacy-model \(unavailable or legacy\)/,
+    );
+    assert.match(
+      requiredPanel(window).webview.html,
+      /Saved model is unavailable or legacy in this VS Code environment\./,
+    );
+  });
+
+  it("keeps a manual model input fallback when VS Code reports no chat models", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      languageModel: new RecordingLanguageModel([]),
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+
+    assert.equal(detail.schedule.model, "gpt-5");
+    assert.match(
+      requiredPanel(window).webview.html,
+      /name="model"[^>]*value="gpt-5"/,
+    );
+    assert.match(
+      requiredPanel(window).webview.html,
+      /No VS Code chat models were reported; enter a model id manually\./,
+    );
+  });
+
   it("maps schedules and the empty state into Schedule List tree items", async () => {
     const provider = new ScheduleTreeDataProvider(
       new StaticScheduleEditor([]),
@@ -361,6 +495,62 @@ describe("VS Code extension adapter", () => {
     assert.match(window.informationMessages[0] ?? "", /Create active/);
     assert.equal(window.panels.length, 1);
     assert.match(window.panels[0]?.webview.html ?? "", /Review bug branches\./);
+  });
+
+  it("uses an available catalog model during natural-language schedule creation", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const languageModel = new RecordingLanguageModel([
+      {
+        id: "copilot-gpt-4.1",
+        vendor: "copilot",
+        family: "gpt-4.1",
+        displayName: "Copilot GPT-4.1",
+      },
+    ]);
+    const window = new RecordingWindow();
+    window.informationMessageResponses.push("Create Active Schedule");
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: new RecordingCommands(),
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest: "run every hour to review bug branches",
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "activated");
+    assert.equal(result.schedule.model, "copilot-gpt-4.1");
+    assert.match(
+      requiredPanel(window).webview.html,
+      /value="copilot-gpt-4\.1" selected/,
+    );
   });
 
   it("creates a draft and opens Schedule Detail when creation confirmation is declined", async () => {
@@ -638,6 +828,68 @@ describe("VS Code extension adapter", () => {
     ]);
     const children = await provider.getChildren();
     assert.equal(children[0]?.kind, "schedule");
+  });
+
+  it("refreshes open Schedule Detail model choices when VS Code chat models change", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Refresh model choices.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "copilot-gpt-4.1",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const languageModel = new RecordingLanguageModel([
+      {
+        id: "copilot-gpt-4.1",
+        vendor: "copilot",
+        family: "gpt-4.1",
+        displayName: "Copilot GPT-4.1",
+      },
+    ]);
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(schedule.id);
+    const panel = requiredPanel(window);
+    assert.match(panel.webview.html, /value="copilot-gpt-4\.1" selected/);
+
+    languageModel.setModels([
+      {
+        id: "copilot-gpt-5",
+        vendor: "copilot",
+        family: "gpt-5",
+        displayName: "Copilot GPT-5",
+      },
+    ]);
+    await settleAsyncWork();
+
+    assert.match(
+      panel.webview.html,
+      /copilot-gpt-4\.1 \(unavailable or legacy\)/,
+    );
+    assert.match(panel.webview.html, /value="copilot-gpt-5"/);
   });
 
   it("creates a real draft schedule and opens its Schedule Detail webview", async () => {
@@ -1143,6 +1395,86 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("blocks activation and manual runs when the selected model is unavailable", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const draft = await lifecycle.createDraftSchedule({
+      runInstructions: "Try to activate with a stale model.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "legacy-model",
+      approvalMode: "default-approvals",
+    });
+    const active = await lifecycle.createActiveSchedule({
+      runInstructions: "Try to run with a stale model.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "legacy-model",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      languageModel: new RecordingLanguageModel([
+        {
+          id: "copilot-gpt-4.1",
+          vendor: "copilot",
+          family: "gpt-4.1",
+          displayName: "Copilot GPT-4.1",
+        },
+      ]),
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(draft.id);
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "activate",
+      scheduleId: draft.id,
+    });
+
+    assert.equal((await store.getSchedule(draft.id))?.status, "draft");
+    assert.match(requiredPanel(window).webview.html, /role="alert"/);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /Selected model &#39;legacy-model&#39; is not available in this VS Code\/Copilot environment\./,
+    );
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(active.id);
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: active.id,
+    });
+
+    assert.deepEqual(await store.listRunHistory(active.id), []);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /Selected model &#39;legacy-model&#39; is not available in this VS Code\/Copilot environment\./,
+    );
+  });
+
   it("pauses, resumes, and restarts schedules through Schedule Detail actions", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const store = new InMemoryScheduleStore();
@@ -1284,6 +1616,10 @@ function requiredPanel(window: RecordingWindow): RecordingPanel {
   return panel;
 }
 
+async function settleAsyncWork(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 class RecordingCommands implements VsCodeCommandsLike {
   readonly registrations = new Map<string, (...args: unknown[]) => unknown>();
 
@@ -1342,6 +1678,11 @@ class RecordingEventEmitterFactory implements VsCodeEventEmitterFactory {
 
 class RecordingLanguageModel implements VsCodeLanguageModelLike {
   readonly tools = new Map<string, VsCodeLanguageModelToolLike>();
+  private readonly changeEmitter = new RecordingEventEmitter<unknown>();
+
+  readonly onDidChangeChatModels = this.changeEmitter.event;
+
+  constructor(private models: ScheduleModelOption[] = []) {}
 
   registerTool(
     name: string,
@@ -1359,6 +1700,15 @@ class RecordingLanguageModel implements VsCodeLanguageModelLike {
     const tool = this.tools.get(name);
     assert.ok(tool, `Expected language model tool ${name} to be registered.`);
     return tool;
+  }
+
+  async selectChatModels(): Promise<readonly ScheduleModelOption[]> {
+    return this.models;
+  }
+
+  setModels(models: ScheduleModelOption[]): void {
+    this.models = models;
+    this.changeEmitter.fire({});
   }
 }
 

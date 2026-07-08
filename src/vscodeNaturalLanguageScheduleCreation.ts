@@ -10,6 +10,14 @@ import type {
   WorkspaceTargetContext,
 } from "./domain.js";
 import type { ScheduleLifecycle } from "./scheduleLifecycle.js";
+import type {
+  ScheduleModelCatalog,
+  ScheduleModelOption,
+} from "./scheduleModelCatalog.js";
+import {
+  isScheduleModelAvailable,
+  unavailableScheduleModelMessage,
+} from "./scheduleModelCatalog.js";
 
 export type NaturalLanguageScheduleCreationSource =
   | "language-model-tool"
@@ -67,6 +75,7 @@ export interface VsCodeNaturalLanguageScheduleCreationOptions {
   lifecycle: ScheduleLifecycle;
   currentWorkspace?: WorkspaceTargetContext;
   defaultModel?: string;
+  modelCatalog?: ScheduleModelCatalog;
   confirmActivation(
     proposal: NaturalLanguageScheduleActivationProposal,
   ): Promise<boolean>;
@@ -136,6 +145,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
   private readonly lifecycle: ScheduleLifecycle;
   private readonly currentWorkspace: WorkspaceTargetContext | undefined;
   private readonly defaultModel: string;
+  private readonly modelCatalog: ScheduleModelCatalog | undefined;
   private readonly confirmActivation: (
     proposal: NaturalLanguageScheduleActivationProposal,
   ) => Promise<boolean>;
@@ -144,6 +154,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     this.lifecycle = options.lifecycle;
     this.currentWorkspace = options.currentWorkspace;
     this.defaultModel = options.defaultModel ?? "gpt-5";
+    this.modelCatalog = options.modelCatalog;
     this.confirmActivation = options.confirmActivation;
 
     this.languageModelTool = {
@@ -188,9 +199,11 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     input: NaturalLanguageScheduleCreationInput,
     source: NaturalLanguageScheduleCreationSource,
   ): Promise<NaturalLanguageScheduleCreationResult> {
-    const draftInput = this.buildDraftInput(input);
+    const availableModels = await this.listAvailableModels();
+    const draftInput = this.buildDraftInput(input, availableModels);
     const validationMessages = [
       ...activationValidationMessages(draftInput),
+      ...modelValidationMessages(draftInput, availableModels),
       ...riskValidationMessages(input.naturalLanguageRequest),
       ...(input.riskWarnings ?? []),
     ];
@@ -228,6 +241,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
 
   private buildDraftInput(
     input: NaturalLanguageScheduleCreationInput,
+    availableModels: readonly ScheduleModelOption[],
   ): CreateDraftScheduleInput {
     const runInstructions =
       normalizeSentence(input.runInstructions) ??
@@ -238,7 +252,8 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
       input.harnessMode ??
       inferHarnessMode(input.naturalLanguageRequest) ??
       "local-copilot";
-    const model = normalizeText(input.model) ?? this.defaultModel;
+    const model =
+      normalizeText(input.model) ?? availableModels[0]?.id ?? this.defaultModel;
     const approvalMode = input.approvalMode ?? "default-approvals";
 
     const proposal: CreateDraftScheduleInput = {
@@ -255,6 +270,14 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     }
 
     return proposal;
+  }
+
+  private async listAvailableModels(): Promise<readonly ScheduleModelOption[]> {
+    if (!this.modelCatalog) {
+      return [];
+    }
+
+    return this.modelCatalog.listScheduleModels();
   }
 }
 
@@ -275,6 +298,20 @@ function activationValidationMessages(
     messages.push("Harness mode is required before activation.");
   }
   return messages;
+}
+
+function modelValidationMessages(
+  input: CreateDraftScheduleInput,
+  availableModels: readonly ScheduleModelOption[],
+): string[] {
+  if (
+    availableModels.length > 0 &&
+    !isScheduleModelAvailable(input.model, availableModels)
+  ) {
+    return [unavailableScheduleModelMessage(input.model)];
+  }
+
+  return [];
 }
 
 function riskValidationMessages(request: string): string[] {

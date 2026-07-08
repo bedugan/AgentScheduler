@@ -19,6 +19,15 @@ import type {
 } from "./domain.js";
 import { EditorControlSurface } from "./editorControlSurface.js";
 import { ScheduleLifecycle } from "./scheduleLifecycle.js";
+import type {
+  ScheduleModelCatalog,
+  ScheduleModelOption,
+} from "./scheduleModelCatalog.js";
+import {
+  isScheduleModelAvailable,
+  preferredScheduleModel,
+  unavailableScheduleModelMessage,
+} from "./scheduleModelCatalog.js";
 import { SqliteScheduleStore } from "./sqliteScheduleStore.js";
 import type {
   NaturalLanguageScheduleActivationProposal,
@@ -26,6 +35,11 @@ import type {
   NaturalLanguageScheduleCreationResult,
 } from "./vscodeNaturalLanguageScheduleCreation.js";
 import { VsCodeNaturalLanguageScheduleCreationFlow } from "./vscodeNaturalLanguageScheduleCreation.js";
+
+export type {
+  ScheduleModelCatalog,
+  ScheduleModelOption,
+} from "./scheduleModelCatalog.js";
 
 export const CREATE_SCHEDULE_COMMAND = "agentScheduler.createSchedule";
 export const CREATE_SCHEDULE_TOOL_NAME = "agentScheduler_createSchedule";
@@ -99,11 +113,25 @@ export interface VsCodeLanguageModelToolLike {
   ): Promise<unknown>;
 }
 
+export interface VsCodeLanguageModelChatLike {
+  id: string;
+  vendor?: string;
+  family?: string;
+  version?: string;
+  name?: string;
+  displayName?: string;
+  maxInputTokens?: number;
+}
+
 export interface VsCodeLanguageModelLike {
   registerTool(
     name: string,
     tool: VsCodeLanguageModelToolLike,
   ): VsCodeDisposableLike;
+  selectChatModels?(
+    selector?: Record<string, unknown>,
+  ): Promise<readonly VsCodeLanguageModelChatLike[]>;
+  onDidChangeChatModels?: VsCodeEventLike<unknown>;
 }
 
 export interface VsCodeLanguageModelToolResultFactory {
@@ -239,6 +267,7 @@ export interface RegisterVsCodeScheduleCommandsOptions {
   viewColumn: unknown;
   eventEmitterFactory?: VsCodeEventEmitterFactory;
   languageModel?: VsCodeLanguageModelLike;
+  modelCatalog?: ScheduleModelCatalog;
   languageModelToolResultFactory?: VsCodeLanguageModelToolResultFactory;
   chat?: VsCodeChatLike;
 }
@@ -258,6 +287,8 @@ export type ScheduleTreeNode =
 
 interface ScheduleDetailRenderState {
   errorMessage?: string;
+  modelOptions?: readonly ScheduleModelOption[];
+  modelCatalogAvailable?: boolean;
 }
 
 interface ScheduleDetailFormFields {
@@ -314,13 +345,14 @@ export function createDefaultVsCodeSchedulerServices(
 
 export function buildNewDraftScheduleInput(
   workspace: VsCodeWorkspaceLike,
+  defaultModel = "gpt-5",
 ): CreateDraftScheduleInput {
   return {
     runInstructions: "",
     cadence: DEFAULT_HOURLY_CADENCE,
     targetContext: currentWorkspaceTargetContext(workspace),
     harnessMode: "local-copilot",
-    model: "gpt-5",
+    model: defaultModel,
     approvalMode: "default-approvals",
   };
 }
@@ -344,8 +376,76 @@ export function currentWorkspaceTargetContext(
   return targetContext;
 }
 
+export function createVsCodeScheduleModelCatalog(
+  languageModel: VsCodeLanguageModelLike | undefined,
+): ScheduleModelCatalog | undefined {
+  if (!languageModel?.selectChatModels) {
+    return undefined;
+  }
+
+  return {
+    listScheduleModels: async () => {
+      try {
+        const chatModels = await languageModel.selectChatModels?.();
+        return normalizeScheduleModelOptions(chatModels ?? []);
+      } catch {
+        return [];
+      }
+    },
+    ...(languageModel.onDidChangeChatModels && {
+      onDidChangeScheduleModels: (listener: () => unknown) =>
+        languageModel.onDidChangeChatModels?.(() => listener()) ?? {
+          dispose: () => {},
+        },
+    }),
+  };
+}
+
+function normalizeScheduleModelOptions(
+  models: readonly VsCodeLanguageModelChatLike[],
+): ScheduleModelOption[] {
+  const uniqueModels = new Map<string, ScheduleModelOption>();
+  for (const model of models) {
+    if (model.id.trim().length === 0 || uniqueModels.has(model.id)) {
+      continue;
+    }
+
+    uniqueModels.set(model.id, scheduleModelOptionFor(model));
+  }
+
+  return [...uniqueModels.values()].sort((left, right) => {
+    const leftRank = isCopilotScheduleModel(left) ? 0 : 1;
+    const rightRank = isCopilotScheduleModel(right) ? 0 : 1;
+    return (
+      leftRank - rightRank || left.displayName.localeCompare(right.displayName)
+    );
+  });
+}
+
+function scheduleModelOptionFor(
+  model: VsCodeLanguageModelChatLike,
+): ScheduleModelOption {
+  return {
+    id: model.id,
+    displayName: model.displayName ?? model.name ?? model.id,
+    ...(model.vendor ? { vendor: model.vendor } : {}),
+    ...(model.family ? { family: model.family } : {}),
+    ...(model.version ? { version: model.version } : {}),
+    ...(typeof model.maxInputTokens === "number"
+      ? { maxInputTokens: model.maxInputTokens }
+      : {}),
+  };
+}
+
+function isCopilotScheduleModel(model: ScheduleModelOption): boolean {
+  return [model.vendor, model.family, model.displayName, model.id].some((value) =>
+    /\bcopilot\b|github\.copilot/i.test(value ?? ""),
+  );
+}
+
 function createScheduleCreationFlow(
   options: RegisterVsCodeScheduleCommandsOptions,
+  modelCatalog: ScheduleModelCatalog | undefined,
 ): VsCodeNaturalLanguageScheduleCreationFlow | undefined {
   if (!options.services.lifecycle) {
     return undefined;
@@ -356,6 +456,7 @@ function createScheduleCreationFlow(
     lifecycle: options.services.lifecycle,
     ...(currentWorkspace ? { currentWorkspace } : {}),
     defaultModel: "gpt-5",
+    ...(modelCatalog ? { modelCatalog } : {}),
     confirmActivation: (proposal) =>
       confirmNaturalLanguageScheduleActivation(options.window, proposal),
   });
@@ -364,6 +465,8 @@ function createScheduleCreationFlow(
 export function registerVsCodeScheduleCommands(
   options: RegisterVsCodeScheduleCommandsOptions,
 ): VsCodeDisposableLike[] {
+  const modelCatalog =
+    options.modelCatalog ?? createVsCodeScheduleModelCatalog(options.languageModel);
   const scheduleTreeProvider =
     options.eventEmitterFactory && options.window.registerTreeDataProvider
       ? new ScheduleTreeDataProvider(
@@ -371,9 +474,10 @@ export function registerVsCodeScheduleCommands(
           options.eventEmitterFactory,
         )
       : undefined;
-  const scheduleCreationFlow = createScheduleCreationFlow(options);
+  const scheduleCreationFlow = createScheduleCreationFlow(options, modelCatalog);
   const controller = new VsCodeScheduleCommandController({
     ...options,
+    ...(modelCatalog ? { modelCatalog } : {}),
     scheduleTreeProvider,
     scheduleCreationFlow,
   });
@@ -434,7 +538,7 @@ export function renderScheduleDetailWebviewHtml(
     ["Target Context", targetContextLabel(view.overview.targetContext)],
     ["Cadence", cadenceLabel(view.overview.cadence)],
     ["Harness Mode", view.overview.harnessMode ?? "Not selected"],
-    ["Model", view.overview.model],
+    ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
     ["Approval Mode", view.overview.approvalMode],
     ["Run Counter", view.overview.runCounter.label],
     ["Next Run", view.overview.nextRunAt ?? "Not scheduled"],
@@ -549,6 +653,13 @@ export function renderScheduleDetailWebviewHtml(
       background: var(--vscode-inputValidation-errorBackground);
     }
 
+    .field-note {
+      margin: 0;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
     .actions {
       display: flex;
       flex-wrap: wrap;
@@ -650,7 +761,7 @@ export function renderScheduleDetailWebviewHtml(
             view.overview.harnessMode === "cloud-copilot",
           ],
         ])}
-        ${renderInput("model", "Model", "model", view.overview.model)}
+        ${renderModelField(view.overview.model, state)}
         ${renderSelect("approval-mode", "Approval Mode", "approvalMode", [
           [
             "default-approvals",
@@ -716,12 +827,14 @@ function renderInput(
   value: string,
   type = "text",
   attributes = "",
+  note?: string,
 ): string {
   return `<div class="field">
         <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
         <input id="${escapeHtml(id)}" name="${escapeHtml(
           name,
         )}" type="${escapeHtml(type)}" value="${escapeHtml(value)}"${attributes}>
+        ${note ? renderFieldNote(note) : ""}
       </div>`;
 }
 
@@ -730,6 +843,7 @@ function renderSelect(
   label: string,
   name: string,
   options: Array<[string, string, boolean]>,
+  note?: string,
 ): string {
   return `<div class="field">
         <label for="${escapeHtml(id)}">${escapeHtml(label)}</label>
@@ -743,7 +857,56 @@ function renderSelect(
             )
             .join("\n")}
         </select>
+        ${note ? renderFieldNote(note) : ""}
       </div>`;
+}
+
+function renderFieldNote(note: string): string {
+  return `<p class="field-note">${escapeHtml(note)}</p>`;
+}
+
+function renderModelField(
+  model: string,
+  state: ScheduleDetailRenderState,
+): string {
+  const modelOptions = state.modelOptions ?? [];
+  if (modelOptions.length === 0) {
+    return renderInput(
+      "model",
+      "Model",
+      "model",
+      model,
+      "text",
+      "",
+      state.modelCatalogAvailable
+        ? "No VS Code chat models were reported; enter a model id manually."
+        : undefined,
+    );
+  }
+
+  const modelAvailable = isScheduleModelAvailable(model, modelOptions);
+  const options: Array<[string, string, boolean]> = modelAvailable
+    ? []
+    : [[model, `${model} (unavailable or legacy)`, true]];
+  options.push(
+    ...modelOptions.map(
+      (option): [string, string, boolean] => [
+        option.id,
+        modelOptionLabel(option),
+        option.id === model,
+      ],
+    ),
+  );
+
+  return renderSelect(
+    "model",
+    "Model",
+    "model",
+    options,
+    modelAvailable
+      ? undefined
+      : "Saved model is unavailable or legacy in this VS Code environment.",
+  );
 }
 
 function renderScheduleDetailScript(nonce: string): string {
@@ -875,6 +1038,37 @@ function targetContextLabelInputValue(targetContext: TargetContext | null): stri
 
 function cadenceLabel(cadence: RunCadence | null): string {
   return cadence ? `cron: ${cadence.expression}` : "No cadence selected";
+}
+
+function modelOverviewLabel(
+  model: string,
+  modelOptions: readonly ScheduleModelOption[] | undefined,
+): string {
+  if (!modelOptions || modelOptions.length === 0) {
+    return model;
+  }
+
+  const option = modelOptions.find((candidate) => candidate.id === model);
+  return option ? modelOptionLabel(option) : `${model} (unavailable or legacy)`;
+}
+
+function modelOptionLabel(option: ScheduleModelOption): string {
+  const metadata = [option.vendor, option.family, option.version]
+    .filter((value): value is string => Boolean(value))
+    .join(" / ");
+  const tokens =
+    typeof option.maxInputTokens === "number"
+      ? `${option.maxInputTokens} input tokens`
+      : "";
+  const detail = [metadata, tokens].filter((value) => value.length > 0).join(", ");
+
+  if (detail.length > 0) {
+    return `${option.displayName} (${detail})`;
+  }
+
+  return option.displayName === option.id
+    ? option.id
+    : `${option.displayName} (${option.id})`;
 }
 
 function cadenceInputValue(cadence: RunCadence | null): string {
@@ -1328,6 +1522,7 @@ class VsCodeScheduleCommandController {
   private readonly workspace: VsCodeWorkspaceLike;
   private readonly editor: VsCodeScheduleEditor;
   private readonly viewColumn: unknown;
+  private readonly modelCatalog: ScheduleModelCatalog | undefined;
   private readonly scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
   private readonly scheduleCreationFlow:
     | VsCodeNaturalLanguageScheduleCreationFlow
@@ -1343,17 +1538,29 @@ class VsCodeScheduleCommandController {
     this.workspace = options.workspace;
     this.editor = options.services.editor;
     this.viewColumn = options.viewColumn;
+    this.modelCatalog = options.modelCatalog;
     this.scheduleTreeProvider = options.scheduleTreeProvider;
     this.scheduleCreationFlow = options.scheduleCreationFlow;
     this.languageModelToolResultFactory = options.languageModelToolResultFactory;
+    const modelRefreshSubscription = this.modelCatalog?.onDidChangeScheduleModels?.(
+      () => {
+        void this.refreshOpenScheduleDetailPanels();
+      },
+    );
+    if (modelRefreshSubscription) {
+      this.context.subscriptions.push(modelRefreshSubscription);
+    }
   }
 
   async createNewSchedule(): Promise<ScheduleDetailView> {
     return this.runCommand(async () => {
+      const defaultModel =
+        preferredScheduleModel(await this.listScheduleModelOptions())?.id ??
+        "gpt-5";
       const detail = await this.editor.createDraftSchedule(
-        buildNewDraftScheduleInput(this.workspace),
+        buildNewDraftScheduleInput(this.workspace, defaultModel),
       );
-      this.openScheduleDetailPanel(detail);
+      await this.openScheduleDetailPanel(detail);
       this.refreshScheduleTree();
       return detail;
     });
@@ -1370,7 +1577,7 @@ class VsCodeScheduleCommandController {
       }
 
       const detail = await this.editor.openScheduleDetail(selectedScheduleId);
-      this.openScheduleDetailPanel(detail);
+      await this.openScheduleDetailPanel(detail);
       return detail;
     });
   }
@@ -1417,11 +1624,11 @@ class VsCodeScheduleCommandController {
     });
   }
 
-  private openScheduleDetailPanel(detail: ScheduleDetailView): void {
+  private async openScheduleDetailPanel(detail: ScheduleDetailView): Promise<void> {
     const existingPanel = this.scheduleDetailPanels.get(detail.schedule.id);
     if (existingPanel) {
       existingPanel.reveal?.(this.viewColumn);
-      this.renderScheduleDetailPanel(existingPanel, detail);
+      await this.renderScheduleDetailPanel(existingPanel, detail);
       return;
     }
 
@@ -1435,7 +1642,7 @@ class VsCodeScheduleCommandController {
       },
     );
     this.scheduleDetailPanels.set(detail.schedule.id, panel);
-    this.renderScheduleDetailPanel(panel, detail);
+    await this.renderScheduleDetailPanel(panel, detail);
     const disposeSubscription = panel.onDidDispose?.(() => {
       this.scheduleDetailPanels.delete(detail.schedule.id);
     });
@@ -1469,13 +1676,18 @@ class VsCodeScheduleCommandController {
     return picked?.scheduleId;
   }
 
-  private renderScheduleDetailPanel(
+  private async renderScheduleDetailPanel(
     panel: VsCodeWebviewPanelLike,
     detail: ScheduleDetailView,
     state: ScheduleDetailRenderState = {},
-  ): void {
+  ): Promise<void> {
     panel.title = scheduleDetailTitle(detail);
-    panel.webview.html = renderScheduleDetailWebviewHtml(detail, state);
+    const modelOptions = await this.listScheduleModelOptions();
+    panel.webview.html = renderScheduleDetailWebviewHtml(detail, {
+      ...state,
+      modelOptions,
+      modelCatalogAvailable: this.modelCatalog !== undefined,
+    });
   }
 
   private async handleScheduleDetailWebviewMessage(
@@ -1495,7 +1707,7 @@ class VsCodeScheduleCommandController {
               updateScheduleInputFromWebviewFields(message.fields),
             )
           : await this.runScheduleDetailAction(message.scheduleId, message.type);
-      this.renderScheduleDetailPanel(panel, detail);
+      await this.renderScheduleDetailPanel(panel, detail);
       this.refreshScheduleTree();
     } catch (error) {
       await this.renderScheduleDetailError(
@@ -1512,8 +1724,10 @@ class VsCodeScheduleCommandController {
   ): Promise<ScheduleDetailView> {
     switch (action) {
       case "activate":
+        await this.requireSelectedModelAvailable(scheduleId);
         return this.editor.activateSchedule(scheduleId);
       case "run-now":
+        await this.requireSelectedModelAvailable(scheduleId);
         await this.editor.runScheduleNow(scheduleId);
         return this.editor.openScheduleDetail(scheduleId);
       case "pause":
@@ -1545,7 +1759,7 @@ class VsCodeScheduleCommandController {
           ? await this.scheduleCreationFlow.handleChatParticipantRequest(input)
           : await this.scheduleCreationFlow.executeSlashCommand(input);
     const detail = await this.editor.openScheduleDetail(result.schedule.id);
-    this.openScheduleDetailPanel(detail);
+    await this.openScheduleDetailPanel(detail);
     this.refreshScheduleTree();
     return result;
   }
@@ -1576,10 +1790,39 @@ class VsCodeScheduleCommandController {
   ): Promise<void> {
     try {
       const detail = await this.editor.openScheduleDetail(scheduleId);
-      this.renderScheduleDetailPanel(panel, detail, { errorMessage });
+      await this.renderScheduleDetailPanel(panel, detail, { errorMessage });
     } catch {
       await this.window.showErrorMessage?.(`AgentScheduler: ${errorMessage}`);
     }
+  }
+
+  private async listScheduleModelOptions(): Promise<readonly ScheduleModelOption[]> {
+    return this.modelCatalog ? this.modelCatalog.listScheduleModels() : [];
+  }
+
+  private async requireSelectedModelAvailable(scheduleId: string): Promise<void> {
+    const modelOptions = await this.listScheduleModelOptions();
+    if (modelOptions.length === 0) {
+      return;
+    }
+
+    const detail = await this.editor.openScheduleDetail(scheduleId);
+    if (!isScheduleModelAvailable(detail.schedule.model, modelOptions)) {
+      throw new Error(unavailableScheduleModelMessage(detail.schedule.model));
+    }
+  }
+
+  private async refreshOpenScheduleDetailPanels(): Promise<void> {
+    await Promise.all(
+      [...this.scheduleDetailPanels.entries()].map(async ([scheduleId, panel]) => {
+        try {
+          const detail = await this.editor.openScheduleDetail(scheduleId);
+          await this.renderScheduleDetailPanel(panel, detail);
+        } catch {
+          this.scheduleDetailPanels.delete(scheduleId);
+        }
+      }),
+    );
   }
 
   private async runCommand<T>(command: () => Promise<T>): Promise<T> {

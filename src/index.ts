@@ -85,6 +85,15 @@ export {
   EditorControlSurface,
   type EditorControlSurfaceOptions,
 } from "./editorControlSurface.js";
+export type {
+  ScheduleModelCatalog,
+  ScheduleModelOption,
+} from "./scheduleModelCatalog.js";
+export {
+  isScheduleModelAvailable,
+  preferredScheduleModel,
+  unavailableScheduleModelMessage,
+} from "./scheduleModelCatalog.js";
 export {
   defaultLocalSchedulingSetupState,
   LocalSchedulingSetup,
