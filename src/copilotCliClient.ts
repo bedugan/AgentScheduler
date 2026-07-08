@@ -32,7 +32,7 @@ export const DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS = 30 * 60 * 1_000;
 const DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS = 5_000;
 
 export const COPILOT_CLI_MISSING_REASON =
-  "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH.";
+  "GitHub Copilot CLI was not found. Install GitHub Copilot CLI, or run `gh copilot` to download it through GitHub CLI, then ensure `copilot` is on PATH. OS wakeup triggers can use a different PATH than your interactive shell; set COPILOT_CLI_PATH or install `copilot` in a worker-visible path.";
 
 export const COPILOT_CLI_AUTH_UNAVAILABLE_REASON =
   "GitHub Copilot CLI is installed but not authenticated. Run `copilot login` in an interactive shell, or configure `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` for unattended worker contexts.";
