@@ -132,6 +132,7 @@ export interface ScheduleDetailOverview {
 }
 
 export type ScheduleDetailActionKind =
+  | "activate"
   | "run-now"
   | "pause"
   | "resume"
@@ -145,6 +146,7 @@ export interface ScheduleDetailAction {
 }
 
 export interface ScheduleDetailActions {
+  activate: ScheduleDetailAction;
   runNow: ScheduleDetailAction;
   pause: ScheduleDetailAction;
   resume: ScheduleDetailAction;

@@ -1,4 +1,6 @@
 import type {
+  CreateActiveScheduleInput,
+  CreateDraftScheduleInput,
   RunHistoryDetailView,
   RunHistoryEntry,
   ScheduleDetailView,
@@ -48,6 +50,20 @@ export class EditorControlSurface {
     return this.lifecycle.openScheduleDetail(scheduleId);
   }
 
+  async createDraftSchedule(
+    input: CreateDraftScheduleInput,
+  ): Promise<ScheduleDetailView> {
+    const schedule = await this.lifecycle.createDraftSchedule(input);
+    return this.lifecycle.openScheduleDetail(schedule.id);
+  }
+
+  async createActiveSchedule(
+    input: CreateActiveScheduleInput,
+  ): Promise<ScheduleDetailView> {
+    const schedule = await this.lifecycle.createActiveSchedule(input);
+    return this.lifecycle.openScheduleDetail(schedule.id);
+  }
+
   async openRunHistoryDetail(runId: string): Promise<RunHistoryDetailView> {
     return this.lifecycle.openRunHistoryDetail(runId);
   }
@@ -62,6 +78,16 @@ export class EditorControlSurface {
 
   async runScheduleNow(scheduleId: string): Promise<RunHistoryEntry> {
     return this.lifecycle.startManualRun(scheduleId);
+  }
+
+  async activateSchedule(scheduleId: string): Promise<ScheduleDetailView> {
+    await this.lifecycle.activateSchedule(scheduleId);
+    return this.lifecycle.openScheduleDetail(scheduleId);
+  }
+
+  async pauseSchedule(scheduleId: string): Promise<ScheduleDetailView> {
+    await this.lifecycle.pauseSchedule(scheduleId);
+    return this.lifecycle.openScheduleDetail(scheduleId);
   }
 
   async resumeSchedule(scheduleId: string): Promise<ScheduleDetailView> {

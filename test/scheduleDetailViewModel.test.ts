@@ -10,6 +10,91 @@ import {
 } from "../src/testing.js";
 
 describe("Schedule Detail view model", () => {
+  it("exposes activation as a draft-only Schedule Detail action through the Editor Control Surface", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+
+    const draftDetail = await editor.createDraftSchedule({
+      runInstructions: "Activate this draft only after review.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/activation-draft",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 1 },
+    });
+
+    assert.equal(draftDetail.overview.status, "draft");
+    assert.deepEqual(draftDetail.actions.activate, {
+      kind: "activate",
+      label: "Activate Schedule",
+      enabled: true,
+    });
+    assert.equal(draftDetail.actions.runNow.enabled, true);
+
+    const activeDetail = await editor.activateSchedule(draftDetail.schedule.id);
+    assert.equal(activeDetail.overview.status, "active");
+    assert.equal(activeDetail.overview.enabled, true);
+    assert.equal(activeDetail.overview.nextRunAt, "2026-07-07T17:00:00.000Z");
+    assert.deepEqual(activeDetail.actions.activate, {
+      kind: "activate",
+      label: "Activate Schedule",
+      enabled: false,
+      disabledReason: "Only draft schedules can be activated.",
+    });
+    assert.equal(activeDetail.actions.runNow.enabled, true);
+    assert.equal(activeDetail.actions.pause.enabled, true);
+
+    const pausedDetail = await editor.pauseSchedule(activeDetail.schedule.id);
+    assert.equal(pausedDetail.overview.status, "paused");
+    assert.deepEqual(pausedDetail.actions.activate, {
+      kind: "activate",
+      label: "Activate Schedule",
+      enabled: false,
+      disabledReason: "Only draft schedules can be activated.",
+    });
+    assert.equal(pausedDetail.actions.resume.enabled, true);
+    assert.equal(pausedDetail.actions.runNow.enabled, false);
+
+    const completedDetail = await editor.createActiveSchedule({
+      runInstructions: "Complete once, then restart explicitly.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/activation-completed",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 1 },
+    });
+
+    clock.set("2026-07-07T16:15:00.000Z");
+    await editor.runScheduleNow(completedDetail.schedule.id);
+    const completedAfterRun = await editor.openScheduleDetail(
+      completedDetail.schedule.id,
+    );
+    assert.equal(completedAfterRun.overview.status, "completed");
+    assert.deepEqual(completedAfterRun.actions.activate, {
+      kind: "activate",
+      label: "Activate Schedule",
+      enabled: false,
+      disabledReason: "Only draft schedules can be activated.",
+    });
+    assert.equal(completedAfterRun.actions.restart.enabled, true);
+    assert.equal(completedAfterRun.actions.runNow.enabled, false);
+  });
+
   it("shows editable instructions, schedule overview fields, linked run outcomes, and quiet notification defaults together", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const lifecycle = new ScheduleLifecycle({

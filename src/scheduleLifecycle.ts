@@ -950,6 +950,14 @@ export class ScheduleLifecycle {
   private scheduleActionsFor(schedule: Schedule): ScheduleDetailView["actions"] {
     const runNowEnabled = schedule.status === "draft" || schedule.enabled;
     return {
+      activate: {
+        kind: "activate",
+        label: "Activate Schedule",
+        enabled: schedule.status === "draft",
+        ...(schedule.status !== "draft" && {
+          disabledReason: "Only draft schedules can be activated.",
+        }),
+      },
       runNow: {
         kind: "run-now",
         label: "Run Now",
