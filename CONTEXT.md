@@ -120,6 +120,14 @@ _Avoid_: Built-in scheduler, only harness
 A concrete execution path within an agent harness, such as a local CLI session or a cloud agent session.
 _Avoid_: Provider, model
 
+**Scheduled Model**:
+The model selector stored on a schedule, including explicit model ids and provider-defined choices such as Auto. The scheduled model is the user's configuration for future runs.
+_Avoid_: Executed model, harness mode
+
+**Executed Model**:
+The concrete model reported by the harness for one Agent Run. Run History records the executed model when the harness can report it, because Auto or provider defaults may resolve differently across runs.
+_Avoid_: Scheduled model, model picker
+
 **Local Copilot Mode**:
 The Copilot harness mode that starts agent runs on the developer's laptop through local Copilot tooling.
 _Avoid_: Cloud agent, GitHub Actions run
@@ -161,7 +169,7 @@ The process of loading schedule export files into the local store. Imported sche
 _Avoid_: Restore-and-run, database import
 
 **Run History**:
-The per-user local record of attempted agent runs. Run history records what happened for completed, failed, and blocked runs without changing the schedule registry itself, including the resolved run instructions, approval mode, and resolved harness policy used for each run.
+The per-user local record of attempted agent runs. Run history records what happened for completed, failed, and blocked runs without changing the schedule registry itself, including the resolved run instructions, approval mode, scheduled model, executed model when reported by the harness, and resolved harness policy used for each run.
 _Avoid_: Schedule registry, repo log
 
 **Wakeup Trigger**:
@@ -175,6 +183,10 @@ _Avoid_: Harness, cadence parser
 **Local Scheduling Setup**:
 The explicit user-confirmed process that installs, verifies, or removes the operating-system wakeup trigger for the local worker.
 _Avoid_: Hidden install, extension activation
+
+**Secondary Scheduler**:
+An operating-system scheduled task, cron entry, launch agent, systemd timer, detached background loop, or similar mechanism created by a harness run to implement recurrence outside AgentScheduler.
+_Avoid_: Wakeup trigger, local scheduling setup
 
 **Scheduling Disabled State**:
 The machine state where schedules can be created and edited, but automatic local wakeups are not installed or enabled.

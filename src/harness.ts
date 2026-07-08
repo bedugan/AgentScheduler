@@ -53,6 +53,7 @@ export interface HarnessStartResult {
   >;
   completedAt: IsoTimestamp | null;
   summary: string | null;
+  executedModel?: string | null;
 }
 
 export interface HarnessStatusRequest {
@@ -70,6 +71,7 @@ export interface HarnessRunUpdate {
   completedAt: IsoTimestamp | null;
   summary: string | null;
   error: string | null;
+  executedModel?: string | null;
 }
 
 export type HarnessStatusResult = HarnessRunUpdate;
@@ -86,6 +88,7 @@ export interface HarnessCancelResult {
   completedAt: IsoTimestamp | null;
   summary: string | null;
   error: string | null;
+  executedModel?: string | null;
 }
 
 export type HarnessOpenPurpose = "open" | "review";

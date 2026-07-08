@@ -20,7 +20,10 @@ import {
   type LocalSchedulingSetupStore,
   type WakeupProviderPlatform,
 } from "./localSchedulingSetup.js";
-import type { ScheduleStore } from "./store.js";
+import type {
+  ActiveRunReservationResult,
+  ScheduleStore,
+} from "./store.js";
 
 export interface SqliteScheduleStoreOptions {
   databasePath: string;
@@ -57,6 +60,7 @@ interface RunHistoryRow {
   resolved_harness_policy_json: string;
   harness_mode: HarnessMode | "";
   model: string;
+  executed_model?: string | null;
   target_context_json: string;
   external_run_id: string | null;
   summary: string | null;
@@ -228,6 +232,7 @@ export class SqliteScheduleStore
           resolved_harness_policy_json,
           harness_mode,
           model,
+          executed_model,
           target_context_json,
           external_run_id,
           summary,
@@ -245,6 +250,7 @@ export class SqliteScheduleStore
           $resolved_harness_policy_json,
           $harness_mode,
           $model,
+          $executed_model,
           $target_context_json,
           $external_run_id,
           $summary,
@@ -262,6 +268,7 @@ export class SqliteScheduleStore
           resolved_harness_policy_json = excluded.resolved_harness_policy_json,
           harness_mode = excluded.harness_mode,
           model = excluded.model,
+          executed_model = excluded.executed_model,
           target_context_json = excluded.target_context_json,
           external_run_id = excluded.external_run_id,
           summary = excluded.summary,
@@ -280,11 +287,32 @@ export class SqliteScheduleStore
         resolved_harness_policy_json: JSON.stringify(entry.resolvedHarnessPolicy),
         harness_mode: entry.harnessMode ?? "",
         model: entry.model,
+        executed_model: entry.executedModel,
         target_context_json: JSON.stringify(entry.targetContext),
         external_run_id: entry.externalRunId,
         summary: entry.summary,
         error: entry.error,
       });
+  }
+
+  async reserveActiveRun(
+    entry: RunHistoryEntry,
+  ): Promise<ActiveRunReservationResult> {
+    this.database.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      const occupyingRun = this.findOccupyingActiveRun(entry);
+      if (occupyingRun) {
+        this.database.exec("COMMIT");
+        return { reserved: false, occupyingRun };
+      }
+
+      await this.saveRunHistory(entry);
+      this.database.exec("COMMIT");
+      return { reserved: true, run: this.runHistoryClone(entry) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined> {
@@ -424,6 +452,7 @@ export class SqliteScheduleStore
         resolved_harness_policy_json TEXT NOT NULL,
         harness_mode TEXT NOT NULL,
         model TEXT NOT NULL,
+        executed_model TEXT,
         target_context_json TEXT NOT NULL,
         external_run_id TEXT,
         summary TEXT,
@@ -444,6 +473,56 @@ export class SqliteScheduleStore
         updated_at TEXT
       );
     `);
+    this.addColumnIfMissing("run_history", "executed_model", "TEXT");
+  }
+
+  private addColumnIfMissing(
+    tableName: string,
+    columnName: string,
+    definition: string,
+  ): void {
+    const rows = this.database
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all() as unknown as Array<{ name: string }>;
+    if (rows.some((row) => row.name === columnName)) {
+      return;
+    }
+
+    this.database.exec(
+      `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
+    );
+  }
+
+  private findOccupyingActiveRun(
+    entry: RunHistoryEntry,
+  ): RunHistoryEntry | undefined {
+    const targetContextJson = JSON.stringify(entry.targetContext);
+    const hasRunSlot = entry.harnessMode !== null && entry.targetContext !== null;
+    const row = this.database
+      .prepare(`
+        SELECT *
+        FROM run_history
+        WHERE status IN ('running', 'approval-waiting')
+          AND completed_at IS NULL
+          AND (
+            schedule_id = $schedule_id
+            OR (
+              $has_run_slot = 1
+              AND harness_mode = $harness_mode
+              AND target_context_json = $target_context_json
+            )
+          )
+        ORDER BY started_at ASC, id ASC
+        LIMIT 1
+      `)
+      .get({
+        schedule_id: entry.scheduleId,
+        has_run_slot: hasRunSlot ? 1 : 0,
+        harness_mode: entry.harnessMode ?? "",
+        target_context_json: targetContextJson,
+      }) as RunHistoryRow | undefined;
+
+    return row ? this.runHistoryFromRow(row) : undefined;
   }
 
   private scheduleFromRow(row: ScheduleRow): Schedule {
@@ -482,11 +561,16 @@ export class SqliteScheduleStore
       ),
       harnessMode: row.harness_mode === "" ? null : row.harness_mode,
       model: row.model,
+      executedModel: row.executed_model ?? null,
       targetContext: parseJson<TargetContext | null>(row.target_context_json),
       externalRunId: row.external_run_id,
       summary: row.summary,
       error: row.error,
     };
+  }
+
+  private runHistoryClone(entry: RunHistoryEntry): RunHistoryEntry {
+    return JSON.parse(JSON.stringify(entry)) as RunHistoryEntry;
   }
 }
 

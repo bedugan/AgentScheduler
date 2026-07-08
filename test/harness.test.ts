@@ -233,6 +233,63 @@ describe("Copilot Local harness", () => {
     assert.equal(client.startRequests.length, 0);
   });
 
+  it("blocks Bypass Approvals when the local CLI cannot verify required permission flags", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: {
+        status: "available",
+        approvalSurfaceAvailable: false,
+        supportedPermissionFlags: ["--no-ask-user"],
+      },
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = createSchedule({
+      approvalMode: "bypass-approvals",
+    });
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "blocked");
+    assert.match(preflight.reason, /required permission flag/);
+    assert.match(preflight.reason, /--allow-all-tools/);
+    assert.equal(client.availabilityRequests.length, 1);
+    assert.equal(client.startRequests.length, 0);
+  });
+
+  it("blocks Local Copilot instructions that ask for secondary schedulers", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: {
+        status: "available",
+        approvalSurfaceAvailable: false,
+        supportedPermissionFlags: ["--no-ask-user", "--allow-all-tools"],
+      },
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = {
+      ...createSchedule({
+        approvalMode: "bypass-approvals",
+      }),
+      runInstructions:
+        "Create a Windows scheduled task that runs every hour to check the time.",
+    };
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "blocked");
+    assert.match(preflight.reason, /AgentScheduler owns recurrence/);
+    assert.equal(client.availabilityRequests.length, 0);
+    assert.equal(client.startRequests.length, 0);
+  });
+
   it("records unattended Default Approvals blocking as a blocked run without falling back", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const client = new RecordingCopilotLocalClient({

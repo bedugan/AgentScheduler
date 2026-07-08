@@ -318,6 +318,7 @@ type ScheduleDetailWebviewMessage =
   | {
       type: ScheduleDetailActionKind;
       scheduleId: string;
+      fields?: ScheduleDetailFormFields;
     };
 
 export function sqliteLocalStorePath(
@@ -975,19 +976,20 @@ function renderScheduleDetailScript(nonce: string): string {
 
   form.addEventListener("submit", (event) => {
     event.preventDefault();
+    const fields = {
+      runInstructions: valueFor("runInstructions"),
+      cadenceExpression: valueFor("cadenceExpression"),
+      targetContextUri: valueFor("targetContextUri"),
+      targetContextLabel: valueFor("targetContextLabel"),
+      harnessMode: valueFor("harnessMode"),
+      model: valueFor("model"),
+      approvalMode: valueFor("approvalMode"),
+      runCapMaxRuns: valueFor("runCapMaxRuns"),
+    };
     vscode.postMessage({
       type: "save",
       scheduleId: form.dataset.scheduleId,
-      fields: {
-        runInstructions: valueFor("runInstructions"),
-        cadenceExpression: valueFor("cadenceExpression"),
-        targetContextUri: valueFor("targetContextUri"),
-        targetContextLabel: valueFor("targetContextLabel"),
-        harnessMode: valueFor("harnessMode"),
-        model: valueFor("model"),
-        approvalMode: valueFor("approvalMode"),
-        runCapMaxRuns: valueFor("runCapMaxRuns"),
-      },
+      fields,
     });
   });
 
@@ -1011,10 +1013,24 @@ function renderScheduleDetailScript(nonce: string): string {
         button.textContent = "Starting...";
       }
 
-      vscode.postMessage({
+      const message = {
         type: action,
         scheduleId: form.dataset.scheduleId,
-      });
+      };
+      if (action === "run-now") {
+        message.fields = {
+          runInstructions: valueFor("runInstructions"),
+          cadenceExpression: valueFor("cadenceExpression"),
+          targetContextUri: valueFor("targetContextUri"),
+          targetContextLabel: valueFor("targetContextLabel"),
+          harnessMode: valueFor("harnessMode"),
+          model: valueFor("model"),
+          approvalMode: valueFor("approvalMode"),
+          runCapMaxRuns: valueFor("runCapMaxRuns"),
+        };
+      }
+
+      vscode.postMessage(message);
     });
   });
 })();
@@ -1045,6 +1061,7 @@ function renderPreviousRuns(previousRuns: ScheduleDetailPreviousRun[]): string {
           <th>Trigger</th>
           <th>Started</th>
           <th>Completed</th>
+          <th>Executed Model</th>
           <th>Details</th>
           <th>Outcome</th>
         </tr>
@@ -1061,6 +1078,7 @@ function renderPreviousRun(run: ScheduleDetailPreviousRun): string {
           <td>${escapeHtml(run.trigger)}</td>
           <td>${escapeHtml(run.startedAt)}</td>
           <td>${escapeHtml(run.completedAt ?? "Active")}</td>
+          <td>${escapeHtml(run.executedModel ?? "Unknown")}</td>
           <td>${escapeHtml(previousRunDetail(run))}</td>
           <td>${escapeHtml(run.outcome.description)}</td>
         </tr>`;
@@ -1547,6 +1565,7 @@ function parseScheduleDetailWebviewMessage(
     return {
       type: message.type,
       scheduleId: message.scheduleId,
+      ...(isRecord(message.fields) ? { fields: message.fields } : {}),
     };
   }
 
@@ -1883,7 +1902,11 @@ class VsCodeScheduleCommandController {
               message.scheduleId,
               updateScheduleInputFromWebviewFields(message.fields),
             )
-          : await this.runScheduleDetailAction(message.scheduleId, message.type);
+          : await this.runScheduleDetailAction(
+              message.scheduleId,
+              message.type,
+              message.fields,
+            );
       await this.renderScheduleDetailPanel(panel, detail);
       this.refreshScheduleTree();
     } catch (error) {
@@ -1898,12 +1921,19 @@ class VsCodeScheduleCommandController {
   private async runScheduleDetailAction(
     scheduleId: string,
     action: ScheduleDetailActionKind,
+    fields?: ScheduleDetailFormFields,
   ): Promise<ScheduleDetailView> {
     switch (action) {
       case "activate":
         await this.requireSelectedModelAvailable(scheduleId);
         return this.editor.activateSchedule(scheduleId);
       case "run-now":
+        if (fields) {
+          await this.editor.saveScheduleDetailEdits(
+            scheduleId,
+            updateScheduleInputFromWebviewFields(fields),
+          );
+        }
         await this.requireSelectedModelAvailable(scheduleId);
         await this.editor.runScheduleNow(scheduleId);
         return this.editor.openScheduleDetail(scheduleId);

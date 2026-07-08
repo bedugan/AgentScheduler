@@ -42,6 +42,7 @@ import type {
   HarnessCancelResult,
   HarnessOpenPurpose,
   HarnessOpenResult,
+  HarnessStartResult,
   HarnessStatusResult,
 } from "./harness.js";
 import type {
@@ -355,6 +356,8 @@ export class ScheduleLifecycle {
       scheduleRevision: run.scheduleRevision,
       resolvedRunInstructions: run.runInstructionsSnapshot,
       approvalMode: run.approvalModeSnapshot,
+      selectedModel: run.model,
+      executedModel: run.executedModel,
       resolvedHarnessPolicy: run.resolvedHarnessPolicy,
       outcome: this.runOutcomeViewFor(run),
     };
@@ -610,13 +613,17 @@ export class ScheduleLifecycle {
       return blockedRun;
     }
 
-    const occupyingRun = await this.findOccupyingRun(schedule);
-    if (occupyingRun) {
+    const existingOccupyingRun = await this.findOccupyingRun(schedule);
+    if (existingOccupyingRun) {
       const reason =
         "Run slot is occupied by an active run. AgentScheduler deferred this due run and will coalesce catch-up work for the schedule.";
 
       if (trigger === "automatic") {
         return this.deferRun(schedule, trigger, requestedAt, reason);
+      }
+
+      if (existingOccupyingRun.scheduleId === schedule.id) {
+        return existingOccupyingRun;
       }
 
       const blockedRun = this.buildRunHistoryEntry({
@@ -644,74 +651,138 @@ export class ScheduleLifecycle {
       localSchedulingEnabled,
     });
 
-    if (preflight.status === "blocked") {
-      await this.completePendingDeferredRun(
-        pendingDeferredRun,
-        requestedAt,
-        "Deferred run ended with a blocked catch-up attempt.",
-      );
+    if (preflight.status === "deferred" && pendingDeferredRun) {
+      return pendingDeferredRun;
+    }
+
+    const startingRun = this.buildRunHistoryEntry({
+      schedule,
+      trigger,
+      startedAt: requestedAt,
+      completedAt: null,
+      status: "running",
+      resolvedHarnessPolicy:
+        preflight.resolvedHarnessPolicy ?? this.defaultPolicySnapshot(schedule),
+      externalRunId: null,
+      summary: "Run is starting.",
+      error: null,
+    });
+    const reservation = await this.store.reserveActiveRun(startingRun);
+    if (!reservation.reserved) {
+      const reason =
+        "Run slot is occupied by an active run. AgentScheduler deferred this due run and will coalesce catch-up work for the schedule.";
+
+      if (trigger === "automatic") {
+        return this.deferRun(schedule, trigger, requestedAt, reason);
+      }
+
+      if (reservation.occupyingRun.scheduleId === schedule.id) {
+        return reservation.occupyingRun;
+      }
+
       const blockedRun = this.buildRunHistoryEntry({
         schedule,
         trigger,
         startedAt: requestedAt,
         completedAt: requestedAt,
         status: "blocked",
-        resolvedHarnessPolicy:
-          preflight.resolvedHarnessPolicy ?? this.defaultPolicySnapshot(schedule),
+        resolvedHarnessPolicy: this.defaultPolicySnapshot(schedule),
         externalRunId: null,
         summary: null,
-        error: preflight.reason,
+        error:
+          "Run slot is occupied by an active run. Wait for the active run to finish before starting a manual run.",
       });
       await this.persistRunResult(schedule, blockedRun, trigger);
       return blockedRun;
     }
 
-    if (preflight.status === "deferred") {
-      return this.deferRun(
-        schedule,
-        trigger,
+    if (preflight.status === "blocked") {
+      await this.completePendingDeferredRun(
+        pendingDeferredRun,
         requestedAt,
-        preflight.reason,
-        preflight.resolvedHarnessPolicy,
+        "Deferred run ended with a blocked catch-up attempt.",
       );
+      const blockedRun = {
+        ...startingRun,
+        completedAt: requestedAt,
+        status: "blocked" as const,
+        resolvedHarnessPolicy:
+          preflight.resolvedHarnessPolicy ?? this.defaultPolicySnapshot(schedule),
+        externalRunId: null,
+        summary: null,
+        error: preflight.reason,
+      };
+      await this.persistRunResult(schedule, blockedRun, trigger);
+      return blockedRun;
+    }
+
+    if (preflight.status === "deferred") {
+      const deferredRun = {
+        ...startingRun,
+        status: "deferred" as const,
+        completedAt: null,
+        resolvedHarnessPolicy:
+          preflight.resolvedHarnessPolicy ?? this.defaultPolicySnapshot(schedule),
+        summary: null,
+        error: preflight.reason,
+      };
+      await this.store.saveRunHistory(deferredRun);
+      return deferredRun;
     }
 
     if (preflight.status === "requires-approval") {
       await this.completePendingDeferredRun(pendingDeferredRun, requestedAt);
-      const approvalWaitingRun = this.buildRunHistoryEntry({
-        schedule,
-        trigger,
-        startedAt: requestedAt,
+      const approvalWaitingRun = {
+        ...startingRun,
+        status: "approval-waiting" as const,
         completedAt: null,
-        status: "approval-waiting",
         resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
-        externalRunId: null,
         summary: preflight.reason,
         error: null,
-      });
+      };
       await this.persistRunResult(schedule, approvalWaitingRun, trigger);
       return approvalWaitingRun;
     }
 
     await this.completePendingDeferredRun(pendingDeferredRun, requestedAt);
-    const startResult = await harness.start({
-      schedule,
-      trigger,
-      requestedAt,
-      runInstructions: schedule.runInstructions,
+    await this.store.saveRunHistory({
+      ...startingRun,
       resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
     });
-    const run = this.buildRunHistoryEntry({
-      schedule,
-      trigger,
-      startedAt: requestedAt,
+    let startResult: HarnessStartResult;
+    try {
+      startResult = await harness.start({
+        schedule,
+        trigger,
+        requestedAt,
+        runInstructions: schedule.runInstructions,
+        resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
+      });
+    } catch (error) {
+      await this.persistRunResult(
+        schedule,
+        {
+          ...startingRun,
+          completedAt: this.nowIso(),
+          status: "failed",
+          resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
+          summary: null,
+          error: errorMessageFromUnknown(error),
+        },
+        trigger,
+      );
+      throw error;
+    }
+    const run = {
+      ...startingRun,
       completedAt: startResult.completedAt,
       status: startResult.status,
       resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
       externalRunId: startResult.externalRunId,
       summary: startResult.summary,
       error: null,
-    });
+      executedModel: startResult.executedModel ?? null,
+    };
 
     await this.persistRunResult(schedule, run, trigger);
     return run;
@@ -797,6 +868,7 @@ export class ScheduleLifecycle {
         : update.completedAt ?? requestedAt,
       summary: update.summary,
       error: update.error,
+      executedModel: update.executedModel ?? run.executedModel,
     };
   }
 
@@ -900,6 +972,11 @@ export class ScheduleLifecycle {
     schedule: Schedule,
     trigger: RunTrigger,
   ): Promise<RunHistoryEntry> {
+    const occupyingRun = await this.findOccupyingRun(schedule);
+    if (occupyingRun?.scheduleId === schedule.id) {
+      return occupyingRun;
+    }
+
     const requestedAt = this.nowIso();
     const blockedRun = this.buildRunHistoryEntry({
       schedule,
@@ -911,7 +988,7 @@ export class ScheduleLifecycle {
       externalRunId: null,
       summary: null,
       error:
-        "Run slot is occupied by a manual run that is already starting. Wait for the active run to finish before starting another manual run.",
+        "Run slot is occupied by an active run. Wait for the active run to finish before starting a manual run.",
     });
     await this.persistRunResult(schedule, blockedRun, trigger);
     return blockedRun;
@@ -927,6 +1004,7 @@ export class ScheduleLifecycle {
     externalRunId: string | null;
     summary: string | null;
     error: string | null;
+    executedModel?: string | null;
   }): RunHistoryEntry {
     return {
       id: this.idGenerator.nextId("run"),
@@ -941,6 +1019,7 @@ export class ScheduleLifecycle {
       resolvedHarnessPolicy: input.resolvedHarnessPolicy,
       harnessMode: input.schedule.harnessMode,
       model: input.schedule.model,
+      executedModel: input.executedModel ?? null,
       targetContext: input.schedule.targetContext,
       externalRunId: input.externalRunId,
       summary: input.summary,
@@ -1632,4 +1711,10 @@ function unavailableHarnessModeMessage(mode: HarnessMode): string {
 
 function formatScheduleStatuses(statuses: Schedule["status"][]): string {
   return statuses.join(" or ");
+}
+
+function errorMessageFromUnknown(error: unknown): string {
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : String(error);
 }
