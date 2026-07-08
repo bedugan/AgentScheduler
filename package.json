@@ -10,7 +10,10 @@
   "activationEvents": [
     "onCommand:agentScheduler.newSchedule",
     "onCommand:agentScheduler.openSchedule",
-    "onView:agentScheduler.scheduleList"
+    "onCommand:agentScheduler.createSchedule",
+    "onView:agentScheduler.scheduleList",
+    "onLanguageModelTool:agentScheduler_createSchedule",
+    "onChatParticipant:agentScheduler.schedule"
   ],
   "contributes": {
     "commands": [
@@ -23,6 +26,130 @@
         "command": "agentScheduler.openSchedule",
         "title": "Open Schedule",
         "category": "AgentScheduler"
+      },
+      {
+        "command": "agentScheduler.createSchedule",
+        "title": "Create Schedule",
+        "category": "AgentScheduler"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "agentScheduler_createSchedule",
+        "tags": [
+          "agentScheduler",
+          "schedules"
+        ],
+        "toolReferenceName": "createSchedule",
+        "displayName": "Create AgentScheduler Schedule",
+        "modelDescription": "Create an AgentScheduler recurring agent schedule from a natural-language request. Use this when the user asks to create, schedule, recur, or periodically run agent work. Complete low-risk requests can become active after confirmation; incomplete or risky requests become disabled drafts for review.",
+        "userDescription": "Create an AgentScheduler schedule from a natural-language request.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(calendar)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "naturalLanguageRequest"
+          ],
+          "properties": {
+            "naturalLanguageRequest": {
+              "type": "string",
+              "description": "The user's natural-language schedule creation request."
+            },
+            "runInstructions": {
+              "type": "string",
+              "description": "Inline instructions to run each time the schedule fires."
+            },
+            "cadence": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "expression"
+              ],
+              "properties": {
+                "type": {
+                  "const": "cron"
+                },
+                "expression": {
+                  "type": "string"
+                }
+              }
+            },
+            "targetContext": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type",
+                "uri"
+              ],
+              "properties": {
+                "type": {
+                  "const": "workspace"
+                },
+                "uri": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
+            },
+            "harnessMode": {
+              "type": "string",
+              "enum": [
+                "local-copilot",
+                "cloud-copilot"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "approvalMode": {
+              "type": "string",
+              "enum": [
+                "default-approvals",
+                "bypass-approvals",
+                "autopilot"
+              ]
+            },
+            "runCap": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "maxRuns"
+              ],
+              "properties": {
+                "maxRuns": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            "riskWarnings": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "agentScheduler.schedule",
+        "name": "agentScheduler",
+        "fullName": "AgentScheduler",
+        "description": "Create and review recurring agent schedules.",
+        "isSticky": false,
+        "commands": [
+          {
+            "name": "createSchedule",
+            "description": "Create an AgentScheduler schedule from natural language."
+          }
+        ]
       }
     ],
     "views": {

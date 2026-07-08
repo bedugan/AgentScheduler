@@ -7,6 +7,7 @@ import type {
   HarnessMode,
   RunCadence,
   RunHistoryEntry,
+  RunCapInput,
   ScheduleDetailActionKind,
   ScheduleDetailAction,
   ScheduleDetailPreviousRun,
@@ -19,7 +20,17 @@ import type {
 import { EditorControlSurface } from "./editorControlSurface.js";
 import { ScheduleLifecycle } from "./scheduleLifecycle.js";
 import { SqliteScheduleStore } from "./sqliteScheduleStore.js";
+import type {
+  NaturalLanguageScheduleActivationProposal,
+  NaturalLanguageScheduleCreationInput,
+  NaturalLanguageScheduleCreationResult,
+} from "./vscodeNaturalLanguageScheduleCreation.js";
+import { VsCodeNaturalLanguageScheduleCreationFlow } from "./vscodeNaturalLanguageScheduleCreation.js";
 
+export const CREATE_SCHEDULE_COMMAND = "agentScheduler.createSchedule";
+export const CREATE_SCHEDULE_TOOL_NAME = "agentScheduler_createSchedule";
+export const CREATE_SCHEDULE_CHAT_PARTICIPANT_ID = "agentScheduler.schedule";
+export const CREATE_SCHEDULE_CHAT_SLASH_COMMAND = "createSchedule";
 export const NEW_SCHEDULE_COMMAND = "agentScheduler.newSchedule";
 export const OPEN_SCHEDULE_COMMAND = "agentScheduler.openSchedule";
 export const SCHEDULE_LIST_VIEW_ID = "agentScheduler.scheduleList";
@@ -77,6 +88,53 @@ export interface VsCodeCommandsLike {
   ): VsCodeDisposableLike;
 }
 
+export interface VsCodeLanguageModelToolInvocationOptionsLike {
+  input: unknown;
+}
+
+export interface VsCodeLanguageModelToolLike {
+  invoke(
+    options: VsCodeLanguageModelToolInvocationOptionsLike,
+    token?: unknown,
+  ): Promise<unknown>;
+}
+
+export interface VsCodeLanguageModelLike {
+  registerTool(
+    name: string,
+    tool: VsCodeLanguageModelToolLike,
+  ): VsCodeDisposableLike;
+}
+
+export interface VsCodeLanguageModelToolResultFactory {
+  createTextPart(value: string): unknown;
+  createToolResult(parts: unknown[]): unknown;
+}
+
+export interface VsCodeChatRequestLike {
+  prompt: string;
+  command?: string;
+}
+
+export interface VsCodeChatResponseStreamLike {
+  markdown?(message: string): unknown;
+  progress?(message: string): unknown;
+}
+
+export interface VsCodeChatParticipantLike extends VsCodeDisposableLike {}
+
+export interface VsCodeChatLike {
+  createChatParticipant(
+    id: string,
+    handler: (
+      request: VsCodeChatRequestLike,
+      context: unknown,
+      stream: VsCodeChatResponseStreamLike,
+      token: unknown,
+    ) => unknown,
+  ): VsCodeChatParticipantLike;
+}
+
 export interface VsCodeQuickPickItemLike {
   label: string;
   description?: string;
@@ -115,11 +173,12 @@ export interface VsCodeWindowLike {
     items: readonly T[],
     options: VsCodeQuickPickOptionsLike,
   ): Promise<T | undefined>;
+  showInputBox?(options: VsCodeInputBoxOptionsLike): Promise<string | undefined>;
   registerTreeDataProvider?<T>(
     viewId: string,
     provider: VsCodeTreeDataProviderLike<T>,
   ): VsCodeDisposableLike;
-  showInformationMessage?(message: string): Promise<unknown>;
+  showInformationMessage?(message: string, ...items: unknown[]): Promise<unknown>;
   showErrorMessage?(message: string): Promise<unknown>;
 }
 
@@ -127,6 +186,11 @@ export interface VsCodeCommandLike {
   command: string;
   title: string;
   arguments?: unknown[];
+}
+
+export interface VsCodeInputBoxOptionsLike {
+  prompt: string;
+  placeHolder?: string;
 }
 
 export interface VsCodeTreeItemLike {
@@ -162,6 +226,7 @@ export interface VsCodeScheduleEditor {
 
 export interface VsCodeSchedulerServices {
   editor: VsCodeScheduleEditor;
+  lifecycle?: ScheduleLifecycle;
   close?(): void;
 }
 
@@ -173,6 +238,9 @@ export interface RegisterVsCodeScheduleCommandsOptions {
   services: VsCodeSchedulerServices;
   viewColumn: unknown;
   eventEmitterFactory?: VsCodeEventEmitterFactory;
+  languageModel?: VsCodeLanguageModelLike;
+  languageModelToolResultFactory?: VsCodeLanguageModelToolResultFactory;
+  chat?: VsCodeChatLike;
 }
 
 interface ScheduleQuickPickItem extends VsCodeQuickPickItemLike {
@@ -239,6 +307,7 @@ export function createDefaultVsCodeSchedulerServices(
 
   return {
     editor: new EditorControlSurface(lifecycle),
+    lifecycle,
     close: () => store.close(),
   };
 }
@@ -275,6 +344,23 @@ export function currentWorkspaceTargetContext(
   return targetContext;
 }
 
+function createScheduleCreationFlow(
+  options: RegisterVsCodeScheduleCommandsOptions,
+): VsCodeNaturalLanguageScheduleCreationFlow | undefined {
+  if (!options.services.lifecycle) {
+    return undefined;
+  }
+
+  const currentWorkspace = currentWorkspaceTargetContext(options.workspace);
+  return new VsCodeNaturalLanguageScheduleCreationFlow({
+    lifecycle: options.services.lifecycle,
+    ...(currentWorkspace ? { currentWorkspace } : {}),
+    defaultModel: "gpt-5",
+    confirmActivation: (proposal) =>
+      confirmNaturalLanguageScheduleActivation(options.window, proposal),
+  });
+}
+
 export function registerVsCodeScheduleCommands(
   options: RegisterVsCodeScheduleCommandsOptions,
 ): VsCodeDisposableLike[] {
@@ -285,9 +371,11 @@ export function registerVsCodeScheduleCommands(
           options.eventEmitterFactory,
         )
       : undefined;
+  const scheduleCreationFlow = createScheduleCreationFlow(options);
   const controller = new VsCodeScheduleCommandController({
     ...options,
     scheduleTreeProvider,
+    scheduleCreationFlow,
   });
   const disposables = [
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
@@ -297,6 +385,30 @@ export function registerVsCodeScheduleCommands(
       controller.openSchedule(scheduleId),
     ),
   ];
+  if (scheduleCreationFlow) {
+    disposables.push(
+      options.commands.registerCommand(CREATE_SCHEDULE_COMMAND, (input) =>
+        controller.executeScheduleCreationSlashCommand(input),
+      ),
+    );
+  }
+  if (scheduleCreationFlow && options.languageModel) {
+    disposables.push(
+      options.languageModel.registerTool(CREATE_SCHEDULE_TOOL_NAME, {
+        invoke: (toolInvocation) =>
+          controller.invokeScheduleCreationTool(toolInvocation.input),
+      }),
+    );
+  }
+  if (scheduleCreationFlow && options.chat) {
+    disposables.push(
+      options.chat.createChatParticipant(
+        CREATE_SCHEDULE_CHAT_PARTICIPANT_ID,
+        (request, _context, stream) =>
+          controller.handleScheduleCreationChatRequest(request, stream),
+      ),
+    );
+  }
   if (scheduleTreeProvider && options.window.registerTreeDataProvider) {
     disposables.push(
       options.window.registerTreeDataProvider(
@@ -840,6 +952,210 @@ function scheduleTreeTooltip(schedule: ScheduleSummary): string {
   ].join("\n");
 }
 
+const CREATE_ACTIVE_SCHEDULE_ACTION = "Create Active Schedule";
+
+async function confirmNaturalLanguageScheduleActivation(
+  window: VsCodeWindowLike,
+  proposal: NaturalLanguageScheduleActivationProposal,
+): Promise<boolean> {
+  const selected = await window.showInformationMessage?.(
+    "Create active AgentScheduler schedule?",
+    {
+      modal: true,
+      detail: naturalLanguageActivationConfirmationDetail(proposal),
+    },
+    CREATE_ACTIVE_SCHEDULE_ACTION,
+  );
+  return selected === CREATE_ACTIVE_SCHEDULE_ACTION;
+}
+
+function naturalLanguageActivationConfirmationDetail(
+  proposal: NaturalLanguageScheduleActivationProposal,
+): string {
+  const runCap =
+    proposal.runCap && proposal.runCap.maxRuns > 0
+      ? String(proposal.runCap.maxRuns)
+      : "No limit";
+  return [
+    `Instructions: ${proposal.runInstructions}`,
+    `Cadence: ${cadenceLabel(proposal.cadence)}`,
+    `Target: ${targetContextLabel(proposal.targetContext)}`,
+    `Harness: ${proposal.harnessMode}`,
+    `Model: ${proposal.model}`,
+    `Approvals: ${proposal.approvalMode}`,
+    `Run cap: ${runCap}`,
+  ].join("\n");
+}
+
+function naturalLanguageCreationSummary(
+  result: NaturalLanguageScheduleCreationResult,
+): string {
+  const headline =
+    result.outcome === "activated"
+      ? "Created active schedule."
+      : "Created draft schedule.";
+  const notes =
+    result.validationMessages.length > 0
+      ? `\n\nReview notes:\n${result.validationMessages
+          .map((message) => `- ${message}`)
+          .join("\n")}`
+      : "";
+  return `${headline} Opened Schedule Detail for review.${notes}`;
+}
+
+function naturalLanguageScheduleCreationInputFrom(
+  rawInput: unknown,
+): NaturalLanguageScheduleCreationInput {
+  if (typeof rawInput === "string") {
+    const naturalLanguageRequest = rawInput.trim();
+    if (naturalLanguageRequest.length === 0) {
+      throw new Error("Natural-language schedule request is required.");
+    }
+    return { naturalLanguageRequest };
+  }
+
+  if (!isRecord(rawInput)) {
+    throw new Error("Natural-language schedule creation input must be an object.");
+  }
+
+  const naturalLanguageRequest = stringProperty(
+    rawInput,
+    "naturalLanguageRequest",
+  )?.trim();
+  if (!naturalLanguageRequest) {
+    throw new Error("Natural-language schedule request is required.");
+  }
+
+  const input: NaturalLanguageScheduleCreationInput = {
+    naturalLanguageRequest,
+  };
+  const runInstructions = stringProperty(rawInput, "runInstructions")?.trim();
+  if (runInstructions) {
+    input.runInstructions = runInstructions;
+  }
+  const cadence = cadenceProperty(rawInput, "cadence");
+  if (cadence) {
+    input.cadence = cadence;
+  }
+  const targetContext = targetContextProperty(rawInput, "targetContext");
+  if (targetContext) {
+    input.targetContext = targetContext;
+  }
+  const harnessMode = harnessModeProperty(rawInput, "harnessMode");
+  if (harnessMode) {
+    input.harnessMode = harnessMode;
+  }
+  const model = stringProperty(rawInput, "model")?.trim();
+  if (model) {
+    input.model = model;
+  }
+  const approvalMode = approvalModeProperty(rawInput, "approvalMode");
+  if (approvalMode) {
+    input.approvalMode = approvalMode;
+  }
+  const runCap = runCapProperty(rawInput, "runCap");
+  if (runCap) {
+    input.runCap = runCap;
+  }
+  const riskWarnings = stringArrayProperty(rawInput, "riskWarnings");
+  if (riskWarnings.length > 0) {
+    input.riskWarnings = riskWarnings;
+  }
+
+  return input;
+}
+
+function stringProperty(
+  record: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function cadenceProperty(
+  record: Record<string, unknown>,
+  key: string,
+): RunCadence | undefined {
+  const value = record[key];
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const type = value["type"];
+  const expression = value["expression"];
+  return type === "cron" && typeof expression === "string"
+    ? { type: "cron", expression }
+    : undefined;
+}
+
+function targetContextProperty(
+  record: Record<string, unknown>,
+  key: string,
+): WorkspaceTargetContext | undefined {
+  const value = record[key];
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const type = value["type"];
+  const uri = value["uri"];
+  const label = value["label"];
+  if (type !== "workspace" || typeof uri !== "string") {
+    return undefined;
+  }
+
+  return {
+    type: "workspace",
+    uri,
+    ...(typeof label === "string" && label.trim().length > 0
+      ? { label }
+      : {}),
+  };
+}
+
+function harnessModeProperty(
+  record: Record<string, unknown>,
+  key: string,
+): HarnessMode | undefined {
+  const value = record[key];
+  return value === "local-copilot" || value === "cloud-copilot"
+    ? value
+    : undefined;
+}
+
+function approvalModeProperty(
+  record: Record<string, unknown>,
+  key: string,
+): ApprovalMode | undefined {
+  const value = record[key];
+  return value === "default-approvals" ||
+    value === "bypass-approvals" ||
+    value === "autopilot"
+    ? value
+    : undefined;
+}
+
+function runCapProperty(
+  record: Record<string, unknown>,
+  key: string,
+): RunCapInput | undefined {
+  const value = record[key];
+  if (!isRecord(value) || !Number.isInteger(value["maxRuns"])) {
+    return undefined;
+  }
+  const maxRuns = value["maxRuns"];
+  return typeof maxRuns === "number" && maxRuns > 0 ? { maxRuns } : undefined;
+}
+
+function stringArrayProperty(
+  record: Record<string, unknown>,
+  key: string,
+): string[] {
+  const value = record[key];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
 function updateScheduleInputFromWebviewFields(
   fields: ScheduleDetailFormFields,
 ): UpdateScheduleInput {
@@ -1003,6 +1319,7 @@ export class ScheduleTreeDataProvider
 interface VsCodeScheduleCommandControllerOptions
   extends RegisterVsCodeScheduleCommandsOptions {
   scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
+  scheduleCreationFlow: VsCodeNaturalLanguageScheduleCreationFlow | undefined;
 }
 
 class VsCodeScheduleCommandController {
@@ -1012,6 +1329,12 @@ class VsCodeScheduleCommandController {
   private readonly editor: VsCodeScheduleEditor;
   private readonly viewColumn: unknown;
   private readonly scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
+  private readonly scheduleCreationFlow:
+    | VsCodeNaturalLanguageScheduleCreationFlow
+    | undefined;
+  private readonly languageModelToolResultFactory:
+    | VsCodeLanguageModelToolResultFactory
+    | undefined;
   private readonly scheduleDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
 
   constructor(options: VsCodeScheduleCommandControllerOptions) {
@@ -1021,6 +1344,8 @@ class VsCodeScheduleCommandController {
     this.editor = options.services.editor;
     this.viewColumn = options.viewColumn;
     this.scheduleTreeProvider = options.scheduleTreeProvider;
+    this.scheduleCreationFlow = options.scheduleCreationFlow;
+    this.languageModelToolResultFactory = options.languageModelToolResultFactory;
   }
 
   async createNewSchedule(): Promise<ScheduleDetailView> {
@@ -1047,6 +1372,48 @@ class VsCodeScheduleCommandController {
       const detail = await this.editor.openScheduleDetail(selectedScheduleId);
       this.openScheduleDetailPanel(detail);
       return detail;
+    });
+  }
+
+  async invokeScheduleCreationTool(input: unknown): Promise<unknown> {
+    const result = await this.createScheduleFromNaturalLanguage(
+      input,
+      "language-model-tool",
+    );
+    return this.languageModelToolResultFactory
+      ? this.languageModelToolResultFactory.createToolResult([
+          this.languageModelToolResultFactory.createTextPart(
+            naturalLanguageCreationSummary(result),
+          ),
+        ])
+      : result;
+  }
+
+  async handleScheduleCreationChatRequest(
+    request: VsCodeChatRequestLike,
+    stream: VsCodeChatResponseStreamLike,
+  ): Promise<NaturalLanguageScheduleCreationResult> {
+    const source =
+      request.command === CREATE_SCHEDULE_CHAT_SLASH_COMMAND ||
+      request.command === CREATE_SCHEDULE_COMMAND
+        ? "slash-command"
+        : "chat-participant";
+    const result = await this.createScheduleFromNaturalLanguage(
+      { naturalLanguageRequest: request.prompt },
+      source,
+    );
+    stream.markdown?.(naturalLanguageCreationSummary(result));
+    return result;
+  }
+
+  async executeScheduleCreationSlashCommand(
+    input: unknown,
+  ): Promise<NaturalLanguageScheduleCreationResult | undefined> {
+    return this.runCommand(async () => {
+      const resolvedInput = await this.resolveSlashCommandCreationInput(input);
+      return resolvedInput
+        ? this.createScheduleFromNaturalLanguage(resolvedInput, "slash-command")
+        : undefined;
     });
   }
 
@@ -1160,6 +1527,46 @@ class VsCodeScheduleCommandController {
 
   private refreshScheduleTree(): void {
     this.scheduleTreeProvider?.refresh();
+  }
+
+  private async createScheduleFromNaturalLanguage(
+    rawInput: unknown,
+    source: "language-model-tool" | "chat-participant" | "slash-command",
+  ): Promise<NaturalLanguageScheduleCreationResult> {
+    if (!this.scheduleCreationFlow) {
+      throw new Error("Natural-language schedule creation is not configured.");
+    }
+
+    const input = naturalLanguageScheduleCreationInputFrom(rawInput);
+    const result =
+      source === "language-model-tool"
+        ? await this.scheduleCreationFlow.invokeLanguageModelTool(input)
+        : source === "chat-participant"
+          ? await this.scheduleCreationFlow.handleChatParticipantRequest(input)
+          : await this.scheduleCreationFlow.executeSlashCommand(input);
+    const detail = await this.editor.openScheduleDetail(result.schedule.id);
+    this.openScheduleDetailPanel(detail);
+    this.refreshScheduleTree();
+    return result;
+  }
+
+  private async resolveSlashCommandCreationInput(
+    input: unknown,
+  ): Promise<unknown | undefined> {
+    if (input !== undefined) {
+      return input;
+    }
+    if (!this.window.showInputBox) {
+      throw new Error("Natural-language schedule creation input is required.");
+    }
+
+    const naturalLanguageRequest = await this.window.showInputBox({
+      prompt: "Describe the AgentScheduler schedule to create.",
+      placeHolder: "Run every hour to review open bug branches",
+    });
+    return naturalLanguageRequest && naturalLanguageRequest.trim().length > 0
+      ? naturalLanguageRequest
+      : undefined;
   }
 
   private async renderScheduleDetailError(
