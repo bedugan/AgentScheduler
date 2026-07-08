@@ -33,6 +33,7 @@ export interface WorkerCliDependencies {
   localSchedulingSetup?: WorkerCliLocalSchedulingSetup;
   lifecycle?: WorkerCliLifecycle;
   harnesses?: AgentHarness[];
+  createCopilotLocalHarness?: () => AgentHarness;
 }
 
 export interface WorkerCliIo {
@@ -333,9 +334,13 @@ async function runScanDueWorkCommand(
   try {
     const lifecycle = new ScheduleLifecycle({
       store,
-      harnesses: dependencies.harnesses ?? [
-        createDefaultCopilotLocalHarness({ detectAvailability: false }),
-      ],
+      harnesses:
+        dependencies.harnesses ??
+        [
+          (dependencies.createCopilotLocalHarness ??
+            (() =>
+              createDefaultCopilotLocalHarness({ detectAvailability: false })))(),
+        ],
       localSchedulingSetup: {
         isLocalSchedulingEnabled: async () =>
           (await store.getLocalSchedulingSetup()).enabled,
