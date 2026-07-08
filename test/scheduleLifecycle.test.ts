@@ -1214,25 +1214,29 @@ describe("Schedule Lifecycle API tracer bullet", () => {
         unattended: false,
       },
     });
-    assert.deepEqual(runner.calls, [
-      {
-        command: "/custom/copilot",
-        args: [
-          "-C",
-          "/tmp/agent-scheduler",
-          "--model",
-          "gpt-5",
-          "--output-format",
-          "json",
-          "--no-color",
-          "--no-ask-user",
-          "--allow-all-tools",
-          "-p",
-          "Run the concrete Copilot CLI client.",
-        ],
-        options: { timeoutMs: 1_800_000 },
-      },
+    assert.equal(runner.calls.length, 1);
+    assert.equal(runner.calls[0]?.command, "/custom/copilot");
+    assert.deepEqual(runner.calls[0]?.args.slice(0, -1), [
+      "-C",
+      "/tmp/agent-scheduler",
+      "--model",
+      "gpt-5",
+      "--output-format",
+      "json",
+      "--no-color",
+      "--no-ask-user",
+      "--allow-all-tools",
+      "-p",
     ]);
+    assert.equal(runner.calls[0]?.options?.timeoutMs, 1_800_000);
+    assert.match(
+      runner.calls[0]?.args.at(-1) ?? "",
+      /AgentScheduler execution frame/,
+    );
+    assert.match(
+      runner.calls[0]?.args.at(-1) ?? "",
+      /Run the concrete Copilot CLI client\./,
+    );
   });
 
   it("blocks activation when a registered harness reports itself unavailable", async () => {
