@@ -216,6 +216,7 @@ export interface ScheduleSummary {
   id: string;
   status: ScheduleStatus;
   enabled: boolean;
+  automaticRuns?: "active" | "inactive";
   nextRunAt: IsoTimestamp | null;
   lastRunAt: IsoTimestamp | null;
   runCounter: RunCounter;
