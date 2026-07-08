@@ -81,6 +81,7 @@ export {
 } from "./copilotHarness.js";
 export type {
   CopilotCliCommandResult,
+  CopilotCliCommandRunOptions,
   CopilotCliCommandRunner,
   CopilotCliLocalClientOptions,
   CreateDefaultCopilotLocalHarnessOptions,
@@ -93,6 +94,7 @@ export {
   copilotLocalHarnessAvailabilityFor,
   createDefaultCopilotLocalHarness,
   DEFAULT_COPILOT_CLI_COMMAND,
+  DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS,
   detectCopilotCliAvailabilitySync,
 } from "./copilotCliClient.js";
 export type { ScheduleStore } from "./store.js";
