@@ -196,6 +196,22 @@ export class SqliteScheduleStore
     return rows.map((row) => this.scheduleFromRow(row));
   }
 
+  async deleteSchedule(id: string): Promise<void> {
+    this.database.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      this.database
+        .prepare("DELETE FROM run_history WHERE schedule_id = $schedule_id")
+        .run({ schedule_id: id });
+      this.database
+        .prepare("DELETE FROM schedules WHERE id = $id")
+        .run({ id });
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
     this.database
       .prepare(`

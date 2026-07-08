@@ -159,6 +159,43 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     }
   });
 
+  it("deletes schedules and run history from the SQLite local store", async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
+    const databasePath = join(tempDirectory, "schedules.sqlite");
+
+    try {
+      const store = new SqliteScheduleStore({ databasePath });
+      const lifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T17:00:00.000Z"),
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      const schedule = await lifecycle.createDraftSchedule({
+        runInstructions: "Delete this SQLite schedule.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: {
+          type: "workspace",
+          uri: "file:///tmp/agent-scheduler",
+        },
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+      });
+      await lifecycle.startManualRun(schedule.id);
+      await lifecycle.deleteSchedule(schedule.id);
+      store.close();
+
+      const reopenedStore = new SqliteScheduleStore({ databasePath });
+      assert.equal(await reopenedStore.getSchedule(schedule.id), undefined);
+      assert.deepEqual(await reopenedStore.listRunHistory(schedule.id), []);
+      reopenedStore.close();
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("runs due active schedules from the SQLite local store after lifecycle restart", async () => {
     const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
     const databasePath = join(tempDirectory, "schedules.sqlite");
@@ -352,6 +389,112 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual(dueScan.startedRunIds, []);
     assert.equal(fakeHarness.preflightRequests.length, 0);
     assert.equal(fakeHarness.startRequests.length, 0);
+  });
+
+  it("deletes schedules and run history while blocking deletion with active runs", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    let startAttempts = 0;
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      startResult: (request) => {
+        startAttempts += 1;
+        return startAttempts === 1
+          ? {
+              externalRunId: "active-before-delete",
+              status: "running",
+              completedAt: null,
+              summary: "Run is still active.",
+            }
+          : {
+              externalRunId: "completed-before-delete",
+              status: "completed",
+              completedAt: request.requestedAt,
+              summary: "Run completed before deletion.",
+            };
+      },
+    });
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store,
+      harnesses: [fakeHarness],
+    });
+    const draft = await lifecycle.createDraftSchedule({
+      runInstructions: "Delete this draft.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const active = await lifecycle.createActiveSchedule({
+      runInstructions: "Delete this active schedule.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const paused = await lifecycle.createActiveSchedule({
+      runInstructions: "Delete this paused schedule.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const completed = await lifecycle.createActiveSchedule({
+      runInstructions: "Delete this completed schedule and history.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 1 },
+    });
+
+    await lifecycle.pauseSchedule(paused.id);
+    const runningRun = await lifecycle.startManualRun(active.id);
+    await assert.rejects(
+      () => lifecycle.deleteSchedule(active.id),
+      /running or approval-waiting run/,
+    );
+    await lifecycle.resolveActiveRun(runningRun.id, {
+      status: "completed",
+      summary: "Resolved before deletion.",
+    });
+
+    clock.set("2026-07-07T16:10:00.000Z");
+    await lifecycle.startManualRun(completed.id);
+    assert.equal((await store.listRunHistory(completed.id)).length, 1);
+
+    await lifecycle.deleteSchedule(draft.id);
+    await lifecycle.deleteSchedule(active.id);
+    await lifecycle.deleteSchedule(paused.id);
+    await lifecycle.deleteSchedule(completed.id);
+
+    assert.deepEqual(await lifecycle.listSchedules(), []);
+    assert.deepEqual(await store.listRunHistory(completed.id), []);
+    await assert.rejects(
+      () => lifecycle.openScheduleDetail(draft.id),
+      /Schedule 'schedule_1' was not found\./,
+    );
+    clock.set("2026-07-07T17:00:00.000Z");
+    assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
   });
 
   it("starts active schedules when their hourly cron cadence is due", async () => {

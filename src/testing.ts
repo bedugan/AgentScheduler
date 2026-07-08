@@ -87,6 +87,11 @@ export class InMemoryScheduleStore implements ScheduleStore {
       .map((schedule) => cloneStoreValue(schedule));
   }
 
+  async deleteSchedule(id: string): Promise<void> {
+    this.schedules.delete(id);
+    this.runHistory.delete(id);
+  }
+
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
     const entries = this.runHistory.get(entry.scheduleId) ?? [];
     const existingIndex = entries.findIndex(

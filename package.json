@@ -10,6 +10,7 @@
   "activationEvents": [
     "onCommand:agentScheduler.newSchedule",
     "onCommand:agentScheduler.openSchedule",
+    "onCommand:agentScheduler.deleteSchedule",
     "onCommand:agentScheduler.createSchedule",
     "onView:agentScheduler.scheduleList",
     "onLanguageModelTool:agentScheduler_createSchedule",
@@ -25,6 +26,11 @@
       {
         "command": "agentScheduler.openSchedule",
         "title": "Open Schedule",
+        "category": "AgentScheduler"
+      },
+      {
+        "command": "agentScheduler.deleteSchedule",
+        "title": "Delete Schedule",
         "category": "AgentScheduler"
       },
       {
@@ -157,6 +163,15 @@
         {
           "id": "agentScheduler.scheduleList",
           "name": "AgentScheduler"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "agentScheduler.deleteSchedule",
+          "when": "view == agentScheduler.scheduleList && viewItem == agentScheduler.schedule",
+          "group": "inline"
         }
       ]
     }

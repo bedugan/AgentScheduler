@@ -14,6 +14,7 @@ import {
   CREATE_SCHEDULE_CHAT_SLASH_COMMAND,
   CREATE_SCHEDULE_COMMAND,
   CREATE_SCHEDULE_TOOL_NAME,
+  DELETE_SCHEDULE_COMMAND,
   NEW_SCHEDULE_COMMAND,
   OPEN_SCHEDULE_COMMAND,
   SCHEDULE_DETAIL_VIEW_TYPE,
@@ -71,6 +72,7 @@ describe("VS Code extension adapter", () => {
           inputSchema: Record<string, unknown>;
         }>;
         views?: Record<string, Array<{ id: string; name: string }>>;
+        menus?: Record<string, Array<{ command: string; when?: string }>>;
       };
       extensionKind?: string[];
       engines?: { vscode?: string };
@@ -82,6 +84,7 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual(manifest.activationEvents, [
       `onCommand:${NEW_SCHEDULE_COMMAND}`,
       `onCommand:${OPEN_SCHEDULE_COMMAND}`,
+      `onCommand:${DELETE_SCHEDULE_COMMAND}`,
       `onCommand:${CREATE_SCHEDULE_COMMAND}`,
       `onView:${SCHEDULE_LIST_VIEW_ID}`,
       `onLanguageModelTool:${CREATE_SCHEDULE_TOOL_NAME}`,
@@ -89,8 +92,20 @@ describe("VS Code extension adapter", () => {
     ]);
     assert.deepEqual(
       manifest.contributes?.commands?.map((command) => command.command),
-      [NEW_SCHEDULE_COMMAND, OPEN_SCHEDULE_COMMAND, CREATE_SCHEDULE_COMMAND],
+      [
+        NEW_SCHEDULE_COMMAND,
+        OPEN_SCHEDULE_COMMAND,
+        DELETE_SCHEDULE_COMMAND,
+        CREATE_SCHEDULE_COMMAND,
+      ],
     );
+    assert.deepEqual(manifest.contributes?.menus?.["view/item/context"], [
+      {
+        command: DELETE_SCHEDULE_COMMAND,
+        when: `view == ${SCHEDULE_LIST_VIEW_ID} && viewItem == agentScheduler.schedule`,
+        group: "inline",
+      },
+    ]);
     const toolContribution = manifest.contributes?.languageModelTools?.[0];
     assert.equal(toolContribution?.name, CREATE_SCHEDULE_TOOL_NAME);
     assert.equal(toolContribution?.toolReferenceName, "createSchedule");
@@ -558,8 +573,9 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual([...commands.registrations.keys()], [
       NEW_SCHEDULE_COMMAND,
       OPEN_SCHEDULE_COMMAND,
+      DELETE_SCHEDULE_COMMAND,
     ]);
-    assert.equal(context.subscriptions.length, 2);
+    assert.equal(context.subscriptions.length, 3);
   });
 
   it("registers natural-language creation surfaces and activates complete tool requests after confirmation", async () => {
@@ -1015,6 +1031,89 @@ describe("VS Code extension adapter", () => {
     ]);
     const children = await provider.getChildren();
     assert.equal(children[0]?.kind, "schedule");
+  });
+
+  it("confirms and deletes schedules from detail and list actions", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const eventEmitterFactory = new RecordingEventEmitterFactory();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      eventEmitterFactory,
+    });
+    const provider = window.requiredTreeProvider(SCHEDULE_LIST_VIEW_ID);
+    const refreshes: Array<ScheduleTreeNode | undefined> = [];
+    provider.onDidChangeTreeData?.((event) => {
+      refreshes.push(event);
+    });
+
+    const detail = (await commandCallback(
+      commands,
+      NEW_SCHEDULE_COMMAND,
+    )()) as ScheduleDetailView;
+    const panel = requiredPanel(window);
+    await panel.webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: detail.schedule.id,
+    });
+    assert.equal((await store.listRunHistory(detail.schedule.id)).length, 1);
+
+    window.warningMessageResponses.push("Delete Schedule");
+    await panel.webview.postMessageFromWebview({
+      type: "delete",
+      scheduleId: detail.schedule.id,
+    });
+
+    assert.equal(window.warningMessages[0], "Delete AgentScheduler schedule?");
+    assert.equal(panel.disposeCalls, 1);
+    assert.deepEqual(await store.listSchedules(), []);
+    assert.deepEqual(await store.listRunHistory(detail.schedule.id), []);
+
+    const second = await lifecycle.createDraftSchedule({
+      runInstructions: "Delete this schedule from the tree.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    window.warningMessageResponses.push("Delete Schedule");
+    await commandCallback(commands, DELETE_SCHEDULE_COMMAND)({
+      kind: "schedule",
+      schedule: {
+        id: second.id,
+      },
+    });
+
+    assert.equal(await store.getSchedule(second.id), undefined);
+    assert.ok(refreshes.length >= 3);
   });
 
   it("refreshes open Schedule Detail model choices when VS Code chat models change", async () => {
@@ -1947,7 +2046,9 @@ interface RecordingPanel extends VsCodeWebviewPanelLike {
   options: unknown;
   webview: RecordingWebview;
   revealCalls: number;
+  disposeCalls: number;
   reveal(showOptions?: unknown): void;
+  dispose(): void;
 }
 
 class RecordingEventEmitter<T> implements VsCodeEventEmitterLike<T> {
@@ -2098,6 +2199,9 @@ class RecordingWindow implements VsCodeWindowLike {
   readonly informationMessages: string[] = [];
   readonly informationMessageItems: unknown[][] = [];
   readonly informationMessageResponses: unknown[] = [];
+  readonly warningMessages: string[] = [];
+  readonly warningMessageItems: unknown[][] = [];
+  readonly warningMessageResponses: unknown[] = [];
   readonly inputBoxPrompts: string[] = [];
   readonly inputBoxResponses: Array<string | undefined> = [];
   readonly errorMessages: string[] = [];
@@ -2119,8 +2223,12 @@ class RecordingWindow implements VsCodeWindowLike {
       options,
       webview: new RecordingWebview(),
       revealCalls: 0,
+      disposeCalls: 0,
       reveal: () => {
         panel.revealCalls += 1;
+      },
+      dispose: () => {
+        panel.disposeCalls += 1;
       },
     };
     this.panels.push(panel);
@@ -2165,6 +2273,15 @@ class RecordingWindow implements VsCodeWindowLike {
     return this.informationMessageResponses.shift();
   }
 
+  async showWarningMessage(
+    message: string,
+    ...items: unknown[]
+  ): Promise<unknown> {
+    this.warningMessages.push(message);
+    this.warningMessageItems.push(items);
+    return this.warningMessageResponses.shift();
+  }
+
   async showInputBox(options: { prompt: string }): Promise<string | undefined> {
     this.inputBoxPrompts.push(options.prompt);
     return this.inputBoxResponses.shift();
@@ -2207,6 +2324,10 @@ class EmptyScheduleEditor implements VsCodeScheduleEditor {
 
   async restartCompletedSchedule(): Promise<ScheduleDetailView> {
     throw new Error("restartCompletedSchedule should not be called.");
+  }
+
+  async deleteSchedule(): Promise<void> {
+    throw new Error("deleteSchedule should not be called.");
   }
 
   async listSchedules(): Promise<

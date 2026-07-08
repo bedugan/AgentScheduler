@@ -111,6 +111,10 @@ export class EditorControlSurface {
     return this.lifecycle.openScheduleDetail(scheduleId);
   }
 
+  async deleteSchedule(scheduleId: string): Promise<void> {
+    await this.lifecycle.deleteSchedule(scheduleId);
+  }
+
   async enableLocalScheduling(): Promise<LocalSchedulingSetupResult> {
     if (!this.options.localSchedulingSetup) {
       throw new Error("Local scheduling setup is not configured.");
