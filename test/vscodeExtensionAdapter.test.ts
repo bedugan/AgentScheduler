@@ -513,6 +513,33 @@ describe("VS Code extension adapter", () => {
       title: "Open Schedule",
       arguments: ["schedule_1"],
     });
+
+    const inactiveAutomaticRunsItem = scheduleTreeItemForSummary({
+      id: "schedule_2",
+      status: "active",
+      enabled: true,
+      automaticRuns: "inactive",
+      nextRunAt: "2026-07-07T18:00:00.000Z",
+      lastRunAt: null,
+      runCounter: { completed: 0, limit: null },
+      runInstructions: "Review inactive automatic scheduling display.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    assert.equal(
+      inactiveAutomaticRunsItem.description,
+      "active / automatic runs inactive until Local Scheduling is enabled",
+    );
+    assert.match(
+      inactiveAutomaticRunsItem.tooltip ?? "",
+      /Automatic runs inactive until Local Scheduling is enabled/,
+    );
   });
 
   it("registers create and open commands at the adapter boundary", () => {
@@ -1124,6 +1151,65 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("renders active next-run and cadence display from Local Scheduling state", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const active = await lifecycle.createActiveSchedule({
+      runInstructions: "Show active automatic scheduling.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const customCron = await lifecycle.createDraftSchedule({
+      runInstructions: "Show custom cron cadence.",
+      cadence: { type: "cron", expression: "15,45 9-17 * * 1-5" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(active.id);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /2026-07-07T17:00:00\.000Z/,
+    );
+    assert.match(requiredPanel(window).webview.html, /Every hour/);
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(customCron.id);
+    assert.match(
+      requiredPanel(window).webview.html,
+      /custom cron: 15,45 9-17 \* \* 1-5/,
+    );
+  });
+
   it("opens a Schedule Detail webview from the real view model without browser DOM tests", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const lifecycle = new ScheduleLifecycle({
@@ -1386,6 +1472,13 @@ describe("VS Code extension adapter", () => {
       panel.webview.html,
       /Automatic runs are inactive until local scheduling setup is enabled\./,
     );
+    assert.match(
+      panel.webview.html,
+      /Automatic runs inactive until Local Scheduling is enabled/,
+    );
+    assert.doesNotMatch(panel.webview.html, /2026-07-07T17:00:00\.000Z/);
+    assert.match(panel.webview.html, /Every hour/);
+    assert.match(panel.webview.html, /Cron Expression/);
   });
 
   it("shows lifecycle validation failures inline in the Schedule Detail panel", async () => {

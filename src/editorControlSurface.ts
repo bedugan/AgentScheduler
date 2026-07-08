@@ -30,11 +30,15 @@ export class EditorControlSurface {
 
   async listSchedules(): Promise<ScheduleSummary[]> {
     const schedules = await this.lifecycle.listSchedules();
+    const automaticRuns = (await this.lifecycle.isLocalSchedulingEnabled())
+      ? "active"
+      : "inactive";
 
     return schedules.map((schedule) => ({
       id: schedule.id,
       status: schedule.status,
       enabled: schedule.enabled,
+      automaticRuns,
       nextRunAt: schedule.nextRunAt,
       lastRunAt: schedule.lastRunAt,
       runCounter: schedule.runCounter,

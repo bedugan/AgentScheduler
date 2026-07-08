@@ -1280,7 +1280,7 @@ export class ScheduleLifecycle {
     return this.clock.now().toISOString();
   }
 
-  private async isLocalSchedulingEnabled(): Promise<boolean> {
+  async isLocalSchedulingEnabled(): Promise<boolean> {
     if (this.localSchedulingSetup) {
       return this.localSchedulingSetup.isLocalSchedulingEnabled();
     }

@@ -539,12 +539,12 @@ export function renderScheduleDetailWebviewHtml(
     ["Status", view.overview.status],
     ["Enabled", view.overview.enabled ? "Yes" : "No"],
     ["Target Context", targetContextLabel(view.overview.targetContext)],
-    ["Cadence", cadenceLabel(view.overview.cadence)],
+    ["Cadence", cadenceSummaryLabel(view.overview.cadence)],
     ["Harness Mode", harnessModeOverviewLabel(view)],
     ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
     ["Approval Mode", view.overview.approvalMode],
     ["Run Counter", view.overview.runCounter.label],
-    ["Next Run", view.overview.nextRunAt ?? "Not scheduled"],
+    ["Next Run", nextRunDisplayLabel(view)],
     ["Last Run", view.overview.lastRunAt ?? "Never"],
     ["Harness Availability", view.harnessAvailability.message],
   ];
@@ -736,7 +736,7 @@ export function renderScheduleDetailWebviewHtml(
         </div>
         ${renderInput(
           "cadence-expression",
-          "Cadence",
+          "Cron Expression",
           "cadenceExpression",
           cadenceInputValue(view.overview.cadence),
         )}
@@ -1071,8 +1071,51 @@ function targetContextLabelInputValue(targetContext: TargetContext | null): stri
   return targetContext?.label ?? "";
 }
 
+function nextRunDisplayLabel(view: ScheduleDetailView): string {
+  if (
+    view.overview.status === "active" &&
+    view.overview.cadence &&
+    view.localScheduling.automaticRuns === "inactive"
+  ) {
+    return "Automatic runs inactive until Local Scheduling is enabled";
+  }
+
+  return view.overview.nextRunAt ?? "Not scheduled";
+}
+
 function cadenceLabel(cadence: RunCadence | null): string {
-  return cadence ? `cron: ${cadence.expression}` : "No cadence selected";
+  return cadenceSummaryLabel(cadence);
+}
+
+function cadenceSummaryLabel(cadence: RunCadence | null): string {
+  if (!cadence) {
+    return "No cadence selected";
+  }
+
+  if (cadence.type === "cron" && cadence.expression === "0 * * * *") {
+    return "Every hour";
+  }
+
+  if (cadence.type === "cron") {
+    const everyMinutes = /^\*\/([1-9]\d?) \* \* \* \*$/.exec(
+      cadence.expression,
+    );
+    if (everyMinutes?.[1]) {
+      return `Every ${everyMinutes[1]} minutes`;
+    }
+
+    if (cadence.expression === "0 9 * * *") {
+      return "Every day at 09:00";
+    }
+
+    if (cadence.expression === "0 9 * * 1") {
+      return "Every week on Monday at 09:00";
+    }
+
+    return `custom cron: ${cadence.expression}`;
+  }
+
+  return "No cadence selected";
 }
 
 function harnessModeOverviewLabel(view: ScheduleDetailView): string {
@@ -1154,9 +1197,7 @@ export function scheduleTreeItemForSummary(
 ): VsCodeTreeItemLike {
   return {
     label: conciseInstructionLabel(schedule.runInstructions),
-    description: `${schedule.status} / next: ${
-      schedule.nextRunAt ?? "not scheduled"
-    }`,
+    description: `${schedule.status} / ${scheduleTreeNextRunText(schedule)}`,
     tooltip: scheduleTreeTooltip(schedule),
     command: {
       command: OPEN_SCHEDULE_COMMAND,
@@ -1192,8 +1233,28 @@ function scheduleTreeTooltip(schedule: ScheduleSummary): string {
   return [
     conciseInstructionLabel(schedule.runInstructions),
     `Status: ${schedule.status}`,
-    `Next run: ${schedule.nextRunAt ?? "not scheduled"}`,
+    `Next run: ${scheduleTreeNextRunValue(schedule)}`,
   ].join("\n");
+}
+
+function scheduleTreeNextRunText(schedule: ScheduleSummary): string {
+  return scheduleTreeAutomaticRunsInactive(schedule)
+    ? "automatic runs inactive until Local Scheduling is enabled"
+    : `next: ${schedule.nextRunAt ?? "not scheduled"}`;
+}
+
+function scheduleTreeNextRunValue(schedule: ScheduleSummary): string {
+  return scheduleTreeAutomaticRunsInactive(schedule)
+    ? "Automatic runs inactive until Local Scheduling is enabled"
+    : schedule.nextRunAt ?? "not scheduled";
+}
+
+function scheduleTreeAutomaticRunsInactive(schedule: ScheduleSummary): boolean {
+  return (
+    schedule.status === "active" &&
+    schedule.cadence !== null &&
+    schedule.automaticRuns === "inactive"
+  );
 }
 
 const CREATE_ACTIVE_SCHEDULE_ACTION = "Create Active Schedule";
