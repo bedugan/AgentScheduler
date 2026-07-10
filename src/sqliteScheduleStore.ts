@@ -29,7 +29,7 @@ import {
 import type {
   ActiveRunReservationResult,
   RunResultCommit,
-  ScheduleRunStateUpdate,
+  ScheduleOperationalTransition,
   ScheduleStore,
 } from "./store.js";
 
@@ -509,7 +509,7 @@ export class SqliteScheduleStore
 
   async commitRunResult(
     entry: RunHistoryEntry,
-    scheduleUpdate: ScheduleRunStateUpdate,
+    transition: ScheduleOperationalTransition,
   ): Promise<RunResultCommit> {
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
@@ -544,22 +544,22 @@ export class SqliteScheduleStore
             AND updated_at = $expected_updated_at
         `)
         .run({
-          id: scheduleUpdate.scheduleId,
-          expected_revision: scheduleUpdate.expectedRevision,
-          expected_status: scheduleUpdate.expectedState.status,
-          expected_enabled: scheduleUpdate.expectedState.enabled ? 1 : 0,
+          id: transition.scheduleId,
+          expected_revision: transition.expectedRevision,
+          expected_status: transition.expectedState.status,
+          expected_enabled: transition.expectedState.enabled ? 1 : 0,
           expected_run_counter_json: JSON.stringify(
-            scheduleUpdate.expectedState.runCounter,
+            transition.expectedState.runCounter,
           ),
-          expected_next_run_at: scheduleUpdate.expectedState.nextRunAt,
-          expected_last_run_at: scheduleUpdate.expectedState.lastRunAt,
-          expected_updated_at: scheduleUpdate.expectedState.updatedAt,
-          status: scheduleUpdate.status,
-          enabled: scheduleUpdate.enabled ? 1 : 0,
-          run_counter_json: JSON.stringify(scheduleUpdate.runCounter),
-          next_run_at: scheduleUpdate.nextRunAt,
-          last_run_at: scheduleUpdate.lastRunAt,
-          updated_at: scheduleUpdate.updatedAt,
+          expected_next_run_at: transition.expectedState.nextRunAt,
+          expected_last_run_at: transition.expectedState.lastRunAt,
+          expected_updated_at: transition.expectedState.updatedAt,
+          status: transition.status,
+          enabled: transition.enabled ? 1 : 0,
+          run_counter_json: JSON.stringify(transition.runCounter),
+          next_run_at: transition.nextRunAt,
+          last_run_at: transition.lastRunAt,
+          updated_at: transition.updatedAt,
         });
       if (result.changes === 0) {
         this.database.exec("ROLLBACK");

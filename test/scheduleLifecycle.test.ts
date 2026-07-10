@@ -20,7 +20,7 @@ import {
   type CopilotCliCommandRunner,
   type CopilotInteractiveExecutor,
   type RunResultCommit,
-  type ScheduleRunStateUpdate,
+  type ScheduleOperationalTransition,
 } from "../src/index.js";
 import type {
   HarnessMode,
@@ -1142,11 +1142,11 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.editPending) {
           this.editPending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
           await this.saveSchedule({
             ...schedule,
@@ -1154,7 +1154,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
             runInstructions: "Concurrent edit won the race.",
           });
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 
@@ -1197,11 +1197,11 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.pausePending) {
           this.pausePending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
           await this.saveSchedule({
             ...schedule,
@@ -1211,7 +1211,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
             updatedAt: "2026-07-07T16:06:00.000Z",
           });
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 
@@ -1254,11 +1254,11 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.editPending) {
           this.editPending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
           await this.saveSchedule({
             ...schedule,
@@ -1266,7 +1266,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
             runInstructions: "Preserve this concurrent cap edit.",
           });
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 

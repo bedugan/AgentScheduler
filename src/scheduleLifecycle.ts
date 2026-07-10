@@ -29,7 +29,10 @@ import {
   isActiveRunStatus,
   isStartedRunStatus,
 } from "./domain.js";
-import { nextRunAtAfter } from "./recurrencePolicy.js";
+import {
+  hasReachedRunCap,
+  reduceRecurrenceAfterRun,
+} from "./recurrenceReducer.js";
 import { ScheduleDefinition } from "./scheduleDefinition.js";
 import { ScheduleFile } from "./scheduleFile.js";
 import type {
@@ -575,7 +578,7 @@ export class ScheduleLifecycle {
 
     if (
       trigger !== "draft-manual" &&
-      this.hasRunCounterReachedLimit(schedule.runCounter)
+      hasReachedRunCap(schedule.runCounter)
     ) {
       const blockedRun = this.buildRunHistoryEntry({
         schedule,
@@ -1125,82 +1128,22 @@ export class ScheduleLifecycle {
   ): Promise<void> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const currentSchedule = await this.requireSchedule(schedule.id);
-      const completedAt = run.completedAt ?? run.startedAt;
-      const recurrenceAnchor = new Date(
-        Math.max(
-          new Date(completedAt).getTime(),
-          this.clock.now().getTime(),
-        ),
-      );
-      const nextRunCounter = { ...currentSchedule.runCounter };
-      let nextStatus = currentSchedule.status;
-      let nextEnabled = currentSchedule.enabled;
-      let nextRunAt = currentSchedule.nextRunAt;
-
-      if (isActiveRunStatus(run.status)) {
-        if (trigger === "automatic" && currentSchedule.cadence) {
-          nextRunAt = nextRunAtAfter(
-            currentSchedule.cadence,
-            new Date(run.startedAt),
-          );
-        }
-      } else if (trigger !== "draft-manual" && run.status === "completed") {
-        nextRunCounter.completed += 1;
-      }
-
       const pendingDeferredRun =
         trigger === "automatic" && run.status === "completed"
           ? await this.store.getPendingDeferredRun(currentSchedule.id)
           : undefined;
 
-      if (!isActiveRunStatus(run.status)) {
-        if (this.hasRunCounterReachedLimit(nextRunCounter)) {
-          nextStatus = "completed";
-          nextEnabled = false;
-          nextRunAt = null;
-        } else if (
-          trigger === "automatic" &&
-          run.status === "completed" &&
-          currentSchedule.cadence
-        ) {
-          nextRunAt = pendingDeferredRun
-            ? currentSchedule.nextRunAt
-            : nextRunAtAfter(currentSchedule.cadence, recurrenceAnchor);
-        } else if (
-          trigger === "automatic" &&
-          currentSchedule.status === "active" &&
-          currentSchedule.enabled &&
-          currentSchedule.cadence
-        ) {
-          nextRunAt = nextRunAtAfter(
-            currentSchedule.cadence,
-            recurrenceAnchor,
-          );
-        }
-      }
-
-      const commit = await this.store.commitRunResult(run, {
-        scheduleId: currentSchedule.id,
-        expectedRevision: currentSchedule.revision,
-        expectedState: {
-          status: currentSchedule.status,
-          enabled: currentSchedule.enabled,
-          runCounter: currentSchedule.runCounter,
-          nextRunAt: currentSchedule.nextRunAt,
-          lastRunAt: currentSchedule.lastRunAt,
-          updatedAt: currentSchedule.updatedAt,
-        },
-        status: nextStatus,
-        enabled: nextEnabled,
-        runCounter: nextRunCounter,
-        nextRunAt,
-        lastRunAt: isActiveRunStatus(run.status)
-          ? run.startedAt
-          : completedAt,
-        updatedAt: isActiveRunStatus(run.status)
-          ? run.startedAt
-          : completedAt,
+      const reduction = reduceRecurrenceAfterRun({
+        schedule: currentSchedule,
+        run,
+        trigger,
+        now: this.clock.now(),
+        hasPendingDeferredRun: pendingDeferredRun !== undefined,
       });
+      const commit = await this.store.commitRunResult(
+        run,
+        reduction.transition,
+      );
       if (!commit.committed) {
         continue;
       }
@@ -1210,11 +1153,11 @@ export class ScheduleLifecycle {
 
       if (
         pendingDeferredRun &&
-        this.hasRunCounterReachedLimit(nextRunCounter)
+        reduction.reachedRunCap
       ) {
         await this.completePendingDeferredRun(
           pendingDeferredRun,
-          completedAt,
+          reduction.completedAt,
           "Deferred run ended because the schedule completed before catch-up work started.",
         );
       }
@@ -1224,10 +1167,6 @@ export class ScheduleLifecycle {
     throw new Error(
       `Schedule '${schedule.id}' changed repeatedly while AgentScheduler was saving Run History. Retry after schedule edits settle.`,
     );
-  }
-
-  private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {
-    return runCounter.limit !== null && runCounter.completed >= runCounter.limit;
   }
 
   private runCounterViewFor(schedule: Schedule): {

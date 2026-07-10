@@ -31,7 +31,7 @@ import {
   cloneStoreValue,
   type ActiveRunReservationResult,
   type RunResultCommit,
-  type ScheduleRunStateUpdate,
+  type ScheduleOperationalTransition,
   type ScheduleStore,
 } from "./store.js";
 import {
@@ -239,7 +239,7 @@ export class InMemoryScheduleStore implements ScheduleStore {
 
   async commitRunResult(
     entry: RunHistoryEntry,
-    scheduleUpdate: ScheduleRunStateUpdate,
+    transition: ScheduleOperationalTransition,
   ): Promise<RunResultCommit> {
     const existingRun = (this.runHistory.get(entry.scheduleId) ?? []).find(
       (candidate) => candidate.id === entry.id,
@@ -252,29 +252,29 @@ export class InMemoryScheduleStore implements ScheduleStore {
       return { committed: true, applied: false };
     }
 
-    const schedule = this.schedules.get(scheduleUpdate.scheduleId);
+    const schedule = this.schedules.get(transition.scheduleId);
     if (
       !schedule ||
-      schedule.revision !== scheduleUpdate.expectedRevision ||
-      schedule.status !== scheduleUpdate.expectedState.status ||
-      schedule.enabled !== scheduleUpdate.expectedState.enabled ||
+      schedule.revision !== transition.expectedRevision ||
+      schedule.status !== transition.expectedState.status ||
+      schedule.enabled !== transition.expectedState.enabled ||
       JSON.stringify(schedule.runCounter) !==
-        JSON.stringify(scheduleUpdate.expectedState.runCounter) ||
-      schedule.nextRunAt !== scheduleUpdate.expectedState.nextRunAt ||
-      schedule.lastRunAt !== scheduleUpdate.expectedState.lastRunAt ||
-      schedule.updatedAt !== scheduleUpdate.expectedState.updatedAt
+        JSON.stringify(transition.expectedState.runCounter) ||
+      schedule.nextRunAt !== transition.expectedState.nextRunAt ||
+      schedule.lastRunAt !== transition.expectedState.lastRunAt ||
+      schedule.updatedAt !== transition.expectedState.updatedAt
     ) {
       return { committed: false };
     }
 
     this.schedules.set(schedule.id, cloneStoreValue({
       ...schedule,
-      status: scheduleUpdate.status,
-      enabled: scheduleUpdate.enabled,
-      runCounter: scheduleUpdate.runCounter,
-      nextRunAt: scheduleUpdate.nextRunAt,
-      lastRunAt: scheduleUpdate.lastRunAt,
-      updatedAt: scheduleUpdate.updatedAt,
+      status: transition.status,
+      enabled: transition.enabled,
+      runCounter: transition.runCounter,
+      nextRunAt: transition.nextRunAt,
+      lastRunAt: transition.lastRunAt,
+      updatedAt: transition.updatedAt,
     }));
     this.upsertRunHistory(entry);
     return { committed: true, applied: true };

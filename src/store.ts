@@ -20,7 +20,7 @@ export type ActiveRunReservationResult =
       occupyingRun: RunHistoryEntry;
     };
 
-export interface ScheduleRunStateUpdate {
+export interface ScheduleOperationalTransition {
   scheduleId: string;
   expectedRevision: number;
   expectedState: {
@@ -52,7 +52,7 @@ export interface ScheduleStore {
   saveRunHistory(entry: RunHistoryEntry): Promise<void>;
   commitRunResult(
     entry: RunHistoryEntry,
-    scheduleUpdate: ScheduleRunStateUpdate,
+    transition: ScheduleOperationalTransition,
   ): Promise<RunResultCommit>;
   reserveActiveRun(entry: RunHistoryEntry): Promise<ActiveRunReservationResult>;
   getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined>;

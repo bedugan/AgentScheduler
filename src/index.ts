@@ -102,7 +102,7 @@ export {
 } from "./copilotCliClient.js";
 export type {
   RunResultCommit,
-  ScheduleRunStateUpdate,
+  ScheduleOperationalTransition,
   ScheduleStore,
 } from "./store.js";
 export {
