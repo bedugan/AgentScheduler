@@ -973,6 +973,18 @@ class VsCodeScheduleCommandController {
     if (
       typeof rawMessage === "object" &&
       rawMessage !== null &&
+      (rawMessage as { type?: unknown }).type === "form-interaction" &&
+      typeof (rawMessage as { active?: unknown }).active === "boolean"
+    ) {
+      this.panelHost.setScheduleInteraction(
+        panel,
+        (rawMessage as { active: boolean }).active,
+      );
+      return;
+    }
+    if (
+      typeof rawMessage === "object" &&
+      rawMessage !== null &&
       (rawMessage as { type?: unknown }).type === "form-dirty"
     ) {
       this.panelHost.markScheduleDirty(panel);

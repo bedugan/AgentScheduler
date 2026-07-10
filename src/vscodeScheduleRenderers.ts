@@ -498,6 +498,24 @@ function renderScheduleDetailScript(nonce: string): string {
     return field && "value" in field ? field.value : "";
   };
 
+  form.addEventListener("focusin", () => {
+    vscode.postMessage({
+      type: "form-interaction",
+      scheduleId: form.dataset.scheduleId,
+      active: true,
+    });
+  });
+  form.addEventListener("focusout", (event) => {
+    if (event.relatedTarget && form.contains(event.relatedTarget)) {
+      return;
+    }
+    vscode.postMessage({
+      type: "form-interaction",
+      scheduleId: form.dataset.scheduleId,
+      active: false,
+    });
+  });
+
   let dirtyReported = false;
   form.addEventListener("input", () => {
     if (!dirtyReported) {

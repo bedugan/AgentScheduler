@@ -54,6 +54,7 @@ export class VsCodeSchedulePanelHost {
   private readonly schedulePanels = new Map<string, SchedulePanelLike>();
   private readonly runHistoryPanels = new Map<string, SchedulePanelLike>();
   private readonly dirtySchedulePanels = new WeakSet<SchedulePanelLike>();
+  private readonly interactingSchedulePanels = new WeakSet<SchedulePanelLike>();
 
   constructor(private readonly options: SchedulePanelHostOptions) {}
 
@@ -115,6 +116,7 @@ export class VsCodeSchedulePanelHost {
     state: ScheduleDetailRenderState = {},
   ): Promise<void> {
     this.dirtySchedulePanels.delete(panel);
+    this.interactingSchedulePanels.delete(panel);
     panel.title = this.options.scheduleTitle(detail);
     panel.webview.html = await this.options.renderSchedule(detail, state);
   }
@@ -148,7 +150,9 @@ export class VsCodeSchedulePanelHost {
     await Promise.all([
       this.refreshSchedules(
         (panel) =>
-          panel.visible !== false && !this.dirtySchedulePanels.has(panel),
+          panel.visible !== false &&
+          !this.dirtySchedulePanels.has(panel) &&
+          !this.interactingSchedulePanels.has(panel),
       ),
       this.refreshRunHistory((panel) => panel.visible !== false),
     ]);
@@ -156,6 +160,14 @@ export class VsCodeSchedulePanelHost {
 
   markScheduleDirty(panel: SchedulePanelLike): void {
     this.dirtySchedulePanels.add(panel);
+  }
+
+  setScheduleInteraction(panel: SchedulePanelLike, active: boolean): void {
+    if (active) {
+      this.interactingSchedulePanels.add(panel);
+    } else {
+      this.interactingSchedulePanels.delete(panel);
+    }
   }
 
   async refreshSchedules(

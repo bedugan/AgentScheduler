@@ -227,6 +227,101 @@ describe("VS Code extension adapter", () => {
     assert.equal((await editor.openScheduleDetail(created.schedule.id)).overview.status, "draft");
   });
 
+  it("pauses live Schedule Detail replacement while the form is focused", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const created = await editor.createDraftSchedule({
+      runInstructions: "Original focus-safe instructions.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/focus-refresh" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const context = recordingContext();
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    registerVsCodeScheduleCommands({
+      context,
+      commands,
+      window,
+      workspace: {},
+      services: { editor },
+      viewColumn: 1,
+    });
+    try {
+      await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
+      const panel = requiredPanel(window);
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: true,
+      });
+      await editor.saveScheduleDetailEdits(created.schedule.id, {
+        runInstructions: "Metadata changed while the form stayed focused.",
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.doesNotMatch(
+        panel.webview.html,
+        /Metadata changed while the form stayed focused/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: false,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.match(
+        panel.webview.html,
+        /Metadata changed while the form stayed focused/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: true,
+      });
+      await panel.webview.postMessageFromWebview({
+        type: "form-dirty",
+        scheduleId: created.schedule.id,
+      });
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: false,
+      });
+      await editor.saveScheduleDetailEdits(created.schedule.id, {
+        runInstructions: "A later persisted change must not erase dirty fields.",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.doesNotMatch(
+        panel.webview.html,
+        /A later persisted change must not erase dirty fields/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "refresh",
+        scheduleId: created.schedule.id,
+      });
+      assert.match(
+        panel.webview.html,
+        /A later persisted change must not erase dirty fields/,
+      );
+    } finally {
+      for (const disposable of context.subscriptions) {
+        disposable.dispose();
+      }
+    }
+  });
+
   it("detects worker writes through SQLite data_version for open-state refresh", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-version-"));
     const databasePath = join(directory, "schedules.sqlite");
@@ -2358,6 +2453,66 @@ describe("VS Code extension adapter", () => {
     assert.equal(runNowButton.attributes.get("aria-busy"), "true");
     assert.equal(runNowButton.attributes.get("aria-live"), "polite");
     assert.equal(runNowButton.textContent, "Starting...");
+  });
+
+  it("reports Schedule Detail form focus as one refresh-pausing interaction", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const detail = await new EditorControlSurface(lifecycle).createDraftSchedule({
+      runInstructions: "Keep focus while editing.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/focus" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const script = scriptContentFrom(renderScheduleDetailWebviewHtml(detail));
+    const postedMessages: unknown[] = [];
+    const listeners = new Map<string, (event: { relatedTarget?: unknown }) => void>();
+    const insideForm = { insideForm: true };
+    const form = {
+      dataset: { scheduleId: detail.schedule.id },
+      elements: { namedItem: () => ({ value: "" }) },
+      contains: (target: unknown) => target === insideForm,
+      addEventListener: (
+        name: string,
+        listener: (event: { relatedTarget?: unknown }) => void,
+      ) => listeners.set(name, listener),
+    };
+    const document = {
+      querySelector: (selector: string) =>
+        selector === "#schedule-detail-form" ? form : null,
+      querySelectorAll: () => [],
+    };
+
+    Function("acquireVsCodeApi", "document", script)(
+      () => ({
+        postMessage: (message: unknown) => postedMessages.push(message),
+      }),
+      document,
+    );
+
+    listeners.get("focusin")?.({});
+    listeners.get("focusout")?.({ relatedTarget: insideForm });
+    listeners.get("focusout")?.({ relatedTarget: null });
+
+    assert.deepEqual(postedMessages, [
+      {
+        type: "form-interaction",
+        scheduleId: detail.schedule.id,
+        active: true,
+      },
+      {
+        type: "form-interaction",
+        scheduleId: detail.schedule.id,
+        active: false,
+      },
+    ]);
   });
 
   it("routes Schedule List selections through Open Schedule and focuses an existing detail panel", async () => {
