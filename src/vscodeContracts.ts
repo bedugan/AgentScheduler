@@ -22,7 +22,6 @@ import type { VsCodeGlobalStorageContextLike } from "./vscodeLocalScheduling.js"
 export interface VsCodeDisposableLike {
   dispose(): unknown;
 }
-
 export interface VsCodeEventLike<T> {
   (listener: (event: T) => unknown): VsCodeDisposableLike;
 }
@@ -249,5 +248,3 @@ export interface RegisterVsCodeScheduleCommandsOptions {
   languageModelToolResultFactory?: VsCodeLanguageModelToolResultFactory;
   chat?: VsCodeChatLike;
 }
-
-
