@@ -190,7 +190,9 @@ export function createVsCodeScheduleModelCatalog(
   return {
     listScheduleModels: async () => {
       try {
-        const chatModels = await languageModel.selectChatModels?.();
+        const chatModels = await languageModel.selectChatModels?.({
+          vendor: "copilot",
+        });
         return normalizeScheduleModelOptions(chatModels ?? []);
       } catch {
         return [];
@@ -247,6 +249,31 @@ function isCopilotScheduleModel(model: ScheduleModelOption): boolean {
   );
 }
 
+function filterCliModelsByAuthenticatedCopilotCatalog(
+  cliModels: readonly ScheduleModelOption[],
+  authenticatedModels: readonly ScheduleModelOption[],
+): ScheduleModelOption[] {
+  if (authenticatedModels.length === 0) {
+    return [...cliModels];
+  }
+  const authenticatedIdentifiers = new Set(
+    authenticatedModels
+      .filter(isCopilotScheduleModel)
+      .flatMap((model) => [model.id, model.family, model.version, model.displayName])
+      .filter((value): value is string => Boolean(value))
+      .map(normalizeModelIdentifier),
+  );
+  return cliModels.filter(
+    (model) =>
+      model.id === "auto" ||
+      authenticatedIdentifiers.has(normalizeModelIdentifier(model.id)),
+  );
+}
+
+function normalizeModelIdentifier(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function createScheduleCreationFlow(
   options: RegisterVsCodeScheduleCommandsOptions,
   modelCatalog: ScheduleModelCatalog | undefined,
@@ -275,9 +302,16 @@ export function registerVsCodeScheduleCommands(
             const models = await options.services.editor.listHarnessModels?.(
               "local-copilot",
             );
-            return models && models.length > 0
-              ? models
-              : (await vsCodeModelCatalog?.listScheduleModels()) ?? [];
+            if (!models || models.length === 0) {
+              return (await vsCodeModelCatalog?.listScheduleModels()) ?? [];
+            }
+            if (!vsCodeModelCatalog) {
+              return models;
+            }
+            return filterCliModelsByAuthenticatedCopilotCatalog(
+              models,
+              await vsCodeModelCatalog.listScheduleModels(),
+            );
           },
           ...(vsCodeModelCatalog?.onDidChangeScheduleModels && {
             onDidChangeScheduleModels:
@@ -1175,13 +1209,16 @@ class VsCodeScheduleCommandController {
   private async listScheduleModelOptions(
     mode: HarnessMode | null = "local-copilot",
   ): Promise<readonly ScheduleModelOption[]> {
+    if (mode === "local-copilot" && this.modelCatalog) {
+      return this.modelCatalog.listScheduleModels();
+    }
     if (mode && this.editor.listHarnessModels) {
       const harnessModels = await this.editor.listHarnessModels(mode);
       if (harnessModels.length > 0) {
         return harnessModels;
       }
     }
-    return this.modelCatalog ? this.modelCatalog.listScheduleModels() : [];
+    return [];
   }
 
   private async requireSelectedModelAvailable(scheduleId: string): Promise<void> {
