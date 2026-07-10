@@ -6,14 +6,15 @@ import type {
   RunCadence,
   RunCapInput,
   Schedule,
+  ScheduleHarnessModeAvailability,
   TargetContext,
   WorkspaceTargetContext,
 } from "./domain.js";
-import type { ScheduleLifecycle } from "./scheduleLifecycle.js";
 import type {
   ScheduleModelCatalog,
   ScheduleModelOption,
 } from "./scheduleModelCatalog.js";
+import type { VsCodeScheduleEditor } from "./vscodeContracts.js";
 import {
   isScheduleModelAvailable,
   unavailableScheduleModelMessage,
@@ -72,7 +73,12 @@ export interface NaturalLanguageScheduleCreationSlashCommand {
 }
 
 export interface VsCodeNaturalLanguageScheduleCreationOptions {
-  lifecycle: ScheduleLifecycle;
+  editor: Pick<
+    VsCodeScheduleEditor,
+    | "createDraftSchedule"
+    | "createActiveSchedule"
+    | "listHarnessModeAvailability"
+  >;
   currentWorkspace?: WorkspaceTargetContext;
   defaultModel?: string;
   modelCatalog?: ScheduleModelCatalog;
@@ -142,7 +148,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
   readonly chatParticipant: NaturalLanguageScheduleCreationChatParticipant;
   readonly slashCommand: NaturalLanguageScheduleCreationSlashCommand;
 
-  private readonly lifecycle: ScheduleLifecycle;
+  private readonly editor: VsCodeNaturalLanguageScheduleCreationOptions["editor"];
   private readonly currentWorkspace: WorkspaceTargetContext | undefined;
   private readonly defaultModel: string;
   private readonly modelCatalog: ScheduleModelCatalog | undefined;
@@ -151,7 +157,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
   ) => Promise<boolean>;
 
   constructor(options: VsCodeNaturalLanguageScheduleCreationOptions) {
-    this.lifecycle = options.lifecycle;
+    this.editor = options.editor;
     this.currentWorkspace = options.currentWorkspace;
     this.defaultModel = options.defaultModel ?? "gpt-5";
     this.modelCatalog = options.modelCatalog;
@@ -201,16 +207,17 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
   ): Promise<NaturalLanguageScheduleCreationResult> {
     const availableModels = await this.listAvailableModels();
     const draftInput = this.buildDraftInput(input, availableModels);
+    const harnessAvailability = await this.editor.listHarnessModeAvailability();
     const validationMessages = [
       ...activationValidationMessages(draftInput),
-      ...harnessAvailabilityValidationMessages(this.lifecycle, draftInput),
+      ...harnessAvailabilityValidationMessages(harnessAvailability, draftInput),
       ...modelValidationMessages(draftInput, availableModels),
       ...riskValidationMessages(input.naturalLanguageRequest),
       ...(input.riskWarnings ?? []),
     ];
 
     if (validationMessages.length > 0) {
-      const schedule = await this.lifecycle.createDraftSchedule(draftInput);
+      const { schedule } = await this.editor.createDraftSchedule(draftInput);
       return {
         source,
         outcome: "draft",
@@ -222,7 +229,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     const proposal = toActivationProposal(draftInput);
     const confirmed = await this.confirmActivation(proposal);
     if (!confirmed) {
-      const schedule = await this.lifecycle.createDraftSchedule(draftInput);
+      const { schedule } = await this.editor.createDraftSchedule(draftInput);
       return {
         source,
         outcome: "draft",
@@ -231,7 +238,7 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
       };
     }
 
-    const schedule = await this.lifecycle.createActiveSchedule(proposal);
+    const { schedule } = await this.editor.createActiveSchedule(proposal);
     return {
       source,
       outcome: "activated",
@@ -316,14 +323,19 @@ function modelValidationMessages(
 }
 
 function harnessAvailabilityValidationMessages(
-  lifecycle: ScheduleLifecycle,
+  availabilities: readonly ScheduleHarnessModeAvailability[],
   input: CreateDraftScheduleInput,
 ): string[] {
   if (!input.harnessMode) {
     return [];
   }
 
-  const availability = lifecycle.harnessModeAvailabilityFor(input.harnessMode);
+  const availability = availabilities.find(
+    (candidate) => candidate.mode === input.harnessMode,
+  );
+  if (!availability) {
+    return [];
+  }
   return availability.available
     ? []
     : [

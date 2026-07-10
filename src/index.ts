@@ -101,8 +101,9 @@ export {
   detectCopilotCliAvailabilitySync,
 } from "./copilotCliClient.js";
 export type {
+  DeleteScheduleIfIdleResult,
   RunResultCommit,
-  ScheduleRunStateUpdate,
+  ScheduleOperationalTransition,
   ScheduleStore,
 } from "./store.js";
 export {

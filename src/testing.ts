@@ -31,7 +31,7 @@ import {
   cloneStoreValue,
   type ActiveRunReservationResult,
   type RunResultCommit,
-  type ScheduleRunStateUpdate,
+  type ScheduleOperationalTransition,
   type ScheduleStore,
 } from "./store.js";
 import {
@@ -71,8 +71,30 @@ export class InMemoryScheduleStore implements ScheduleStore {
   private readonly runHistory = new Map<string, RunHistoryEntry[]>();
   private readonly localRunExecutions = new Map<string, LocalRunExecution>();
 
-  async saveSchedule(schedule: Schedule): Promise<void> {
+  async createSchedule(schedule: Schedule): Promise<boolean> {
+    if (this.schedules.has(schedule.id)) {
+      return false;
+    }
     this.schedules.set(schedule.id, cloneStoreValue(schedule));
+    return true;
+  }
+
+  async compareAndSaveSchedule(
+    expected: Schedule,
+    schedule: Schedule,
+  ): Promise<boolean> {
+    if (
+      schedule.id !== expected.id ||
+      schedule.createdAt !== expected.createdAt
+    ) {
+      return false;
+    }
+    const current = this.schedules.get(expected.id);
+    if (!current || !sameScheduleState(current, expected)) {
+      return false;
+    }
+    this.schedules.set(schedule.id, cloneStoreValue(schedule));
+    return true;
   }
 
   async getSchedule(id: string): Promise<Schedule | undefined> {
@@ -101,12 +123,24 @@ export class InMemoryScheduleStore implements ScheduleStore {
       .map((schedule) => cloneStoreValue(schedule));
   }
 
-  async deleteSchedule(id: string): Promise<void> {
+  async deleteScheduleIfIdle(
+    id: string,
+  ): Promise<"deleted" | "active-run" | "not-found"> {
+    if (!this.schedules.has(id)) {
+      return "not-found";
+    }
+    const hasActiveRun = (this.runHistory.get(id) ?? []).some(
+      (run) => isActiveRunStatus(run.status) && run.completedAt === null,
+    );
+    if (hasActiveRun) {
+      return "active-run";
+    }
     for (const run of this.runHistory.get(id) ?? []) {
       this.localRunExecutions.delete(run.id);
     }
     this.schedules.delete(id);
     this.runHistory.delete(id);
+    return "deleted";
   }
 
   async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {
@@ -239,7 +273,7 @@ export class InMemoryScheduleStore implements ScheduleStore {
 
   async commitRunResult(
     entry: RunHistoryEntry,
-    scheduleUpdate: ScheduleRunStateUpdate,
+    transition: ScheduleOperationalTransition,
   ): Promise<RunResultCommit> {
     const existingRun = (this.runHistory.get(entry.scheduleId) ?? []).find(
       (candidate) => candidate.id === entry.id,
@@ -252,29 +286,29 @@ export class InMemoryScheduleStore implements ScheduleStore {
       return { committed: true, applied: false };
     }
 
-    const schedule = this.schedules.get(scheduleUpdate.scheduleId);
+    const schedule = this.schedules.get(transition.scheduleId);
     if (
       !schedule ||
-      schedule.revision !== scheduleUpdate.expectedRevision ||
-      schedule.status !== scheduleUpdate.expectedState.status ||
-      schedule.enabled !== scheduleUpdate.expectedState.enabled ||
+      schedule.revision !== transition.expectedRevision ||
+      schedule.status !== transition.expectedState.status ||
+      schedule.enabled !== transition.expectedState.enabled ||
       JSON.stringify(schedule.runCounter) !==
-        JSON.stringify(scheduleUpdate.expectedState.runCounter) ||
-      schedule.nextRunAt !== scheduleUpdate.expectedState.nextRunAt ||
-      schedule.lastRunAt !== scheduleUpdate.expectedState.lastRunAt ||
-      schedule.updatedAt !== scheduleUpdate.expectedState.updatedAt
+        JSON.stringify(transition.expectedState.runCounter) ||
+      schedule.nextRunAt !== transition.expectedState.nextRunAt ||
+      schedule.lastRunAt !== transition.expectedState.lastRunAt ||
+      schedule.updatedAt !== transition.expectedState.updatedAt
     ) {
       return { committed: false };
     }
 
     this.schedules.set(schedule.id, cloneStoreValue({
       ...schedule,
-      status: scheduleUpdate.status,
-      enabled: scheduleUpdate.enabled,
-      runCounter: scheduleUpdate.runCounter,
-      nextRunAt: scheduleUpdate.nextRunAt,
-      lastRunAt: scheduleUpdate.lastRunAt,
-      updatedAt: scheduleUpdate.updatedAt,
+      status: transition.status,
+      enabled: transition.enabled,
+      runCounter: transition.runCounter,
+      nextRunAt: transition.nextRunAt,
+      lastRunAt: transition.lastRunAt,
+      updatedAt: transition.updatedAt,
     }));
     this.upsertRunHistory(entry);
     return { committed: true, applied: true };
@@ -522,5 +556,18 @@ function sameRunSlot(left: RunHistoryEntry, right: RunHistoryEntry): boolean {
     left.harnessMode === right.harnessMode &&
     left.targetContext.type === right.targetContext.type &&
     left.targetContext.uri === right.targetContext.uri
+  );
+}
+
+function sameScheduleState(left: Schedule, right: Schedule): boolean {
+  return (
+    left.id === right.id &&
+    left.revision === right.revision &&
+    left.status === right.status &&
+    left.enabled === right.enabled &&
+    JSON.stringify(left.runCounter) === JSON.stringify(right.runCounter) &&
+    left.nextRunAt === right.nextRunAt &&
+    left.lastRunAt === right.lastRunAt &&
+    left.updatedAt === right.updatedAt
   );
 }

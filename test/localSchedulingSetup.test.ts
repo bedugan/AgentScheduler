@@ -906,7 +906,7 @@ async function seedWorkerStore(
       updatedAt: "2026-07-07T16:00:00.000Z",
     });
     for (const schedule of schedules) {
-      await store.saveSchedule(schedule);
+      assert.equal(await store.createSchedule(schedule), true);
     }
   } finally {
     store.close();

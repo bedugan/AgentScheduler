@@ -20,7 +20,7 @@ import {
   type CopilotCliCommandRunner,
   type CopilotInteractiveExecutor,
   type RunResultCommit,
-  type ScheduleRunStateUpdate,
+  type ScheduleOperationalTransition,
 } from "../src/index.js";
 import type {
   HarnessMode,
@@ -29,6 +29,7 @@ import type {
   HarnessStartRequest,
   HarnessStartResult,
   HarnessExecutionObserver,
+  RunHistoryEntry,
   Schedule,
 } from "../src/index.js";
 import {
@@ -588,6 +589,82 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
   });
 
+  it("does not delete when another SQLite connection reserves a run at the delete boundary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-delete-race-"));
+    const databasePath = join(directory, "schedules.sqlite");
+    const racingStore = new SqliteScheduleStore({ databasePath });
+    let activeRun!: RunHistoryEntry;
+    class DeleteBoundaryStore extends SqliteScheduleStore {
+      override async deleteScheduleIfIdle(
+        scheduleId: string,
+      ): Promise<"deleted" | "active-run" | "not-found"> {
+        await racingStore.reserveActiveRun(activeRun);
+        const atomicDelete = (
+          SqliteScheduleStore.prototype as unknown as {
+            deleteScheduleIfIdle(
+              id: string,
+            ): Promise<"deleted" | "active-run" | "not-found">;
+          }
+        ).deleteScheduleIfIdle;
+        return atomicDelete.call(this, scheduleId);
+      }
+    }
+    const deletingStore = new DeleteBoundaryStore({ databasePath });
+    try {
+      const lifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store: deletingStore,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      const schedule = await lifecycle.createDraftSchedule({
+        runInstructions: "Keep this schedule while its run is active.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/delete-race" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "default-approvals",
+      });
+      activeRun = {
+        id: "run_delete_race",
+        scheduleId: schedule.id,
+        scheduleRevision: schedule.revision,
+        trigger: "manual",
+        status: "running",
+        startedAt: "2026-07-07T16:00:00.000Z",
+        completedAt: null,
+        runInstructionsSnapshot: schedule.runInstructions,
+        approvalModeSnapshot: schedule.approvalMode,
+        resolvedHarnessPolicy: {
+          harnessMode: schedule.harnessMode,
+          approvalMode: schedule.approvalMode,
+        },
+        harnessMode: schedule.harnessMode,
+        model: schedule.model,
+        executedModel: null,
+        targetContext: schedule.targetContext,
+        externalRunId: "execution:delete-race",
+        summary: "Running at the delete boundary.",
+        error: null,
+      };
+
+      await assert.rejects(
+        lifecycle.deleteSchedule(schedule.id),
+        /running or approval-waiting run/,
+      );
+      assert.ok(await deletingStore.getSchedule(schedule.id));
+      assert.equal(
+        (await racingStore.getRunHistoryEntry(activeRun.id))?.status,
+        "running",
+      );
+    } finally {
+      deletingStore.close();
+      racingStore.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("starts active schedules when their hourly cron cadence is due", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const fakeHarness = new FakeHarness({ mode: "local-copilot" });
@@ -1136,25 +1213,99 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual(detail.schedule.runCounter, { completed: 1, limit: 5 });
   });
 
+  it("retries a schedule edit after a concurrent definition CAS loses the race", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-definition-race-"));
+    const databasePath = join(directory, "schedules.sqlite");
+    const competingStore = new SqliteScheduleStore({ databasePath });
+    let competingLifecycle!: ScheduleLifecycle;
+    let racePending = false;
+    let competingUpdateApplied = false;
+    class DefinitionBoundaryStore extends SqliteScheduleStore {
+      override async compareAndSaveSchedule(
+        expected: unknown,
+        schedule: Schedule,
+      ): Promise<boolean> {
+        if (racePending) {
+          racePending = false;
+          await competingLifecycle.updateSchedule(schedule.id, {
+            model: "gpt-5.1",
+          });
+          competingUpdateApplied = true;
+        }
+        const compareAndSave = (
+          SqliteScheduleStore.prototype as unknown as {
+            compareAndSaveSchedule(
+              expectedState: unknown,
+              nextSchedule: Schedule,
+            ): Promise<boolean>;
+          }
+        ).compareAndSaveSchedule;
+        return compareAndSave.call(this, expected, schedule);
+      }
+    }
+    const editingStore = new DefinitionBoundaryStore({ databasePath });
+    try {
+      const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+      const editingLifecycle = new ScheduleLifecycle({
+        clock,
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store: editingStore,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      competingLifecycle = new ScheduleLifecycle({
+        clock,
+        localSchedulingEnabled: false,
+        store: competingStore,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      const schedule = await editingLifecycle.createDraftSchedule({
+        runInstructions: "Original instructions.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/cas-race" },
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+      });
+
+      racePending = true;
+      const updated = await editingLifecycle.updateSchedule(schedule.id, {
+        runInstructions: "Preserve both concurrent definition edits.",
+      });
+
+      assert.equal(competingUpdateApplied, true);
+      assert.equal(updated.model, "gpt-5.1");
+      assert.equal(
+        updated.runInstructions,
+        "Preserve both concurrent definition edits.",
+      );
+      assert.equal(updated.revision, 3);
+    } finally {
+      editingStore.close();
+      competingStore.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rebases a Run Result when the Schedule Revision changes during commit", async () => {
     class ConcurrentEditStore extends InMemoryScheduleStore {
       private editPending = true;
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.editPending) {
           this.editPending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
-          await this.saveSchedule({
+          assert.equal(await this.compareAndSaveSchedule(schedule, {
             ...schedule,
             revision: schedule.revision + 1,
             runInstructions: "Concurrent edit won the race.",
-          });
+          }), true);
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 
@@ -1197,21 +1348,21 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.pausePending) {
           this.pausePending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
-          await this.saveSchedule({
+          assert.equal(await this.compareAndSaveSchedule(schedule, {
             ...schedule,
             status: "paused",
             enabled: false,
             nextRunAt: null,
             updatedAt: "2026-07-07T16:06:00.000Z",
-          });
+          }), true);
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 
@@ -1254,19 +1405,19 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       override async commitRunResult(
         entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
-        scheduleUpdate: ScheduleRunStateUpdate,
+        transition: ScheduleOperationalTransition,
       ): Promise<RunResultCommit> {
         if (this.editPending) {
           this.editPending = false;
-          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          const schedule = await this.getSchedule(transition.scheduleId);
           assert.ok(schedule);
-          await this.saveSchedule({
+          assert.equal(await this.compareAndSaveSchedule(schedule, {
             ...schedule,
             revision: schedule.revision + 1,
             runInstructions: "Preserve this concurrent cap edit.",
-          });
+          }), true);
         }
-        return super.commitRunResult(entry, scheduleUpdate);
+        return super.commitRunResult(entry, transition);
       }
     }
 
@@ -2696,7 +2847,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -2767,7 +2918,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -2808,7 +2959,7 @@ describe("VS Code natural-language schedule creation", () => {
       label: "AgentScheduler",
     };
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async () => true,
@@ -2880,7 +3031,7 @@ describe("VS Code natural-language schedule creation", () => {
     });
     let confirmationRequests = 0;
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       defaultModel: "gpt-5",
       confirmActivation: async () => {
         confirmationRequests += 1;
@@ -2927,7 +3078,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -2989,7 +3140,7 @@ describe("VS Code natural-language schedule creation", () => {
         harnesses: [new FakeHarness({ mode: "local-copilot" })],
       });
       const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-        lifecycle,
+        editor: new EditorControlSurface(lifecycle),
         defaultModel: "gpt-5",
         confirmActivation: async () => true,
       });

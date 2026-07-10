@@ -265,4 +265,48 @@ describe("schedule import and export", () => {
     );
     assert.equal((await lifecycle.listSchedules()).length, 1);
   });
+
+  it("imports by creating new definitions without overwriting an id collision", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T22:30:00.000Z"),
+      idGenerator: { nextId: () => "schedule_collision" },
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const existing = await lifecycle.createDraftSchedule({
+      runInstructions: "Keep this existing definition.",
+      cadence: null,
+      targetContext: null,
+      harnessMode: null,
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+
+    await assert.rejects(
+      lifecycle.importSchedules({
+        schemaVersion: 1,
+        exportedAt: "2026-07-07T22:20:00.000Z",
+        schedules: [
+          {
+            sourceScheduleId: "source_collision",
+            revision: 1,
+            runInstructions: "Do not overwrite the existing definition.",
+            cadence: null,
+            targetContext: null,
+            harnessMode: null,
+            model: "auto",
+            approvalMode: "default-approvals",
+            runCap: null,
+          },
+        ],
+      }),
+      /already exists.*No existing schedule was overwritten/,
+    );
+
+    assert.equal(
+      (await lifecycle.openScheduleDetail(existing.id)).schedule.runInstructions,
+      "Keep this existing definition.",
+    );
+  });
 });

@@ -29,7 +29,7 @@ import {
 import type {
   ActiveRunReservationResult,
   RunResultCommit,
-  ScheduleRunStateUpdate,
+  ScheduleOperationalTransition,
   ScheduleStore,
 } from "./store.js";
 
@@ -130,10 +130,10 @@ export class SqliteScheduleStore
     return row?.data_version ?? 0;
   }
 
-  async saveSchedule(schedule: Schedule): Promise<void> {
-    this.database
+  async createSchedule(schedule: Schedule): Promise<boolean> {
+    const result = this.database
       .prepare(`
-        INSERT INTO schedules (
+        INSERT OR IGNORE INTO schedules (
           id,
           revision,
           status,
@@ -166,21 +166,6 @@ export class SqliteScheduleStore
           $created_at,
           $updated_at
         )
-        ON CONFLICT(id) DO UPDATE SET
-          revision = excluded.revision,
-          status = excluded.status,
-          enabled = excluded.enabled,
-          run_instructions = excluded.run_instructions,
-          cadence_json = excluded.cadence_json,
-          target_context_json = excluded.target_context_json,
-          harness_mode = excluded.harness_mode,
-          model = excluded.model,
-          approval_mode = excluded.approval_mode,
-          run_counter_json = excluded.run_counter_json,
-          next_run_at = excluded.next_run_at,
-          last_run_at = excluded.last_run_at,
-          created_at = excluded.created_at,
-          updated_at = excluded.updated_at
       `)
       .run({
         id: schedule.id,
@@ -199,6 +184,68 @@ export class SqliteScheduleStore
         created_at: schedule.createdAt,
         updated_at: schedule.updatedAt,
       });
+    return Number(result.changes) === 1;
+  }
+
+  async compareAndSaveSchedule(
+    expected: Schedule,
+    schedule: Schedule,
+  ): Promise<boolean> {
+    if (
+      schedule.id !== expected.id ||
+      schedule.createdAt !== expected.createdAt
+    ) {
+      return false;
+    }
+    const result = this.database
+      .prepare(`
+        UPDATE schedules
+        SET revision = $revision,
+            status = $status,
+            enabled = $enabled,
+            run_instructions = $run_instructions,
+            cadence_json = $cadence_json,
+            target_context_json = $target_context_json,
+            harness_mode = $harness_mode,
+            model = $model,
+            approval_mode = $approval_mode,
+            run_counter_json = $run_counter_json,
+            next_run_at = $next_run_at,
+            last_run_at = $last_run_at,
+            updated_at = $updated_at
+        WHERE id = $id
+          AND revision = $expected_revision
+          AND status = $expected_status
+          AND enabled = $expected_enabled
+          AND run_counter_json = $expected_run_counter_json
+          AND next_run_at IS $expected_next_run_at
+          AND last_run_at IS $expected_last_run_at
+          AND updated_at = $expected_updated_at
+      `)
+      .run({
+        id: expected.id,
+        expected_revision: expected.revision,
+        expected_status: expected.status,
+        expected_enabled: expected.enabled ? 1 : 0,
+        expected_run_counter_json: JSON.stringify(expected.runCounter),
+        expected_next_run_at: expected.nextRunAt,
+        expected_last_run_at: expected.lastRunAt,
+        expected_updated_at: expected.updatedAt,
+        revision: schedule.revision,
+        status: schedule.status,
+        enabled: schedule.enabled ? 1 : 0,
+        run_instructions: schedule.runInstructions,
+        cadence_json: JSON.stringify(schedule.cadence),
+        target_context_json: JSON.stringify(schedule.targetContext),
+        harness_mode: schedule.harnessMode ?? "",
+        model: schedule.model,
+        approval_mode: schedule.approvalMode,
+        run_counter_json: JSON.stringify(schedule.runCounter),
+        next_run_at: schedule.nextRunAt,
+        last_run_at: schedule.lastRunAt,
+        updated_at: schedule.updatedAt,
+      });
+    return Number(result.changes) === 1;
   }
 
   async getSchedule(id: string): Promise<Schedule | undefined> {
@@ -236,9 +283,31 @@ export class SqliteScheduleStore
     return rows.map((row) => this.scheduleFromRow(row));
   }
 
-  async deleteSchedule(id: string): Promise<void> {
+  async deleteScheduleIfIdle(
+    id: string,
+  ): Promise<"deleted" | "active-run" | "not-found"> {
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
+      const schedule = this.database
+        .prepare("SELECT 1 FROM schedules WHERE id = $id")
+        .get({ id });
+      if (!schedule) {
+        this.database.exec("COMMIT");
+        return "not-found";
+      }
+      const activeRun = this.database
+        .prepare(`
+          SELECT 1 FROM run_history
+          WHERE schedule_id = $schedule_id
+            AND status IN ('running', 'approval-waiting')
+            AND completed_at IS NULL
+          LIMIT 1
+        `)
+        .get({ schedule_id: id });
+      if (activeRun) {
+        this.database.exec("COMMIT");
+        return "active-run";
+      }
       this.database
         .prepare(`
           DELETE FROM local_run_executions
@@ -252,6 +321,7 @@ export class SqliteScheduleStore
         .prepare("DELETE FROM schedules WHERE id = $id")
         .run({ id });
       this.database.exec("COMMIT");
+      return "deleted";
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -509,7 +579,7 @@ export class SqliteScheduleStore
 
   async commitRunResult(
     entry: RunHistoryEntry,
-    scheduleUpdate: ScheduleRunStateUpdate,
+    transition: ScheduleOperationalTransition,
   ): Promise<RunResultCommit> {
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
@@ -544,22 +614,22 @@ export class SqliteScheduleStore
             AND updated_at = $expected_updated_at
         `)
         .run({
-          id: scheduleUpdate.scheduleId,
-          expected_revision: scheduleUpdate.expectedRevision,
-          expected_status: scheduleUpdate.expectedState.status,
-          expected_enabled: scheduleUpdate.expectedState.enabled ? 1 : 0,
+          id: transition.scheduleId,
+          expected_revision: transition.expectedRevision,
+          expected_status: transition.expectedState.status,
+          expected_enabled: transition.expectedState.enabled ? 1 : 0,
           expected_run_counter_json: JSON.stringify(
-            scheduleUpdate.expectedState.runCounter,
+            transition.expectedState.runCounter,
           ),
-          expected_next_run_at: scheduleUpdate.expectedState.nextRunAt,
-          expected_last_run_at: scheduleUpdate.expectedState.lastRunAt,
-          expected_updated_at: scheduleUpdate.expectedState.updatedAt,
-          status: scheduleUpdate.status,
-          enabled: scheduleUpdate.enabled ? 1 : 0,
-          run_counter_json: JSON.stringify(scheduleUpdate.runCounter),
-          next_run_at: scheduleUpdate.nextRunAt,
-          last_run_at: scheduleUpdate.lastRunAt,
-          updated_at: scheduleUpdate.updatedAt,
+          expected_next_run_at: transition.expectedState.nextRunAt,
+          expected_last_run_at: transition.expectedState.lastRunAt,
+          expected_updated_at: transition.expectedState.updatedAt,
+          status: transition.status,
+          enabled: transition.enabled ? 1 : 0,
+          run_counter_json: JSON.stringify(transition.runCounter),
+          next_run_at: transition.nextRunAt,
+          last_run_at: transition.lastRunAt,
+          updated_at: transition.updatedAt,
         });
       if (result.changes === 0) {
         this.database.exec("ROLLBACK");

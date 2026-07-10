@@ -248,3 +248,11 @@ The following placeholders mark useful future screenshots. They are intentionall
 - The Schedule Lifecycle API owns schedule creation, activation, due scans, manual runs, transitions, run caps, import/export, and history snapshotting.
 - The Harness Contract separates scheduling from provider-specific execution.
 - The Worker CLI is separate from the VS Code extension runtime so automatic runs do not depend on editor uptime.
+
+The implementation keeps two stable external seams: `ScheduleLifecycle` for scheduler behavior and `EditorControlSurface` for editor behavior. Cohesive internal modules own the complexity behind them:
+
+- `ScheduleDefinition`, `ScheduleFile`, `RecurrencePolicy`, `RecurrenceReducer`, `RunCoordinator`, and `ScheduleProjection` own lifecycle policy without exposing new extension ports.
+- `ScheduleStore` exposes atomic domain operations implemented by the SQLite and in-memory adapters; callers do not coordinate whole-row writes or transaction ordering.
+- VS Code task execution, Local Scheduling preparation, message validation, rendering, panel lifecycle, and command/tree/controller orchestration live in separate modules below `vscodeExtensionAdapter`, which remains the composition surface.
+
+See [ADR-0052](./docs/adr/0052-own-schedule-lifecycle-rules-in-deep-internal-modules.md) for the ownership and dependency rules.
