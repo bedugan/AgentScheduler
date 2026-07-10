@@ -82,6 +82,10 @@ import {
   targetContextLabel,
   type ScheduleDetailRenderState,
 } from "./vscodeScheduleRenderers.js";
+import {
+  VsCodeSchedulePanelHost,
+  type SchedulePanelLike,
+} from "./vscodeSchedulePanelHost.js";
 export {
   renderRunHistoryDetailHtml,
   renderScheduleDetailWebviewHtml,
@@ -1156,8 +1160,7 @@ class VsCodeScheduleCommandController {
     | undefined;
   private readonly localSchedulingSetupAvailability:
     | VsCodeSchedulerServices["localSchedulingSetupAvailability"];
-  private readonly scheduleDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
-  private readonly runHistoryDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
+  private readonly panelHost: VsCodeSchedulePanelHost;
 
   constructor(options: VsCodeScheduleCommandControllerOptions) {
     this.context = options.context;
@@ -1171,9 +1174,44 @@ class VsCodeScheduleCommandController {
     this.languageModelToolResultFactory = options.languageModelToolResultFactory;
     this.localSchedulingSetupAvailability =
       options.services.localSchedulingSetupAvailability;
+    this.panelHost = new VsCodeSchedulePanelHost({
+      subscriptions: this.context.subscriptions,
+      createPanel: (...args) => this.window.createWebviewPanel(...args),
+      viewColumn: this.viewColumn,
+      scheduleViewType: SCHEDULE_DETAIL_VIEW_TYPE,
+      runHistoryViewType: RUN_HISTORY_DETAIL_VIEW_TYPE,
+      scheduleTitle: scheduleDetailTitle,
+      renderSchedule: async (detail, state = {}) => {
+        const modelOptions = await this.listScheduleModelOptions(
+          detail.schedule.harnessMode,
+        );
+        return renderScheduleDetailWebviewHtml(detail, {
+          ...state,
+          modelOptions,
+          modelCatalogAvailable: this.modelCatalog !== undefined,
+          ...(this.localSchedulingSetupAvailability && {
+            localSchedulingSetupAvailability:
+              this.localSchedulingSetupAvailability,
+          }),
+        });
+      },
+      renderRunHistory: renderRunHistoryDetailHtml,
+      loadSchedule: (id) => this.editor.openScheduleDetail(id),
+      loadRunHistory: (id) => {
+        if (!this.editor.openRunHistoryDetail) {
+          throw new Error("Run History Detail is not configured.");
+        }
+        return this.editor.openRunHistoryDetail(id);
+      },
+      onScheduleMessage: (panel, message) =>
+        this.handleScheduleDetailWebviewMessage(panel, message),
+      onRunHistoryMessage: (panel, runId, message) =>
+        this.handleRunHistoryMessage(panel, runId, message),
+      showError: (message) => this.window.showErrorMessage?.(message),
+    });
     const modelRefreshSubscription = this.modelCatalog?.onDidChangeScheduleModels?.(
       () => {
-        void this.refreshOpenScheduleDetailPanels();
+        void this.panelHost.refreshSchedules();
       },
     );
     if (modelRefreshSubscription) {
@@ -1197,7 +1235,7 @@ class VsCodeScheduleCommandController {
           defaultHarnessMode,
         ),
       );
-      await this.openScheduleDetailPanel(detail);
+      await this.panelHost.openSchedule(detail);
       this.refreshScheduleTree();
       return detail;
     });
@@ -1205,23 +1243,7 @@ class VsCodeScheduleCommandController {
 
   async refreshExternalState(): Promise<void> {
     this.refreshScheduleTree();
-    await Promise.all([
-      this.refreshOpenScheduleDetailPanels(),
-      ...[...this.runHistoryDetailPanels.entries()].map(
-        async ([runId, panel]) => {
-          if (!this.editor.openRunHistoryDetail) {
-            return;
-          }
-          try {
-            panel.webview.html = renderRunHistoryDetailHtml(
-              await this.editor.openRunHistoryDetail(runId),
-            );
-          } catch {
-            this.runHistoryDetailPanels.delete(runId);
-          }
-        },
-      ),
-    ]);
+    await this.panelHost.refreshAll();
   }
 
   async openSchedule(scheduleId: unknown): Promise<ScheduleDetailView | undefined> {
@@ -1235,7 +1257,7 @@ class VsCodeScheduleCommandController {
       }
 
       const detail = await this.editor.openScheduleDetail(selectedScheduleId);
-      await this.openScheduleDetailPanel(detail);
+      await this.panelHost.openSchedule(detail);
       return detail;
     });
   }
@@ -1293,39 +1315,6 @@ class VsCodeScheduleCommandController {
     });
   }
 
-  private async openScheduleDetailPanel(detail: ScheduleDetailView): Promise<void> {
-    const existingPanel = this.scheduleDetailPanels.get(detail.schedule.id);
-    if (existingPanel) {
-      existingPanel.reveal?.(this.viewColumn);
-      await this.renderScheduleDetailPanel(existingPanel, detail);
-      return;
-    }
-
-    const panel = this.window.createWebviewPanel(
-      SCHEDULE_DETAIL_VIEW_TYPE,
-      scheduleDetailTitle(detail),
-      this.viewColumn,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-      },
-    );
-    this.scheduleDetailPanels.set(detail.schedule.id, panel);
-    await this.renderScheduleDetailPanel(panel, detail);
-    const disposeSubscription = panel.onDidDispose?.(() => {
-      this.scheduleDetailPanels.delete(detail.schedule.id);
-    });
-    if (disposeSubscription) {
-      this.context.subscriptions.push(disposeSubscription);
-    }
-    const messageSubscription = panel.webview.onDidReceiveMessage?.((message) =>
-      this.handleScheduleDetailWebviewMessage(panel, message),
-    );
-    if (messageSubscription) {
-      this.context.subscriptions.push(messageSubscription);
-    }
-  }
-
   private async pickScheduleId(): Promise<string | undefined> {
     const schedules = await this.editor.listSchedules();
     if (schedules.length === 0) {
@@ -1345,28 +1334,8 @@ class VsCodeScheduleCommandController {
     return picked?.scheduleId;
   }
 
-  private async renderScheduleDetailPanel(
-    panel: VsCodeWebviewPanelLike,
-    detail: ScheduleDetailView,
-    state: ScheduleDetailRenderState = {},
-  ): Promise<void> {
-    panel.title = scheduleDetailTitle(detail);
-    const modelOptions = await this.listScheduleModelOptions(
-      detail.schedule.harnessMode,
-    );
-    panel.webview.html = renderScheduleDetailWebviewHtml(detail, {
-      ...state,
-      modelOptions,
-      modelCatalogAvailable: this.modelCatalog !== undefined,
-      ...(this.localSchedulingSetupAvailability && {
-        localSchedulingSetupAvailability:
-          this.localSchedulingSetupAvailability,
-      }),
-    });
-  }
-
   private async handleScheduleDetailWebviewMessage(
-    panel: VsCodeWebviewPanelLike,
+    panel: SchedulePanelLike,
     rawMessage: unknown,
   ): Promise<void> {
     if (
@@ -1375,7 +1344,7 @@ class VsCodeScheduleCommandController {
       (rawMessage as { type?: unknown }).type === "open-run-history" &&
       typeof (rawMessage as { runId?: unknown }).runId === "string"
     ) {
-      await this.openRunHistoryDetailPanel(
+      await this.panelHost.openRunHistory(
         (rawMessage as { runId: string }).runId,
       );
       return;
@@ -1388,7 +1357,7 @@ class VsCodeScheduleCommandController {
     try {
       if (isLocalSchedulingWebviewAction(message.type)) {
         await this.runLocalSchedulingAction(message.type);
-        await this.refreshOpenScheduleDetailPanels();
+        await this.panelHost.refreshSchedules();
         this.refreshScheduleTree();
         return;
       }
@@ -1409,10 +1378,10 @@ class VsCodeScheduleCommandController {
               message.type as ScheduleDetailActionKind,
               "fields" in message ? message.fields : undefined,
             );
-      await this.renderScheduleDetailPanel(panel, detail);
+      await this.panelHost.renderSchedule(panel, detail);
       this.refreshScheduleTree();
     } catch (error) {
-      await this.renderScheduleDetailError(
+      await this.panelHost.renderError(
         panel,
         message.scheduleId,
         errorMessageFor(error),
@@ -1463,46 +1432,27 @@ class VsCodeScheduleCommandController {
     }
   }
 
-  private async openRunHistoryDetailPanel(runId: string): Promise<void> {
-    if (!this.editor.openRunHistoryDetail) {
-      throw new Error("Run History Detail is not configured.");
-    }
-    const detail = await this.editor.openRunHistoryDetail(runId);
-    const existing = this.runHistoryDetailPanels.get(runId);
-    if (existing) {
-      existing.reveal?.(this.viewColumn);
-      existing.webview.html = renderRunHistoryDetailHtml(detail);
+  private async handleRunHistoryMessage(
+    panel: SchedulePanelLike,
+    runId: string,
+    message: unknown,
+  ): Promise<void> {
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      typeof (message as { action?: unknown }).action !== "string"
+    ) {
       return;
     }
-    const panel = this.window.createWebviewPanel(
-      RUN_HISTORY_DETAIL_VIEW_TYPE,
-      `Run ${runId}`,
-      this.viewColumn,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    panel.webview.html = renderRunHistoryDetailHtml(detail);
-    this.runHistoryDetailPanels.set(runId, panel);
-    panel.onDidDispose?.(() => this.runHistoryDetailPanels.delete(runId));
-    panel.webview.onDidReceiveMessage?.(async (message) => {
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        typeof (message as { action?: unknown }).action !== "string"
-      ) {
-        return;
-      }
-      const action = (message as { action: string }).action;
-      if (action === "cancel" && this.editor.cancelRun) {
-        await this.editor.cancelRun(runId);
-      } else if (action === "open" && this.editor.openRun) {
-        await this.editor.openRun(runId);
-      }
-      panel.webview.html = renderRunHistoryDetailHtml(
-        await this.editor.openRunHistoryDetail!(runId),
-      );
-      this.refreshScheduleTree();
-      await this.refreshOpenScheduleDetailPanels();
-    });
+    const action = (message as { action: string }).action;
+    if (action === "cancel" && this.editor.cancelRun) {
+      await this.editor.cancelRun(runId);
+    } else if (action === "open" && this.editor.openRun) {
+      await this.editor.openRun(runId);
+    }
+    await this.panelHost.refreshRunHistoryPanel(panel, runId);
+    this.refreshScheduleTree();
+    await this.panelHost.refreshSchedules();
   }
 
   private async runScheduleDetailAction(
@@ -1555,7 +1505,7 @@ class VsCodeScheduleCommandController {
           ? await this.scheduleCreationFlow.handleChatParticipantRequest(input)
           : await this.scheduleCreationFlow.executeSlashCommand(input);
     const detail = await this.editor.openScheduleDetail(result.schedule.id);
-    await this.openScheduleDetailPanel(detail);
+    await this.panelHost.openSchedule(detail);
     this.refreshScheduleTree();
     return result;
   }
@@ -1579,19 +1529,6 @@ class VsCodeScheduleCommandController {
       : undefined;
   }
 
-  private async renderScheduleDetailError(
-    panel: VsCodeWebviewPanelLike,
-    scheduleId: string,
-    errorMessage: string,
-  ): Promise<void> {
-    try {
-      const detail = await this.editor.openScheduleDetail(scheduleId);
-      await this.renderScheduleDetailPanel(panel, detail, { errorMessage });
-    } catch {
-      await this.window.showErrorMessage?.(`AgentScheduler: ${errorMessage}`);
-    }
-  }
-
   private async confirmAndDeleteSchedule(scheduleId: string): Promise<void> {
     const confirmed = await this.confirmScheduleDeletion(scheduleId);
     if (!confirmed) {
@@ -1599,8 +1536,7 @@ class VsCodeScheduleCommandController {
     }
 
     await this.editor.deleteSchedule(scheduleId);
-    this.scheduleDetailPanels.get(scheduleId)?.dispose?.();
-    this.scheduleDetailPanels.delete(scheduleId);
+    this.panelHost.disposeSchedule(scheduleId);
     this.refreshScheduleTree();
   }
 
@@ -1645,19 +1581,6 @@ class VsCodeScheduleCommandController {
     if (!isScheduleModelAvailable(detail.schedule.model, modelOptions)) {
       throw new Error(unavailableScheduleModelMessage(detail.schedule.model));
     }
-  }
-
-  private async refreshOpenScheduleDetailPanels(): Promise<void> {
-    await Promise.all(
-      [...this.scheduleDetailPanels.entries()].map(async ([scheduleId, panel]) => {
-        try {
-          const detail = await this.editor.openScheduleDetail(scheduleId);
-          await this.renderScheduleDetailPanel(panel, detail);
-        } catch {
-          this.scheduleDetailPanels.delete(scheduleId);
-        }
-      }),
-    );
   }
 
   private async runCommand<T>(command: () => Promise<T>): Promise<T> {
