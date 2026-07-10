@@ -2287,6 +2287,91 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.equal((await store.getRunHistoryEntry(run.id))?.status, "running");
   });
 
+  it("recovers after a recovery worker crashes between claim and terminalization", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-claim-crash-"));
+    const databasePath = join(directory, "schedules.sqlite");
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const crashedStore = new SqliteScheduleStore({ databasePath });
+    const crashedWorker = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      executionOwnerId: "worker:crashed",
+      localSchedulingEnabled: false,
+      store: crashedStore,
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          startResult: {
+            externalRunId: "process:crashed-reconciler",
+            status: "running",
+            completedAt: null,
+            summary: "Process is running.",
+          },
+        }),
+      ],
+    });
+    let replacementStore: SqliteScheduleStore | undefined;
+    let crashedStoreOpen = true;
+    try {
+      const schedule = await crashedWorker.createDraftSchedule({
+        runInstructions: "Recover after a crashed recovery worker.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: {
+          type: "workspace",
+          uri: "file:///tmp/recovery-crash",
+        },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "bypass-approvals",
+      });
+      const run = await crashedWorker.startManualRun(schedule.id);
+      const execution = (await crashedStore.getLocalRunExecution(run.id))!;
+      await crashedStore.saveLocalRunExecution({
+        ...execution,
+        capabilities: { ...execution.capabilities, heartbeat: true },
+        leaseExpiresAt: "2026-07-07T16:04:59.000Z",
+      });
+      assert.equal(
+        await crashedStore.claimExpiredExecution({
+          runId: run.id,
+          observedHeartbeatAt: execution.heartbeatAt,
+          observedLeaseExpiresAt: "2026-07-07T16:04:59.000Z",
+          claimedAt: "2026-07-07T16:05:00.000Z",
+        }),
+        true,
+      );
+      crashedStore.close();
+      crashedStoreOpen = false;
+
+      replacementStore = new SqliteScheduleStore({ databasePath });
+      const replacementWorker = new ScheduleLifecycle({
+        clock,
+        executionOwnerId: "worker:replacement",
+        localSchedulingEnabled: false,
+        store: replacementStore,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      clock.set("2026-07-07T16:06:59.000Z");
+      await replacementWorker.scanDueWork();
+      assert.equal(
+        (await replacementStore.getRunHistoryEntry(run.id))?.status,
+        "running",
+      );
+
+      clock.set("2026-07-07T16:07:00.000Z");
+      await replacementWorker.scanDueWork();
+      const recovered = await replacementStore.getRunHistoryEntry(run.id);
+      assert.equal(recovered?.status, "failed");
+      assert.match(recovered?.error ?? "", /lease expired/);
+    } finally {
+      replacementStore?.close();
+      if (crashedStoreOpen) {
+        crashedStore.close();
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("applies one terminal recovery when two reconcilers claim the same expired lease", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-reconcile-"));
     const databasePath = join(directory, "schedules.sqlite");

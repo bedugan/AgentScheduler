@@ -34,8 +34,11 @@ import {
   type ScheduleRunStateUpdate,
   type ScheduleStore,
 } from "./store.js";
-import type { LocalRunExecution } from "./localRunExecution.js";
-import type { ExpiredExecutionClaim } from "./localRunExecution.js";
+import {
+  RECOVERY_CLAIM_LEASE_MS,
+  type ExpiredExecutionClaim,
+  type LocalRunExecution,
+} from "./localRunExecution.js";
 
 export class FakeClock implements Clock {
   private current: Date;
@@ -175,7 +178,10 @@ export class InMemoryScheduleStore implements ScheduleStore {
       return true;
     }
     if (
-      execution.recoveryClaimedAt ||
+      (execution.recoveryClaimedAt &&
+        new Date(execution.recoveryClaimedAt).getTime() +
+          RECOVERY_CLAIM_LEASE_MS >
+          new Date(claim.claimedAt).getTime()) ||
       execution.heartbeatAt !== claim.observedHeartbeatAt ||
       execution.leaseExpiresAt !== claim.observedLeaseExpiresAt ||
       execution.leaseExpiresAt > claim.claimedAt

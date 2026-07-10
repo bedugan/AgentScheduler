@@ -856,6 +856,7 @@ export function createDefaultVsCodeSchedulerServices(
     }),
     lifecycle,
     localSchedulingSetupAvailability: { available: true },
+    dataVersion: () => store.dataVersion(),
     close: () => store.close(),
   };
 }

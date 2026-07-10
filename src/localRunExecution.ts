@@ -3,6 +3,7 @@ import type { IsoTimestamp } from "./domain.js";
 export const LOCAL_RUN_LEASE_MS = 2 * 60 * 1_000;
 export const LOCAL_RUN_HEARTBEAT_MS = 30 * 1_000;
 export const LEGACY_ACTIVE_RUN_GRACE_MS = LOCAL_RUN_LEASE_MS;
+export const RECOVERY_CLAIM_LEASE_MS = LOCAL_RUN_LEASE_MS;
 export const NON_HEARTBEATING_RUN_LEASE_MS = 24 * 60 * 60 * 1_000;
 
 export interface LocalRunExecutionCapabilities {

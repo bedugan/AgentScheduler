@@ -19,6 +19,7 @@ import type {
   ExpiredExecutionClaim,
   LocalRunExecution,
 } from "./localRunExecution.js";
+import { RECOVERY_CLAIM_LEASE_MS } from "./localRunExecution.js";
 import {
   defaultLocalSchedulingSetupState,
   type LocalSchedulingSetupState,
@@ -363,6 +364,9 @@ export class SqliteScheduleStore
         });
         claimed = Number(result.changes) === 1;
       } else {
+        const claimExpiredBefore = new Date(
+          new Date(claim.claimedAt).getTime() - RECOVERY_CLAIM_LEASE_MS,
+        ).toISOString();
         const result = this.database.prepare(`
           UPDATE local_run_executions
           SET recovery_claimed_at = $claimed_at
@@ -370,7 +374,10 @@ export class SqliteScheduleStore
             AND heartbeat_at = $heartbeat_at
             AND lease_expires_at = $lease_expires_at
             AND lease_expires_at <= $claimed_at
-            AND recovery_claimed_at IS NULL
+            AND (
+              recovery_claimed_at IS NULL
+              OR recovery_claimed_at <= $claim_expired_before
+            )
             AND EXISTS (
               SELECT 1 FROM run_history
               WHERE id = $run_id
@@ -382,6 +389,7 @@ export class SqliteScheduleStore
           heartbeat_at: claim.observedHeartbeatAt,
           lease_expires_at: claim.observedLeaseExpiresAt,
           claimed_at: claim.claimedAt,
+          claim_expired_before: claimExpiredBefore,
         });
         claimed = Number(result.changes) === 1;
       }

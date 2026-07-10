@@ -790,6 +790,7 @@ describe("VS Code extension adapter", () => {
     );
 
     try {
+      assert.equal(typeof services.dataVersion, "function");
       const intent = services.editor.previewEnableLocalScheduling?.();
       assert.match(
         intent?.workerCommand ?? "",
