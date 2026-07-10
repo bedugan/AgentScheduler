@@ -41,16 +41,29 @@ Typecheck without writing build output:
 npm run typecheck
 ```
 
+Package an installable VSIX from the current commit:
+
+```sh
+npm run package:vsix
+```
+
+The package command keeps the source `package.json` and `package-lock.json`
+unchanged. It embeds a commit-qualified version such as `0.1.0+8d0588a` in
+both VSIX manifests and writes a filename such as
+`agent-scheduler-0.1.0-8d0588a.vsix`. The commit suffix identifies the exact
+smoke-test build even while the source release version remains `0.1.0`.
+
+Verify the packaging invariants or run the packaged Worker smoke test with:
+
+```sh
+npm run test:package-vsix
+npm run test:vsix-smoke
+```
+
 Run the test suite:
 
 ```sh
 npm test
-```
-
-Create a local VSIX package:
-
-```sh
-npx @vscode/vsce package
 ```
 
 Install the generated VSIX from VS Code with `Extensions: Install from VSIX...`, or with the VS Code CLI:

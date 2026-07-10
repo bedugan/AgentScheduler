@@ -2,37 +2,26 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   createWriteStream,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import yauzl from "yauzl";
-
-const localVsce = resolve("node_modules", "@vscode", "vsce", "vsce");
-const vsce = process.env.VSCE_PATH ?? (existsSync(localVsce) ? localVsce : undefined);
-if (!vsce) {
-  throw new Error("VSCE_PATH must point to a vsce executable when @vscode/vsce is not installed locally.");
-}
+import { packageVsix } from "./packageVsix.mjs";
 
 const tempDirectory = mkdtempSync(join(tmpdir(), "agent-scheduler-vsix-smoke-"));
-const vsixPath = join(tempDirectory, "agent-scheduler-smoke.vsix");
 const extractedPath = join(tempDirectory, "extracted");
 
 try {
-  const vsceCommand = process.env.VSCE_PATH ? vsce : process.execPath;
-  const vsceArgs = process.env.VSCE_PATH
-    ? ["package", "-o", vsixPath]
-    : [vsce, "package", "-o", vsixPath];
-  execFileSync(vsceCommand, vsceArgs, {
-    cwd: process.cwd(),
-    stdio: "pipe",
-  });
+  const packaged = await packageVsix({ outputDirectory: tempDirectory });
+  const vsixPath = packaged.vsixPath;
+  assert.equal(packaged.embeddedPackageVersion, packaged.version);
+  assert.equal(packaged.embeddedManifestVersion, packaged.version);
   await extractZip(vsixPath, extractedPath);
   const workerPath = realpathSync(
     join(extractedPath, "extension", "dist", "src", "workerCli.js"),
