@@ -19,6 +19,14 @@ export type ActiveRunReservationResult =
 export interface ScheduleRunStateUpdate {
   scheduleId: string;
   expectedRevision: number;
+  expectedState: {
+    status: ScheduleStatus;
+    enabled: boolean;
+    runCounter: RunCounter;
+    nextRunAt: IsoTimestamp | null;
+    lastRunAt: IsoTimestamp | null;
+    updatedAt: IsoTimestamp;
+  };
   status: ScheduleStatus;
   enabled: boolean;
   runCounter: RunCounter;

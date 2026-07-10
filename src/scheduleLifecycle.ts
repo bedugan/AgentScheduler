@@ -1042,6 +1042,12 @@ export class ScheduleLifecycle {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const currentSchedule = await this.requireSchedule(schedule.id);
       const completedAt = run.completedAt ?? run.startedAt;
+      const recurrenceAnchor = new Date(
+        Math.max(
+          new Date(completedAt).getTime(),
+          this.clock.now().getTime(),
+        ),
+      );
       const nextRunCounter = { ...currentSchedule.runCounter };
       let nextStatus = currentSchedule.status;
       let nextEnabled = currentSchedule.enabled;
@@ -1075,7 +1081,7 @@ export class ScheduleLifecycle {
         ) {
           nextRunAt = pendingDeferredRun
             ? currentSchedule.nextRunAt
-            : nextRunAtAfter(currentSchedule.cadence, new Date(completedAt));
+            : nextRunAtAfter(currentSchedule.cadence, recurrenceAnchor);
         } else if (
           trigger === "automatic" &&
           currentSchedule.status === "active" &&
@@ -1084,7 +1090,7 @@ export class ScheduleLifecycle {
         ) {
           nextRunAt = nextRunAtAfter(
             currentSchedule.cadence,
-            new Date(completedAt),
+            recurrenceAnchor,
           );
         }
       }
@@ -1092,6 +1098,14 @@ export class ScheduleLifecycle {
       const commit = await this.store.commitRunResult(run, {
         scheduleId: currentSchedule.id,
         expectedRevision: currentSchedule.revision,
+        expectedState: {
+          status: currentSchedule.status,
+          enabled: currentSchedule.enabled,
+          runCounter: currentSchedule.runCounter,
+          nextRunAt: currentSchedule.nextRunAt,
+          lastRunAt: currentSchedule.lastRunAt,
+          updatedAt: currentSchedule.updatedAt,
+        },
         status: nextStatus,
         enabled: nextEnabled,
         runCounter: nextRunCounter,

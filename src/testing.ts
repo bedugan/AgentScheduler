@@ -121,7 +121,17 @@ export class InMemoryScheduleStore implements ScheduleStore {
     scheduleUpdate: ScheduleRunStateUpdate,
   ): Promise<RunResultCommit> {
     const schedule = this.schedules.get(scheduleUpdate.scheduleId);
-    if (!schedule || schedule.revision !== scheduleUpdate.expectedRevision) {
+    if (
+      !schedule ||
+      schedule.revision !== scheduleUpdate.expectedRevision ||
+      schedule.status !== scheduleUpdate.expectedState.status ||
+      schedule.enabled !== scheduleUpdate.expectedState.enabled ||
+      JSON.stringify(schedule.runCounter) !==
+        JSON.stringify(scheduleUpdate.expectedState.runCounter) ||
+      schedule.nextRunAt !== scheduleUpdate.expectedState.nextRunAt ||
+      schedule.lastRunAt !== scheduleUpdate.expectedState.lastRunAt ||
+      schedule.updatedAt !== scheduleUpdate.expectedState.updatedAt
+    ) {
       return { committed: false };
     }
 

@@ -326,10 +326,24 @@ export class SqliteScheduleStore
               updated_at = $updated_at
           WHERE id = $id
             AND revision = $expected_revision
+            AND status = $expected_status
+            AND enabled = $expected_enabled
+            AND run_counter_json = $expected_run_counter_json
+            AND next_run_at IS $expected_next_run_at
+            AND last_run_at IS $expected_last_run_at
+            AND updated_at = $expected_updated_at
         `)
         .run({
           id: scheduleUpdate.scheduleId,
           expected_revision: scheduleUpdate.expectedRevision,
+          expected_status: scheduleUpdate.expectedState.status,
+          expected_enabled: scheduleUpdate.expectedState.enabled ? 1 : 0,
+          expected_run_counter_json: JSON.stringify(
+            scheduleUpdate.expectedState.runCounter,
+          ),
+          expected_next_run_at: scheduleUpdate.expectedState.nextRunAt,
+          expected_last_run_at: scheduleUpdate.expectedState.lastRunAt,
+          expected_updated_at: scheduleUpdate.expectedState.updatedAt,
           status: scheduleUpdate.status,
           enabled: scheduleUpdate.enabled ? 1 : 0,
           run_counter_json: JSON.stringify(scheduleUpdate.runCounter),
