@@ -29,6 +29,7 @@ import type {
   HarnessStartRequest,
   HarnessStartResult,
   HarnessExecutionObserver,
+  RunHistoryEntry,
   Schedule,
 } from "../src/index.js";
 import {
@@ -586,6 +587,82 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     );
     clock.set("2026-07-07T17:00:00.000Z");
     assert.deepEqual((await lifecycle.scanDueWork()).startedRunIds, []);
+  });
+
+  it("does not delete when another SQLite connection reserves a run at the delete boundary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-delete-race-"));
+    const databasePath = join(directory, "schedules.sqlite");
+    const racingStore = new SqliteScheduleStore({ databasePath });
+    let activeRun!: RunHistoryEntry;
+    class DeleteBoundaryStore extends SqliteScheduleStore {
+      override async deleteScheduleIfIdle(
+        scheduleId: string,
+      ): Promise<"deleted" | "active-run" | "not-found"> {
+        await racingStore.reserveActiveRun(activeRun);
+        const atomicDelete = (
+          SqliteScheduleStore.prototype as unknown as {
+            deleteScheduleIfIdle(
+              id: string,
+            ): Promise<"deleted" | "active-run" | "not-found">;
+          }
+        ).deleteScheduleIfIdle;
+        return atomicDelete.call(this, scheduleId);
+      }
+    }
+    const deletingStore = new DeleteBoundaryStore({ databasePath });
+    try {
+      const lifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store: deletingStore,
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      });
+      const schedule = await lifecycle.createDraftSchedule({
+        runInstructions: "Keep this schedule while its run is active.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/delete-race" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "default-approvals",
+      });
+      activeRun = {
+        id: "run_delete_race",
+        scheduleId: schedule.id,
+        scheduleRevision: schedule.revision,
+        trigger: "manual",
+        status: "running",
+        startedAt: "2026-07-07T16:00:00.000Z",
+        completedAt: null,
+        runInstructionsSnapshot: schedule.runInstructions,
+        approvalModeSnapshot: schedule.approvalMode,
+        resolvedHarnessPolicy: {
+          harnessMode: schedule.harnessMode,
+          approvalMode: schedule.approvalMode,
+        },
+        harnessMode: schedule.harnessMode,
+        model: schedule.model,
+        executedModel: null,
+        targetContext: schedule.targetContext,
+        externalRunId: "execution:delete-race",
+        summary: "Running at the delete boundary.",
+        error: null,
+      };
+
+      await assert.rejects(
+        lifecycle.deleteSchedule(schedule.id),
+        /running or approval-waiting run/,
+      );
+      assert.ok(await deletingStore.getSchedule(schedule.id));
+      assert.equal(
+        (await racingStore.getRunHistoryEntry(activeRun.id))?.status,
+        "running",
+      );
+    } finally {
+      deletingStore.close();
+      racingStore.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("starts active schedules when their hourly cron cadence is due", async () => {

@@ -101,12 +101,24 @@ export class InMemoryScheduleStore implements ScheduleStore {
       .map((schedule) => cloneStoreValue(schedule));
   }
 
-  async deleteSchedule(id: string): Promise<void> {
+  async deleteScheduleIfIdle(
+    id: string,
+  ): Promise<"deleted" | "active-run" | "not-found"> {
+    if (!this.schedules.has(id)) {
+      return "not-found";
+    }
+    const hasActiveRun = (this.runHistory.get(id) ?? []).some(
+      (run) => isActiveRunStatus(run.status) && run.completedAt === null,
+    );
+    if (hasActiveRun) {
+      return "active-run";
+    }
     for (const run of this.runHistory.get(id) ?? []) {
       this.localRunExecutions.delete(run.id);
     }
     this.schedules.delete(id);
     this.runHistory.delete(id);
+    return "deleted";
   }
 
   async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {

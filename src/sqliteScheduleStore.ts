@@ -236,9 +236,31 @@ export class SqliteScheduleStore
     return rows.map((row) => this.scheduleFromRow(row));
   }
 
-  async deleteSchedule(id: string): Promise<void> {
+  async deleteScheduleIfIdle(
+    id: string,
+  ): Promise<"deleted" | "active-run" | "not-found"> {
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
+      const schedule = this.database
+        .prepare("SELECT 1 FROM schedules WHERE id = $id")
+        .get({ id });
+      if (!schedule) {
+        this.database.exec("COMMIT");
+        return "not-found";
+      }
+      const activeRun = this.database
+        .prepare(`
+          SELECT 1 FROM run_history
+          WHERE schedule_id = $schedule_id
+            AND status IN ('running', 'approval-waiting')
+            AND completed_at IS NULL
+          LIMIT 1
+        `)
+        .get({ schedule_id: id });
+      if (activeRun) {
+        this.database.exec("COMMIT");
+        return "active-run";
+      }
       this.database
         .prepare(`
           DELETE FROM local_run_executions
@@ -252,6 +274,7 @@ export class SqliteScheduleStore
         .prepare("DELETE FROM schedules WHERE id = $id")
         .run({ id });
       this.database.exec("COMMIT");
+      return "deleted";
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

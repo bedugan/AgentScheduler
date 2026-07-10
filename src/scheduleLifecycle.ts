@@ -244,17 +244,15 @@ export class ScheduleLifecycle {
   }
 
   async deleteSchedule(scheduleId: string): Promise<void> {
-    await this.requireSchedule(scheduleId);
-    const activeRun = (await this.store.listActiveRuns()).find(
-      (run) => run.scheduleId === scheduleId,
-    );
-    if (activeRun) {
+    const result = await this.store.deleteScheduleIfIdle(scheduleId);
+    if (result === "active-run") {
       throw new Error(
         "Schedule cannot be deleted while it has a running or approval-waiting run. Cancel or resolve the active run before deleting the schedule.",
       );
     }
-
-    await this.store.deleteSchedule(scheduleId);
+    if (result === "not-found") {
+      throw new Error(`Schedule '${scheduleId}' was not found.`);
+    }
   }
 
   async updateSchedule(

@@ -43,12 +43,17 @@ export type RunResultCommit =
   | { committed: true; applied: boolean }
   | { committed: false };
 
+export type DeleteScheduleIfIdleResult =
+  | "deleted"
+  | "active-run"
+  | "not-found";
+
 export interface ScheduleStore {
   saveSchedule(schedule: Schedule): Promise<void>;
   getSchedule(id: string): Promise<Schedule | undefined>;
   listSchedules(): Promise<Schedule[]>;
   listDueSchedules(now: IsoTimestamp): Promise<Schedule[]>;
-  deleteSchedule(id: string): Promise<void>;
+  deleteScheduleIfIdle(id: string): Promise<DeleteScheduleIfIdleResult>;
   saveRunHistory(entry: RunHistoryEntry): Promise<void>;
   commitRunResult(
     entry: RunHistoryEntry,
