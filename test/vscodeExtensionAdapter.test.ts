@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
@@ -9,6 +9,7 @@ import {
   LocalSchedulingSetup,
   MacOsLaunchdWakeupProvider,
   ScheduleLifecycle,
+  SqliteScheduleStore,
   type WakeupProvider,
   type WakeupTriggerOperation,
   type WakeupTriggerRequest,
@@ -380,7 +381,7 @@ describe("VS Code extension adapter", () => {
       const second = deployPackagedWorker(context);
 
       assert.deepEqual(second, first);
-      assert.match(first.fingerprint, /^[a-f0-9]{16}$/);
+      assert.match(first.fingerprint, /^[a-f0-9]{64}$/);
       assert.equal(first.workerPath.startsWith(globalStoragePath), true);
       await readFile(first.workerPath, "utf8");
       const marker = JSON.parse(
@@ -390,6 +391,11 @@ describe("VS Code extension adapter", () => {
         ),
       ) as { fingerprint: string };
       assert.equal(marker.fingerprint, first.fingerprint);
+
+      await writeFile(first.workerPath, "corrupted worker", "utf8");
+      const repaired = deployPackagedWorker(context);
+      assert.deepEqual(repaired, first);
+      assert.doesNotMatch(await readFile(repaired.workerPath, "utf8"), /corrupted worker/);
     } finally {
       await rm(globalStoragePath, { recursive: true, force: true });
     }
@@ -418,7 +424,7 @@ describe("VS Code extension adapter", () => {
       const intent = services.editor.previewEnableLocalScheduling?.();
       assert.match(
         intent?.workerCommand ?? "",
-        /[/\\]worker[/\\][a-f0-9]{16}[/\\]workerCli\.js/,
+        /[/\\]worker[/\\][a-f0-9]{64}[/\\]workerCli\.js/,
       );
       assert.equal(intent?.workerCommand.includes(SQLITE_LOCAL_STORE_FILENAME), true);
       await services.editor.enableLocalScheduling?.();
@@ -466,6 +472,19 @@ describe("VS Code extension adapter", () => {
 
   it("keeps editing available when Node exists but fails the worker capability probe", async () => {
     const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-node-"));
+    const seededStore = new SqliteScheduleStore({
+      databasePath: join(globalStoragePath, SQLITE_LOCAL_STORE_FILENAME),
+    });
+    await seededStore.saveLocalSchedulingSetup({
+      enabled: true,
+      platform: "windows",
+      triggerId: "com.bedugan.AgentScheduler.local-wakeup",
+      installedAt: "2026-07-07T16:00:00.000Z",
+      verifiedAt: null,
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    });
+    seededStore.close();
+    const provider = new TestWakeupProvider();
     const services = createDefaultVsCodeSchedulerServices(
       {
         globalStorageUri: { fsPath: globalStoragePath },
@@ -477,6 +496,7 @@ describe("VS Code extension adapter", () => {
         nodeExecutable: process.execPath,
         userId: 501,
         runtimeProbe: () => false,
+        provider,
       },
     );
 
@@ -487,6 +507,23 @@ describe("VS Code extension adapter", () => {
         /absolute Node\.js executable/,
       );
       assert.deepEqual(await services.editor.listSchedules(), []);
+      const draft = await services.editor.createDraftSchedule({
+        runInstructions: "Manage persisted setup after Node disappears.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/project" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "default-approvals",
+      });
+      assert.equal(draft.localScheduling.enabled, true);
+      assert.equal(services.localSchedulingSetupAvailability?.canManage, true);
+      await assert.rejects(
+        () => services.editor.enableLocalScheduling!(),
+        /absolute Node\.js executable/,
+      );
+      const disabled = await services.editor.disableLocalScheduling!();
+      assert.equal(disabled.state.enabled, false);
+      assert.deepEqual(provider.operations, ["uninstall"]);
     } finally {
       services.close?.();
       await rm(globalStoragePath, { recursive: true, force: true });
@@ -2218,6 +2255,26 @@ describe("VS Code extension adapter", () => {
       /data-action="enable-local-scheduling"[^>]*disabled/,
     );
     assert.match(unavailableHtml, /Install a supported Node\.js runtime/);
+
+    const manageableHtml = renderScheduleDetailWebviewHtml(
+      {
+        ...detail,
+        localScheduling: {
+          enabled: true,
+          automaticRuns: "active",
+          message: "Persisted setup is enabled.",
+        },
+      },
+      {
+        localSchedulingSetupAvailability: {
+          available: false,
+          canManage: true,
+          reason: "Node is unavailable; automatic runs may fail.",
+        },
+      },
+    );
+    assert.match(manageableHtml, /data-action="verify-local-scheduling"/);
+    assert.match(manageableHtml, /data-action="disable-local-scheduling"/);
 
     const enabledHtml = renderScheduleDetailWebviewHtml({
       ...detail,

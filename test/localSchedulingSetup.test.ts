@@ -27,6 +27,8 @@ import type {
   RunHistoryEntry,
   Schedule,
   WakeupProvider,
+  WakeupCommandRunner,
+  WakeupFileReader,
   WakeupTriggerIntent,
   WakeupTriggerOperation,
   WakeupTriggerRequest,
@@ -87,6 +89,7 @@ describe("local scheduling setup", () => {
       "/Query",
       "/TN",
       "AgentSchedulerLocalWakeup",
+      "/XML",
     ]);
     assert.deepEqual(uninstall.commands[0]?.args, [
       "/Delete",
@@ -94,6 +97,67 @@ describe("local scheduling setup", () => {
       "AgentSchedulerLocalWakeup",
       "/F",
     ]);
+  });
+
+  it("verifies the registered Windows task command, worker fingerprint, and store", async () => {
+    const request: WakeupTriggerRequest = {
+      triggerId: "AgentSchedulerLocalWakeup",
+      workerExecutable: "C:\\Program Files\\nodejs\\node.exe",
+      workerArguments: [
+        "C:\\globalStorage\\worker\\full-fingerprint\\workerCli.js",
+        "scan-due-work",
+        "--store",
+        "C:\\globalStorage\\agent-scheduler.sqlite",
+      ],
+      intervalMinutes: 5,
+    };
+    const matchingXml = `<Task><Triggers><CalendarTrigger><Repetition><Interval>PT5M</Interval></Repetition></CalendarTrigger></Triggers><Actions><Exec><Command>C:\\Program Files\\nodejs\\node.exe</Command><Arguments>C:\\globalStorage\\worker\\full-fingerprint\\workerCli.js scan-due-work --store C:\\globalStorage\\agent-scheduler.sqlite</Arguments></Exec></Actions></Task>`;
+    const matching = new WindowsTaskSchedulerWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(matchingXml),
+    });
+    const stale = new WindowsTaskSchedulerWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(
+        matchingXml.replace("full-fingerprint", "stale-fingerprint"),
+      ),
+    });
+
+    assert.equal((await matching.verify(request)).applied, true);
+    assert.equal((await stale.verify(request)).applied, false);
+  });
+
+  it("verifies launchd registration and exact generated plist configuration", async () => {
+    const request: WakeupTriggerRequest = {
+      triggerId: "com.bedugan.AgentScheduler.local-wakeup",
+      workerExecutable: "/opt/homebrew/bin/node",
+      workerArguments: [
+        "/global/worker/full-fingerprint/workerCli.js",
+        "scan-due-work",
+        "--store",
+        "/global/agent-scheduler.sqlite",
+      ],
+      intervalMinutes: 5,
+      launchdPlistPath:
+        "/Users/ada/Library/LaunchAgents/com.bedugan.AgentScheduler.local-wakeup.plist",
+      userId: 501,
+    };
+    const intent = new MacOsLaunchdWakeupProvider().intentFor("install", request);
+    const matching = new MacOsLaunchdWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(
+        `gui/501/${request.triggerId} = { active count = 0 }`,
+      ),
+      fileReader: new EvidenceFileReader(intent.files[0]!.contents),
+    });
+    const stale = new MacOsLaunchdWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(
+        `gui/501/${request.triggerId} = { active count = 0 }`,
+      ),
+      fileReader: new EvidenceFileReader(
+        intent.files[0]!.contents.replace("full-fingerprint", "stale-fingerprint"),
+      ),
+    });
+
+    assert.equal((await matching.verify(request)).applied, true);
+    assert.equal((await stale.verify(request)).applied, false);
   });
 
   it("generates macOS launchd install, verify, and uninstall intent after Windows support", () => {
@@ -990,6 +1054,22 @@ class RecordingWakeupProvider implements WakeupProvider {
   async uninstall(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
     this.uninstallRequests.push(structuredClone(request));
     return { intent: this.intentFor("uninstall", request), applied: true };
+  }
+}
+
+class EvidenceCommandRunner implements WakeupCommandRunner {
+  constructor(private readonly stdout: string) {}
+
+  async run() {
+    return { stdout: this.stdout, stderr: "" };
+  }
+}
+
+class EvidenceFileReader implements WakeupFileReader {
+  constructor(private readonly contents: string) {}
+
+  async read(): Promise<string> {
+    return this.contents;
   }
 }
 

@@ -19,6 +19,7 @@ import type { ScheduleLifecycle } from "./scheduleLifecycle.js";
 
 export interface EditorControlSurfaceOptions {
   localSchedulingSetup?: LocalSchedulingSetup;
+  enableLocalSchedulingUnavailableReason?: string;
   confirmEnableLocalScheduling?: (
     intent: WakeupTriggerIntent,
   ) => Promise<boolean>;
@@ -129,6 +130,9 @@ export class EditorControlSurface {
   }
 
   async enableLocalScheduling(): Promise<LocalSchedulingSetupResult> {
+    if (this.options.enableLocalSchedulingUnavailableReason) {
+      throw new Error(this.options.enableLocalSchedulingUnavailableReason);
+    }
     if (!this.options.localSchedulingSetup) {
       throw new Error("Local scheduling setup is not configured.");
     }

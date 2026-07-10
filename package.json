@@ -197,6 +197,7 @@
   "devDependencies": {
     "@types/node": "^26.1.0",
     "@vscode/vsce": "3.9.2",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "yauzl": "3.4.0"
   }
 }

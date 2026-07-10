@@ -6,6 +6,8 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -323,6 +325,7 @@ export interface VsCodeSchedulerServices {
   lifecycle?: ScheduleLifecycle;
   localSchedulingSetupAvailability?: {
     available: boolean;
+    canManage?: boolean;
     reason?: string;
   };
   close?(): void;
@@ -361,6 +364,7 @@ interface ScheduleDetailRenderState {
   modelCatalogAvailable?: boolean;
   localSchedulingSetupAvailability?: {
     available: boolean;
+    canManage?: boolean;
     reason?: string;
   };
 }
@@ -532,21 +536,44 @@ export function deployPackagedWorker(
   context: VsCodeInstalledExtensionContextLike,
 ): DeployedWorker {
   const sourceDirectory = join(context.extensionUri.fsPath, "dist", "src");
-  const fingerprint = fingerprintDirectory(sourceDirectory);
+  const manifest = workerManifestFor(sourceDirectory);
+  const fingerprint = manifest.fingerprint;
   const targetDirectory = join(
     context.globalStorageUri.fsPath,
     "worker",
     fingerprint,
   );
-  const deploymentMarker = join(targetDirectory, "deployment.json");
-  if (!existsSync(deploymentMarker)) {
-    mkdirSync(targetDirectory, { recursive: true });
-    cpSync(sourceDirectory, targetDirectory, { recursive: true });
-    writeFileSync(
-      deploymentMarker,
-      `${JSON.stringify({ fingerprint })}\n`,
-      "utf8",
-    );
+  if (!validWorkerDeployment(targetDirectory, manifest)) {
+    const suffix = `${process.pid}.${randomBytes(8).toString("hex")}`;
+    const temporaryDirectory = `${targetDirectory}.tmp.${suffix}`;
+    const corruptDirectory = `${targetDirectory}.corrupt.${suffix}`;
+    let movedCorruptDeployment = false;
+    try {
+      mkdirSync(temporaryDirectory, { recursive: true, mode: 0o700 });
+      cpSync(sourceDirectory, temporaryDirectory, { recursive: true });
+      writeFileSync(
+        join(temporaryDirectory, "deployment.json"),
+        `${JSON.stringify(manifest)}\n`,
+        { encoding: "utf8", mode: 0o600 },
+      );
+      if (!validWorkerDeployment(temporaryDirectory, manifest)) {
+        throw new Error("Deployed Worker failed manifest verification.");
+      }
+      if (existsSync(targetDirectory)) {
+        renameSync(targetDirectory, corruptDirectory);
+        movedCorruptDeployment = true;
+      }
+      renameSync(temporaryDirectory, targetDirectory);
+      rmSync(corruptDirectory, { recursive: true, force: true });
+      movedCorruptDeployment = false;
+    } catch (error) {
+      if (movedCorruptDeployment && !existsSync(targetDirectory)) {
+        renameSync(corruptDirectory, targetDirectory);
+      }
+      throw error;
+    } finally {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
   }
   return {
     workerPath: join(targetDirectory, "workerCli.js"),
@@ -554,22 +581,52 @@ export function deployPackagedWorker(
   };
 }
 
-function fingerprintDirectory(directory: string): string {
-  const hash = createHash("sha256");
+interface WorkerDeploymentManifest {
+  fingerprint: string;
+  files: Record<string, string>;
+}
+
+function workerManifestFor(directory: string): WorkerDeploymentManifest {
+  const files: Record<string, string> = {};
   const visit = (current: string): void => {
     for (const name of readdirSync(current).sort()) {
       const path = join(current, name);
       const stats = statSync(path);
       if (stats.isDirectory()) {
         visit(path);
-      } else if (name.endsWith(".js")) {
-        hash.update(path.slice(directory.length));
-        hash.update(readFileSync(path));
+      } else if (name !== "deployment.json") {
+        const relativePath = path.slice(directory.length + 1).replaceAll("\\", "/");
+        files[relativePath] = createHash("sha256")
+          .update(readFileSync(path))
+          .digest("hex");
       }
     }
   };
   visit(directory);
-  return hash.digest("hex").slice(0, 16);
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify(files))
+    .digest("hex");
+  return { fingerprint, files };
+}
+
+function validWorkerDeployment(
+  directory: string,
+  expected: WorkerDeploymentManifest,
+): boolean {
+  try {
+    const recorded = JSON.parse(
+      readFileSync(join(directory, "deployment.json"), "utf8"),
+    ) as WorkerDeploymentManifest;
+    const actual = workerManifestFor(directory);
+    return (
+      recorded.fingerprint === expected.fingerprint &&
+      JSON.stringify(recorded.files) === JSON.stringify(expected.files) &&
+      actual.fingerprint === expected.fingerprint &&
+      JSON.stringify(actual.files) === JSON.stringify(expected.files)
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function localSchedulingWakeupRequestForVsCode(
@@ -639,6 +696,13 @@ export function createDefaultVsCodeSchedulerServices(
     );
   }
   const deployedWorker = deployPackagedWorker(context);
+  const provider =
+    options.provider ??
+    (platform === "win32"
+      ? new WindowsTaskSchedulerWakeupProvider()
+      : new MacOsLaunchdWakeupProvider());
+  const userId =
+    platform === "darwin" ? options.userId ?? process.getuid?.() : undefined;
   const configuredNodeExecutable =
     options.nodeExecutable ?? process.env.AGENT_SCHEDULER_NODE_PATH;
   let nodeExecutable: string;
@@ -656,19 +720,24 @@ export function createDefaultVsCodeSchedulerServices(
       ...(options.userId !== undefined && { userId: options.userId }),
     });
   } catch (error) {
+    const managementRequest = localSchedulingWakeupRequestForVsCode(context, {
+      nodeExecutable: configuredNodeExecutable ?? process.execPath,
+      platform,
+      ...(userId !== undefined && { userId }),
+      ...(options.homeDirectory && { homeDirectory: options.homeDirectory }),
+      workerPath: deployedWorker.workerPath,
+    });
     return createUnavailableLocalSchedulingServices(
       context,
       `${errorMessageFor(error)} Schedule editing and Manual Run Now remain available.`,
       options.interactiveExecutor,
+      {
+        provider,
+        request: managementRequest,
+        window: options.window,
+      },
     );
   }
-  const provider =
-    options.provider ??
-    (platform === "win32"
-      ? new WindowsTaskSchedulerWakeupProvider()
-      : new MacOsLaunchdWakeupProvider());
-  const userId =
-    platform === "darwin" ? options.userId ?? process.getuid?.() : undefined;
   const request = localSchedulingWakeupRequestForVsCode(context, {
     nodeExecutable,
     platform,
@@ -713,10 +782,23 @@ function createUnavailableLocalSchedulingServices(
   context: VsCodeInstalledExtensionContextLike,
   reason: string,
   interactiveExecutor?: CopilotInteractiveExecutor,
+  management?: {
+    provider: WakeupProvider;
+    request: WakeupTriggerRequest;
+    window: VsCodeWindowLike;
+  },
 ): VsCodeSchedulerServices {
   const store = new SqliteScheduleStore({
     databasePath: sqliteLocalStorePath(context),
   });
+  const localSchedulingSetup = management
+    ? new LocalSchedulingSetup({
+        store,
+        provider: management.provider,
+        request: management.request,
+        clock: new SystemClock(),
+      })
+    : undefined;
   const lifecycle = new ScheduleLifecycle({
     store,
     harnesses: [
@@ -724,15 +806,32 @@ function createUnavailableLocalSchedulingServices(
         interactiveExecutor ? { interactiveExecutor } : {},
       ),
     ],
-    localSchedulingSetup: {
-      isLocalSchedulingEnabled: async () => false,
-      getLocalSchedulingSetupState: async () => store.getLocalSchedulingSetup(),
-    },
+    localSchedulingSetup:
+      localSchedulingSetup ?? {
+        isLocalSchedulingEnabled: async () =>
+          (await store.getLocalSchedulingSetup()).enabled,
+        getLocalSchedulingSetupState: async () =>
+          store.getLocalSchedulingSetup(),
+      },
   });
   return {
-    editor: new EditorControlSurface(lifecycle),
+    editor: new EditorControlSurface(
+      lifecycle,
+      localSchedulingSetup
+        ? {
+            localSchedulingSetup,
+            enableLocalSchedulingUnavailableReason: reason,
+            confirmEnableLocalScheduling: (intent) =>
+              confirmEnableLocalScheduling(management!.window, intent),
+          }
+        : {},
+    ),
     lifecycle,
-    localSchedulingSetupAvailability: { available: false, reason },
+    localSchedulingSetupAvailability: {
+      available: false,
+      canManage: localSchedulingSetup !== undefined,
+      reason,
+    },
     close: () => store.close(),
   };
 }
@@ -1298,6 +1397,12 @@ function renderLocalSchedulingActions(
     const reason = availability.reason
       ? ` title="${escapeHtml(availability.reason)}"`
       : "";
+    if (enabled && availability.canManage) {
+      return [
+        '<button type="button" data-action="verify-local-scheduling">Verify Local Scheduling</button>',
+        '<button type="button" data-action="disable-local-scheduling">Disable Local Scheduling</button>',
+      ].join("\n");
+    }
     return `<button type="button" data-action="enable-local-scheduling" disabled${reason}>Enable Local Scheduling</button>`;
   }
   return enabled

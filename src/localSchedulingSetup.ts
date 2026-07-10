@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { IsoTimestamp } from "./domain.js";
@@ -45,16 +45,26 @@ export interface WakeupTriggerResult {
 }
 
 export interface WakeupCommandRunner {
-  run(command: WakeupTriggerCommand): Promise<void>;
+  run(command: WakeupTriggerCommand): Promise<WakeupCommandResult | void>;
+}
+
+export interface WakeupCommandResult {
+  stdout: string;
+  stderr: string;
 }
 
 export interface WakeupFileWriter {
   write(file: WakeupTriggerFile): Promise<void>;
 }
 
+export interface WakeupFileReader {
+  read(path: string): Promise<string>;
+}
+
 export interface WakeupProviderOptions {
   commandRunner?: WakeupCommandRunner;
   fileWriter?: WakeupFileWriter;
+  fileReader?: WakeupFileReader;
 }
 
 export interface WakeupProvider {
@@ -224,8 +234,11 @@ export class WindowsTaskSchedulerWakeupProvider implements WakeupProvider {
 
   async verify(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
     const intent = this.intentFor("verify", request);
-    await applyWakeupIntent(intent, this.commandRunner);
-    return { intent, applied: true };
+    const evidence = await this.commandRunner.run(intent.commands[0]!);
+    return {
+      intent,
+      applied: windowsTaskMatchesRequest(evidence?.stdout ?? "", request),
+    };
   }
 
   async uninstall(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
@@ -251,10 +264,12 @@ export class MacOsLaunchdWakeupProvider implements WakeupProvider {
   readonly platform = "macos";
   private readonly commandRunner: WakeupCommandRunner;
   private readonly fileWriter: WakeupFileWriter;
+  private readonly fileReader: WakeupFileReader;
 
   constructor(options: WakeupProviderOptions = {}) {
     this.commandRunner = options.commandRunner ?? new NodeWakeupCommandRunner();
     this.fileWriter = options.fileWriter ?? new NodeWakeupFileWriter();
+    this.fileReader = options.fileReader ?? new NodeWakeupFileReader();
   }
 
   intentFor(
@@ -291,8 +306,21 @@ export class MacOsLaunchdWakeupProvider implements WakeupProvider {
 
   async verify(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
     const intent = this.intentFor("verify", request);
-    await applyWakeupIntent(intent, this.commandRunner, this.fileWriter);
-    return { intent, applied: true };
+    const evidence = await this.commandRunner.run(intent.commands[0]!);
+    let plistContents = "";
+    try {
+      plistContents = await this.fileReader.read(requireLaunchdPlistPath(request));
+    } catch {
+      return { intent, applied: false };
+    }
+    return {
+      intent,
+      applied:
+        (evidence?.stdout ?? "").includes(
+          `${launchdUserDomain(request)}/${request.triggerId}`,
+        ) &&
+        plistContents === launchdPlistFor(request),
+    };
   }
 
   async uninstall(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
@@ -368,7 +396,7 @@ function taskSchedulerArgsFor(
         "/F",
       ];
     case "verify":
-      return ["/Query", "/TN", request.triggerId];
+      return ["/Query", "/TN", request.triggerId, "/XML"];
     case "uninstall":
       return ["/Delete", "/TN", request.triggerId, "/F"];
   }
@@ -453,17 +481,69 @@ function quoteCommandPart(part: string): string {
   return `"${part.replaceAll('"', '\\"')}"`;
 }
 
+function windowsTaskMatchesRequest(
+  xml: string,
+  request: WakeupTriggerRequest,
+): boolean {
+  const command = xmlTagValue(xml, "Command");
+  const argumentsValue = xmlTagValue(xml, "Arguments");
+  if (!command) {
+    return false;
+  }
+  const actual = normalizeWindowsCommand(
+    [command, argumentsValue].filter(Boolean).join(" "),
+  );
+  const expected = normalizeWindowsCommand(
+    renderCommandLine([request.workerExecutable, ...request.workerArguments]),
+  );
+  return (
+    actual === expected &&
+    new RegExp(
+      `<Interval>PT${request.intervalMinutes}M</Interval>`,
+      "i",
+    ).test(xml)
+  );
+}
+
+function xmlTagValue(xml: string, tag: string): string {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i").exec(xml);
+  return decodeXml(match?.[1] ?? "").trim();
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+function normalizeWindowsCommand(value: string): string {
+  return value.replaceAll('"', "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 class NodeWakeupCommandRunner implements WakeupCommandRunner {
-  run(command: WakeupTriggerCommand): Promise<void> {
+  run(command: WakeupTriggerCommand): Promise<WakeupCommandResult> {
     return new Promise((resolve, reject) => {
       const child = spawn(command.executable, command.args, {
-        stdio: "ignore",
+        stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      child.stdout?.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr?.on("data", (chunk: string) => {
+        stderr += chunk;
       });
       child.on("error", reject);
       child.on("exit", (code) => {
         if (code === 0) {
-          resolve();
+          resolve({ stdout, stderr });
           return;
         }
 
@@ -474,6 +554,12 @@ class NodeWakeupCommandRunner implements WakeupCommandRunner {
         );
       });
     });
+  }
+}
+
+class NodeWakeupFileReader implements WakeupFileReader {
+  read(path: string): Promise<string> {
+    return readFile(path, "utf8");
   }
 }
 
