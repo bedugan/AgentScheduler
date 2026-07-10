@@ -587,15 +587,7 @@ export class ScheduleLifecycle {
         error:
           "Run cap has been reached. Restart the completed schedule before running again.",
       });
-      await this.store.saveRunHistory(blockedRun);
-      await this.store.saveSchedule({
-        ...schedule,
-        status: "completed",
-        enabled: false,
-        nextRunAt: null,
-        lastRunAt: requestedAt,
-        updatedAt: requestedAt,
-      });
+      await this.persistRunResult(schedule, blockedRun, trigger);
       return blockedRun;
     }
 

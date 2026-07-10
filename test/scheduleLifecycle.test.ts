@@ -1238,6 +1238,74 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual(detail.schedule.runCounter, { completed: 1, limit: null });
   });
 
+  it("atomically completes a schedule whose edited run cap is already reached", async () => {
+    class ConcurrentCapEditStore extends InMemoryScheduleStore {
+      private editPending = false;
+
+      armConcurrentEdit(): void {
+        this.editPending = true;
+      }
+
+      override async commitRunResult(
+        entry: Parameters<InMemoryScheduleStore["commitRunResult"]>[0],
+        scheduleUpdate: ScheduleRunStateUpdate,
+      ): Promise<RunResultCommit> {
+        if (this.editPending) {
+          this.editPending = false;
+          const schedule = await this.getSchedule(scheduleUpdate.scheduleId);
+          assert.ok(schedule);
+          await this.saveSchedule({
+            ...schedule,
+            revision: schedule.revision + 1,
+            runInstructions: "Preserve this concurrent cap edit.",
+          });
+        }
+        return super.commitRunResult(entry, scheduleUpdate);
+      }
+    }
+
+    const store = new ConcurrentCapEditStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Complete after the cap is lowered.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 2 },
+    });
+    await lifecycle.startManualRun(schedule.id);
+    await lifecycle.updateSchedule(schedule.id, { runCap: { maxRuns: 1 } });
+    store.armConcurrentEdit();
+
+    const blockedRun = await lifecycle.startManualRun(schedule.id);
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+
+    assert.equal(blockedRun.status, "blocked");
+    assert.equal(detail.schedule.status, "completed");
+    assert.equal(detail.schedule.enabled, false);
+    assert.equal(detail.schedule.nextRunAt, null);
+    assert.equal(
+      detail.schedule.runInstructions,
+      "Preserve this concurrent cap edit.",
+    );
+    assert.deepEqual(detail.schedule.runCounter, { completed: 1, limit: 1 });
+    assert.deepEqual(
+      detail.previousRuns.map((run) => run.status),
+      ["completed", "blocked"],
+    );
+  });
+
   it("uses the SQLite local store reservation to suppress duplicate Run Now starts across lifecycle instances", async () => {
     const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
     const databasePath = join(tempDirectory, "schedules.sqlite");
