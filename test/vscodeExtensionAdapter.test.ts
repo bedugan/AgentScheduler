@@ -190,7 +190,7 @@ describe("VS Code extension adapter", () => {
       },
     );
     try {
-      await worker.saveSchedule({
+      assert.equal(await worker.createSchedule({
         id: "schedule_worker_write",
         revision: 1,
         status: "draft",
@@ -206,7 +206,7 @@ describe("VS Code extension adapter", () => {
         lastRunAt: null,
         createdAt: "2026-07-07T16:00:00.000Z",
         updatedAt: "2026-07-07T16:00:00.000Z",
-      });
+      }), true);
 
       assert.equal(await monitor.poll(), true);
       assert.equal(refreshes, 1);

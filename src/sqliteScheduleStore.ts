@@ -130,10 +130,10 @@ export class SqliteScheduleStore
     return row?.data_version ?? 0;
   }
 
-  async saveSchedule(schedule: Schedule): Promise<void> {
-    this.database
+  async createSchedule(schedule: Schedule): Promise<boolean> {
+    const result = this.database
       .prepare(`
-        INSERT INTO schedules (
+        INSERT OR IGNORE INTO schedules (
           id,
           revision,
           status,
@@ -166,21 +166,6 @@ export class SqliteScheduleStore
           $created_at,
           $updated_at
         )
-        ON CONFLICT(id) DO UPDATE SET
-          revision = excluded.revision,
-          status = excluded.status,
-          enabled = excluded.enabled,
-          run_instructions = excluded.run_instructions,
-          cadence_json = excluded.cadence_json,
-          target_context_json = excluded.target_context_json,
-          harness_mode = excluded.harness_mode,
-          model = excluded.model,
-          approval_mode = excluded.approval_mode,
-          run_counter_json = excluded.run_counter_json,
-          next_run_at = excluded.next_run_at,
-          last_run_at = excluded.last_run_at,
-          created_at = excluded.created_at,
-          updated_at = excluded.updated_at
       `)
       .run({
         id: schedule.id,
@@ -199,6 +184,68 @@ export class SqliteScheduleStore
         created_at: schedule.createdAt,
         updated_at: schedule.updatedAt,
       });
+    return Number(result.changes) === 1;
+  }
+
+  async compareAndSaveSchedule(
+    expected: Schedule,
+    schedule: Schedule,
+  ): Promise<boolean> {
+    if (
+      schedule.id !== expected.id ||
+      schedule.createdAt !== expected.createdAt
+    ) {
+      return false;
+    }
+    const result = this.database
+      .prepare(`
+        UPDATE schedules
+        SET revision = $revision,
+            status = $status,
+            enabled = $enabled,
+            run_instructions = $run_instructions,
+            cadence_json = $cadence_json,
+            target_context_json = $target_context_json,
+            harness_mode = $harness_mode,
+            model = $model,
+            approval_mode = $approval_mode,
+            run_counter_json = $run_counter_json,
+            next_run_at = $next_run_at,
+            last_run_at = $last_run_at,
+            updated_at = $updated_at
+        WHERE id = $id
+          AND revision = $expected_revision
+          AND status = $expected_status
+          AND enabled = $expected_enabled
+          AND run_counter_json = $expected_run_counter_json
+          AND next_run_at IS $expected_next_run_at
+          AND last_run_at IS $expected_last_run_at
+          AND updated_at = $expected_updated_at
+      `)
+      .run({
+        id: expected.id,
+        expected_revision: expected.revision,
+        expected_status: expected.status,
+        expected_enabled: expected.enabled ? 1 : 0,
+        expected_run_counter_json: JSON.stringify(expected.runCounter),
+        expected_next_run_at: expected.nextRunAt,
+        expected_last_run_at: expected.lastRunAt,
+        expected_updated_at: expected.updatedAt,
+        revision: schedule.revision,
+        status: schedule.status,
+        enabled: schedule.enabled ? 1 : 0,
+        run_instructions: schedule.runInstructions,
+        cadence_json: JSON.stringify(schedule.cadence),
+        target_context_json: JSON.stringify(schedule.targetContext),
+        harness_mode: schedule.harnessMode ?? "",
+        model: schedule.model,
+        approval_mode: schedule.approvalMode,
+        run_counter_json: JSON.stringify(schedule.runCounter),
+        next_run_at: schedule.nextRunAt,
+        last_run_at: schedule.lastRunAt,
+        updated_at: schedule.updatedAt,
+      });
+    return Number(result.changes) === 1;
   }
 
   async getSchedule(id: string): Promise<Schedule | undefined> {

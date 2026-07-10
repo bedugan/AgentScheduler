@@ -122,7 +122,9 @@ export class ScheduleLifecycle {
     status: "draft" | "active",
   ): Promise<Schedule> {
     const schedule = this.scheduleDefinition.create(input, status, this.clock.now());
-    await this.store.saveSchedule(schedule);
+    if (!(await this.store.createSchedule(schedule))) {
+      throw new Error(`Schedule '${schedule.id}' already exists.`);
+    }
     return schedule;
   }
 
@@ -174,9 +176,7 @@ export class ScheduleLifecycle {
       options,
       this.nowIso(),
     );
-    for (const schedule of result.schedules) {
-      await this.store.saveSchedule(schedule);
-    }
+    await this.createImportedSchedules(result);
     return result;
   }
 
@@ -189,58 +189,48 @@ export class ScheduleLifecycle {
       options,
       this.nowIso(),
     );
-    for (const schedule of result.schedules) {
-      await this.store.saveSchedule(schedule);
-    }
+    await this.createImportedSchedules(result);
     return result;
   }
 
   async activateSchedule(scheduleId: string): Promise<Schedule> {
-    const schedule = await this.requireSchedule(scheduleId);
-    const activeSchedule = this.scheduleDefinition.transition(
-      schedule,
-      "activate",
-      this.clock.now(),
+    return this.applyScheduleDefinitionChange(
+      scheduleId,
+      (schedule) =>
+        this.scheduleDefinition.transition(
+          schedule,
+          "activate",
+          this.clock.now(),
+        ),
     );
-
-    await this.store.saveSchedule(activeSchedule);
-    return activeSchedule;
   }
 
   async pauseSchedule(scheduleId: string): Promise<Schedule> {
-    const schedule = await this.requireSchedule(scheduleId);
-    const pausedSchedule = this.scheduleDefinition.transition(
-      schedule,
-      "pause",
-      this.clock.now(),
+    return this.applyScheduleDefinitionChange(
+      scheduleId,
+      (schedule) =>
+        this.scheduleDefinition.transition(schedule, "pause", this.clock.now()),
     );
-
-    await this.store.saveSchedule(pausedSchedule);
-    return pausedSchedule;
   }
 
   async resumeSchedule(scheduleId: string): Promise<Schedule> {
-    const schedule = await this.requireSchedule(scheduleId);
-    const resumedSchedule = this.scheduleDefinition.transition(
-      schedule,
-      "resume",
-      this.clock.now(),
+    return this.applyScheduleDefinitionChange(
+      scheduleId,
+      (schedule) =>
+        this.scheduleDefinition.transition(schedule, "resume", this.clock.now()),
     );
-
-    await this.store.saveSchedule(resumedSchedule);
-    return resumedSchedule;
   }
 
   async restartCompletedSchedule(scheduleId: string): Promise<Schedule> {
-    const schedule = await this.requireSchedule(scheduleId);
-    const restartedSchedule = this.scheduleDefinition.transition(
-      schedule,
-      "restart",
-      this.clock.now(),
+    return this.applyScheduleDefinitionChange(
+      scheduleId,
+      (schedule) =>
+        this.scheduleDefinition.transition(
+          schedule,
+          "restart",
+          this.clock.now(),
+        ),
     );
-
-    await this.store.saveSchedule(restartedSchedule);
-    return restartedSchedule;
   }
 
   async deleteSchedule(scheduleId: string): Promise<void> {
@@ -259,15 +249,11 @@ export class ScheduleLifecycle {
     scheduleId: string,
     input: UpdateScheduleInput,
   ): Promise<Schedule> {
-    const schedule = await this.requireSchedule(scheduleId);
-    const nextSchedule = this.scheduleDefinition.update(
-      schedule,
-      input,
-      this.clock.now(),
+    return this.applyScheduleDefinitionChange(
+      scheduleId,
+      (schedule) =>
+        this.scheduleDefinition.update(schedule, input, this.clock.now()),
     );
-
-    await this.store.saveSchedule(nextSchedule);
-    return nextSchedule;
   }
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
@@ -341,6 +327,37 @@ export class ScheduleLifecycle {
       available,
       ...(!available && { reason: unavailableHarnessModeMessage(mode) }),
     };
+  }
+
+  private async createImportedSchedules(
+    result: ScheduleImportResult,
+  ): Promise<void> {
+    for (const schedule of result.schedules) {
+      if (!(await this.store.createSchedule(schedule))) {
+        throw new Error(
+          `Imported schedule id '${schedule.id}' already exists. No existing schedule was overwritten.`,
+        );
+      }
+    }
+  }
+
+  private async applyScheduleDefinitionChange(
+    scheduleId: string,
+    change: (schedule: Schedule) => Schedule,
+  ): Promise<Schedule> {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const current = await this.requireSchedule(scheduleId);
+      const next = change(current);
+      if (next === current) {
+        return current;
+      }
+      if (await this.store.compareAndSaveSchedule(current, next)) {
+        return next;
+      }
+    }
+    throw new Error(
+      `Schedule '${scheduleId}' changed repeatedly while AgentScheduler was saving its definition. Retry after concurrent changes settle.`,
+    );
   }
 
   private async requireSchedule(scheduleId: string): Promise<Schedule> {

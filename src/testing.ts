@@ -71,8 +71,30 @@ export class InMemoryScheduleStore implements ScheduleStore {
   private readonly runHistory = new Map<string, RunHistoryEntry[]>();
   private readonly localRunExecutions = new Map<string, LocalRunExecution>();
 
-  async saveSchedule(schedule: Schedule): Promise<void> {
+  async createSchedule(schedule: Schedule): Promise<boolean> {
+    if (this.schedules.has(schedule.id)) {
+      return false;
+    }
     this.schedules.set(schedule.id, cloneStoreValue(schedule));
+    return true;
+  }
+
+  async compareAndSaveSchedule(
+    expected: Schedule,
+    schedule: Schedule,
+  ): Promise<boolean> {
+    if (
+      schedule.id !== expected.id ||
+      schedule.createdAt !== expected.createdAt
+    ) {
+      return false;
+    }
+    const current = this.schedules.get(expected.id);
+    if (!current || !sameScheduleState(current, expected)) {
+      return false;
+    }
+    this.schedules.set(schedule.id, cloneStoreValue(schedule));
+    return true;
   }
 
   async getSchedule(id: string): Promise<Schedule | undefined> {
@@ -534,5 +556,18 @@ function sameRunSlot(left: RunHistoryEntry, right: RunHistoryEntry): boolean {
     left.harnessMode === right.harnessMode &&
     left.targetContext.type === right.targetContext.type &&
     left.targetContext.uri === right.targetContext.uri
+  );
+}
+
+function sameScheduleState(left: Schedule, right: Schedule): boolean {
+  return (
+    left.id === right.id &&
+    left.revision === right.revision &&
+    left.status === right.status &&
+    left.enabled === right.enabled &&
+    JSON.stringify(left.runCounter) === JSON.stringify(right.runCounter) &&
+    left.nextRunAt === right.nextRunAt &&
+    left.lastRunAt === right.lastRunAt &&
+    left.updatedAt === right.updatedAt
   );
 }

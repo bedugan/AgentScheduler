@@ -49,7 +49,11 @@ export type DeleteScheduleIfIdleResult =
   | "not-found";
 
 export interface ScheduleStore {
-  saveSchedule(schedule: Schedule): Promise<void>;
+  createSchedule(schedule: Schedule): Promise<boolean>;
+  compareAndSaveSchedule(
+    expected: Schedule,
+    schedule: Schedule,
+  ): Promise<boolean>;
   getSchedule(id: string): Promise<Schedule | undefined>;
   listSchedules(): Promise<Schedule[]>;
   listDueSchedules(now: IsoTimestamp): Promise<Schedule[]>;
