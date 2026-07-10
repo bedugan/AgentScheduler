@@ -12,11 +12,11 @@ import type {
   IsoTimestamp,
   ResolvedHarnessPolicy,
   ResolveActiveRunInput,
-  RunCadence,
   RunCapInput,
   RunHistoryEntry,
   RunHistoryDetailView,
   RunOutcomeView,
+  RunCadence,
   RunTrigger,
   Schedule,
   ScheduleHarnessModeAvailability,
@@ -37,6 +37,7 @@ import {
   isStartedRunStatus,
 } from "./domain.js";
 import { nextRunAtAfter } from "./recurrencePolicy.js";
+import { ScheduleDefinition } from "./scheduleDefinition.js";
 import type {
   AgentHarness,
   HarnessCancelResult,
@@ -99,6 +100,7 @@ export class ScheduleLifecycle {
   private readonly harnesses: Map<string, AgentHarness>;
   private readonly manualRunReservations = new Set<string>();
   private readonly executionOwnerId: string;
+  private readonly scheduleDefinition: ScheduleDefinition;
 
   constructor(options: ScheduleLifecycleOptions) {
     this.store = options.store;
@@ -109,6 +111,10 @@ export class ScheduleLifecycle {
     this.executionOwnerId = options.executionOwnerId ?? `process:${process.pid}:${randomUUID()}`;
     this.harnesses = new Map(
       options.harnesses.map((harness) => [harness.mode, harness]),
+    );
+    this.scheduleDefinition = new ScheduleDefinition(
+      this.idGenerator,
+      (schedule) => this.selectedHarnessUnavailableReason(schedule),
     );
   }
 
@@ -124,38 +130,7 @@ export class ScheduleLifecycle {
     input: CreateDraftScheduleInput | CreateActiveScheduleInput,
     status: "draft" | "active",
   ): Promise<Schedule> {
-    const now = this.nowIso();
-    const schedule: Schedule = {
-      id: this.idGenerator.nextId("schedule"),
-      revision: 1,
-      status,
-      enabled: status === "active",
-      runInstructions: input.runInstructions,
-      cadence: input.cadence,
-      targetContext: input.targetContext,
-      harnessMode: input.harnessMode,
-      model: input.model,
-      approvalMode: input.approvalMode,
-      runCounter: {
-        completed: 0,
-        limit: input.runCap?.maxRuns ?? null,
-      },
-      nextRunAt:
-        status === "active"
-          ? nextRunAtAfter(
-              (input as CreateActiveScheduleInput).cadence,
-              this.clock.now(),
-            )
-          : null,
-      lastRunAt: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    if (status === "active") {
-      this.requireActivationRequirements(schedule);
-    }
-
+    const schedule = this.scheduleDefinition.create(input, status, this.clock.now());
     await this.store.saveSchedule(schedule);
     return schedule;
   }
@@ -235,16 +210,11 @@ export class ScheduleLifecycle {
 
   async activateSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
-    this.requireScheduleStatus(schedule, ["draft"], "activated");
-    this.requireActivationRequirements(schedule);
-    const now = this.nowIso();
-    const activeSchedule: Schedule = {
-      ...schedule,
-      status: "active",
-      enabled: true,
-      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
-      updatedAt: now,
-    };
+    const activeSchedule = this.scheduleDefinition.transition(
+      schedule,
+      "activate",
+      this.clock.now(),
+    );
 
     await this.store.saveSchedule(activeSchedule);
     return activeSchedule;
@@ -252,15 +222,11 @@ export class ScheduleLifecycle {
 
   async pauseSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
-    this.requireScheduleStatus(schedule, ["active"], "paused");
-    const now = this.nowIso();
-    const pausedSchedule: Schedule = {
-      ...schedule,
-      status: "paused",
-      enabled: false,
-      nextRunAt: null,
-      updatedAt: now,
-    };
+    const pausedSchedule = this.scheduleDefinition.transition(
+      schedule,
+      "pause",
+      this.clock.now(),
+    );
 
     await this.store.saveSchedule(pausedSchedule);
     return pausedSchedule;
@@ -268,16 +234,11 @@ export class ScheduleLifecycle {
 
   async resumeSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
-    this.requireScheduleStatus(schedule, ["paused"], "resumed");
-    this.requireActivationRequirements(schedule);
-    const now = this.nowIso();
-    const resumedSchedule: Schedule = {
-      ...schedule,
-      status: "active",
-      enabled: true,
-      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
-      updatedAt: now,
-    };
+    const resumedSchedule = this.scheduleDefinition.transition(
+      schedule,
+      "resume",
+      this.clock.now(),
+    );
 
     await this.store.saveSchedule(resumedSchedule);
     return resumedSchedule;
@@ -285,20 +246,11 @@ export class ScheduleLifecycle {
 
   async restartCompletedSchedule(scheduleId: string): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
-    this.requireScheduleStatus(schedule, ["completed"], "restarted");
-    this.requireActivationRequirements(schedule);
-    const now = this.nowIso();
-    const restartedSchedule: Schedule = {
-      ...schedule,
-      status: "active",
-      enabled: true,
-      runCounter: {
-        ...schedule.runCounter,
-        completed: 0,
-      },
-      nextRunAt: nextRunAtAfter(schedule.cadence, this.clock.now()),
-      updatedAt: now,
-    };
+    const restartedSchedule = this.scheduleDefinition.transition(
+      schedule,
+      "restart",
+      this.clock.now(),
+    );
 
     await this.store.saveSchedule(restartedSchedule);
     return restartedSchedule;
@@ -323,46 +275,11 @@ export class ScheduleLifecycle {
     input: UpdateScheduleInput,
   ): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
-    const cadenceChanged =
-      Object.hasOwn(input, "cadence") &&
-      !sameRunCadence(schedule.cadence, input.cadence ?? null);
-    const nextSchedule: Schedule = {
-      ...schedule,
-      revision: schedule.revision + 1,
-      runInstructions: input.runInstructions ?? schedule.runInstructions,
-      cadence: Object.hasOwn(input, "cadence")
-        ? (input.cadence ?? null)
-        : schedule.cadence,
-      targetContext: Object.hasOwn(input, "targetContext")
-        ? (input.targetContext ?? null)
-        : schedule.targetContext,
-      harnessMode: Object.hasOwn(input, "harnessMode")
-        ? (input.harnessMode ?? null)
-        : schedule.harnessMode,
-      model: input.model ?? schedule.model,
-      approvalMode: input.approvalMode ?? schedule.approvalMode,
-      runCounter: Object.hasOwn(input, "runCap")
-        ? {
-            completed: schedule.runCounter.completed,
-            limit: input.runCap?.maxRuns ?? null,
-          }
-        : schedule.runCounter,
-      updatedAt: this.nowIso(),
-    };
-
-    if (sameScheduleConfiguration(schedule, nextSchedule)) {
-      return schedule;
-    }
-
-    if (nextSchedule.status === "active") {
-      this.requireActivationRequirements(nextSchedule);
-      if (cadenceChanged) {
-        nextSchedule.nextRunAt = nextRunAtAfter(
-          nextSchedule.cadence,
-          this.clock.now(),
-        );
-      }
-    }
+    const nextSchedule = this.scheduleDefinition.update(
+      schedule,
+      input,
+      this.clock.now(),
+    );
 
     await this.store.saveSchedule(nextSchedule);
     return nextSchedule;
@@ -644,7 +561,8 @@ export class ScheduleLifecycle {
     trigger: RunTrigger,
   ): Promise<RunHistoryEntry> {
     const requestedAt = this.nowIso();
-    const missingRunRequirements = this.missingActivationRequirements(schedule);
+    const missingRunRequirements =
+      this.scheduleDefinition.missingActivationRequirements(schedule);
     if (missingRunRequirements.length > 0) {
       const blockedRun = this.buildRunHistoryEntry({
         schedule,
@@ -1490,27 +1408,6 @@ export class ScheduleLifecycle {
     };
   }
 
-  private requireScheduleStatus(
-    schedule: Schedule,
-    allowedStatuses: Schedule["status"][],
-    action: string,
-  ): void {
-    if (!allowedStatuses.includes(schedule.status)) {
-      throw new Error(
-        `Only ${formatScheduleStatuses(allowedStatuses)} schedules can be ${action}.`,
-      );
-    }
-  }
-
-  private requireActivationRequirements(
-    schedule: Schedule,
-  ): asserts schedule is ActivationReadySchedule {
-    const missingRequirements = this.missingActivationRequirements(schedule);
-    if (missingRequirements.length > 0) {
-      throw new Error(missingRequirements.join(" "));
-    }
-  }
-
   private defaultPolicySnapshot(schedule: Schedule): ResolvedHarnessPolicy {
     return {
       harnessMode: schedule.harnessMode,
@@ -1621,28 +1518,6 @@ export class ScheduleLifecycle {
       createdAt: now,
       updatedAt: now,
     };
-  }
-
-  private missingActivationRequirements(schedule: Schedule): string[] {
-    const messages: string[] = [];
-    if (schedule.runInstructions.trim().length === 0) {
-      messages.push("Run instructions are required before activation.");
-    }
-    if (!schedule.cadence) {
-      messages.push("Run cadence is required before activation.");
-    }
-    if (!schedule.targetContext) {
-      messages.push("Target context is required before activation.");
-    }
-    if (!schedule.harnessMode) {
-      messages.push("Harness mode is required before activation.");
-    } else {
-      const unavailableReason = this.selectedHarnessUnavailableReason(schedule);
-      if (unavailableReason) {
-        messages.push(unavailableReason);
-      }
-    }
-    return messages;
   }
 
   private selectedHarnessUnavailableReason(schedule: Schedule): string | undefined {
@@ -1937,59 +1812,12 @@ function requirePositiveInteger(
   throw new Error(`${path}.${key} must be a positive integer.`);
 }
 
-type ActivationReadySchedule = Schedule & {
-  cadence: NonNullable<Schedule["cadence"]>;
-  targetContext: NonNullable<Schedule["targetContext"]>;
-  harnessMode: NonNullable<Schedule["harnessMode"]>;
-};
-
 function unavailableHarnessModeMessage(mode: HarnessMode): string {
   return `${HARNESS_MODE_LABELS[mode]} is unavailable in this VS Code environment because no ${HARNESS_MODE_LABELS[mode]} harness is registered. Install or enable the matching Copilot integration, or choose another available harness mode.`;
-}
-
-function formatScheduleStatuses(statuses: Schedule["status"][]): string {
-  return statuses.join(" or ");
 }
 
 function errorMessageFromUnknown(error: unknown): string {
   return error instanceof Error && error.message.trim().length > 0
     ? error.message
     : String(error);
-}
-
-function sameRunCadence(
-  left: RunCadence | null,
-  right: RunCadence | null,
-): boolean {
-  return (
-    left === right ||
-    (left?.type === "cron" &&
-      right?.type === "cron" &&
-      left.expression === right.expression)
-  );
-}
-
-function sameScheduleConfiguration(left: Schedule, right: Schedule): boolean {
-  return (
-    left.runInstructions === right.runInstructions &&
-    sameRunCadence(left.cadence, right.cadence) &&
-    sameTargetContext(left.targetContext, right.targetContext) &&
-    left.harnessMode === right.harnessMode &&
-    left.model === right.model &&
-    left.approvalMode === right.approvalMode &&
-    left.runCounter.limit === right.runCounter.limit
-  );
-}
-
-function sameTargetContext(
-  left: TargetContext | null,
-  right: TargetContext | null,
-): boolean {
-  return (
-    left === right ||
-    (left?.type === "workspace" &&
-      right?.type === "workspace" &&
-      left.uri === right.uri &&
-      left.label === right.label)
-  );
 }
