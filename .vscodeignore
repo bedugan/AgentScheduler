@@ -1,0 +1,12 @@
+.git/**
+.github/**
+docs/**
+src/**
+test/**
+scripts/**
+node_modules/**
+dist/test/**
+dist/**/*.d.ts
+dist/**/*.map
+*.vsix
+tsconfig.json

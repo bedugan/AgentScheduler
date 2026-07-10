@@ -19,6 +19,7 @@ import type { ScheduleLifecycle } from "./scheduleLifecycle.js";
 
 export interface EditorControlSurfaceOptions {
   localSchedulingSetup?: LocalSchedulingSetup;
+  enableLocalSchedulingUnavailableReason?: string;
   confirmEnableLocalScheduling?: (
     intent: WakeupTriggerIntent,
   ) => Promise<boolean>;
@@ -129,6 +130,9 @@ export class EditorControlSurface {
   }
 
   async enableLocalScheduling(): Promise<LocalSchedulingSetupResult> {
+    if (this.options.enableLocalSchedulingUnavailableReason) {
+      throw new Error(this.options.enableLocalSchedulingUnavailableReason);
+    }
     if (!this.options.localSchedulingSetup) {
       throw new Error("Local scheduling setup is not configured.");
     }
@@ -138,12 +142,31 @@ export class EditorControlSurface {
       );
     }
 
-    const intent = this.options.localSchedulingSetup.installIntent();
+    const intent = this.previewEnableLocalScheduling();
     const confirmed = await this.options.confirmEnableLocalScheduling(intent);
     if (!confirmed) {
       throw new Error("Enable local scheduling was not confirmed.");
     }
 
     return this.options.localSchedulingSetup.install();
+  }
+
+  previewEnableLocalScheduling(): WakeupTriggerIntent {
+    return this.requireLocalSchedulingSetup().installIntent();
+  }
+
+  async verifyLocalScheduling(): Promise<LocalSchedulingSetupResult> {
+    return this.requireLocalSchedulingSetup().verify();
+  }
+
+  async disableLocalScheduling(): Promise<LocalSchedulingSetupResult> {
+    return this.requireLocalSchedulingSetup().uninstall();
+  }
+
+  private requireLocalSchedulingSetup(): LocalSchedulingSetup {
+    if (!this.options.localSchedulingSetup) {
+      throw new Error("Local scheduling setup is not configured.");
+    }
+    return this.options.localSchedulingSetup;
   }
 }

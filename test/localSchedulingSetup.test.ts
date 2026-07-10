@@ -27,6 +27,8 @@ import type {
   RunHistoryEntry,
   Schedule,
   WakeupProvider,
+  WakeupCommandRunner,
+  WakeupFileReader,
   WakeupTriggerIntent,
   WakeupTriggerOperation,
   WakeupTriggerRequest,
@@ -87,6 +89,7 @@ describe("local scheduling setup", () => {
       "/Query",
       "/TN",
       "AgentSchedulerLocalWakeup",
+      "/XML",
     ]);
     assert.deepEqual(uninstall.commands[0]?.args, [
       "/Delete",
@@ -94,6 +97,66 @@ describe("local scheduling setup", () => {
       "AgentSchedulerLocalWakeup",
       "/F",
     ]);
+  });
+
+  it("verifies the registered Windows task command, worker fingerprint, and store", async () => {
+    const request: WakeupTriggerRequest = {
+      triggerId: "AgentSchedulerLocalWakeup",
+      workerExecutable: "C:\\Program Files\\nodejs\\node.exe",
+      workerArguments: [
+        "C:\\globalStorage\\worker\\full-fingerprint\\workerCli.js",
+        "scan-due-work",
+        "--store",
+        "C:\\globalStorage\\agent-scheduler.sqlite",
+      ],
+      intervalMinutes: 5,
+    };
+    const matchingXml = `<Task><Triggers><CalendarTrigger><Repetition><Interval>PT5M</Interval></Repetition></CalendarTrigger></Triggers><Actions><Exec><Command>C:\\Program Files\\nodejs\\node.exe</Command><Arguments>C:\\globalStorage\\worker\\full-fingerprint\\workerCli.js scan-due-work --store C:\\globalStorage\\agent-scheduler.sqlite</Arguments></Exec></Actions></Task>`;
+    const matching = new WindowsTaskSchedulerWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(matchingXml),
+    });
+    const stale = new WindowsTaskSchedulerWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(
+        matchingXml.replace("full-fingerprint", "stale-fingerprint"),
+      ),
+    });
+
+    assert.equal((await matching.verify(request)).applied, true);
+    assert.equal((await stale.verify(request)).applied, false);
+  });
+
+  it("verifies launchd registration and exact generated plist configuration", async () => {
+    const request: WakeupTriggerRequest = {
+      triggerId: "com.bedugan.AgentScheduler.local-wakeup",
+      workerExecutable: "/opt/homebrew/bin/node",
+      workerArguments: [
+        "/global/worker/full-fingerprint/workerCli.js",
+        "scan-due-work",
+        "--store",
+        "/global/agent-scheduler.sqlite",
+      ],
+      intervalMinutes: 5,
+      launchdPlistPath:
+        "/Users/ada/Library/LaunchAgents/com.bedugan.AgentScheduler.local-wakeup.plist",
+      userId: 501,
+    };
+    const intent = new MacOsLaunchdWakeupProvider().intentFor("install", request);
+    const matching = new MacOsLaunchdWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(launchdEvidenceFor(request)),
+      fileReader: new EvidenceFileReader(intent.files[0]!.contents),
+    });
+    const stale = new MacOsLaunchdWakeupProvider({
+      commandRunner: new EvidenceCommandRunner(
+        launchdEvidenceFor(request).replace(
+          "full-fingerprint",
+          "stale-loaded-fingerprint",
+        ),
+      ),
+      fileReader: new EvidenceFileReader(intent.files[0]!.contents),
+    });
+
+    assert.equal((await matching.verify(request)).applied, true);
+    assert.equal((await stale.verify(request)).applied, false);
   });
 
   it("generates macOS launchd install, verify, and uninstall intent after Windows support", () => {
@@ -266,6 +329,70 @@ describe("local scheduling setup", () => {
     assert.equal(result.state.triggerId, "com.bedugan.AgentScheduler.local-wakeup");
     assert.equal(result.state.installedAt, "2026-07-07T16:00:00.000Z");
     assert.deepEqual(await setupStore.getLocalSchedulingSetup(), result.state);
+  });
+
+  it("lets the editor preview, verify, and disable Local Scheduling setup", async () => {
+    const provider = new RecordingWakeupProvider();
+    const setup = new LocalSchedulingSetup({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      provider,
+      store: new InMemoryLocalSchedulingSetupStore(),
+      request: {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: "/usr/local/bin/node",
+        workerArguments: ["workerCli.js", "scan-due-work"],
+        intervalMinutes: 5,
+      },
+    });
+    const editor = new EditorControlSurface(
+      new ScheduleLifecycle({
+        store: new InMemoryScheduleStore(),
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      }),
+      {
+        localSchedulingSetup: setup,
+        confirmEnableLocalScheduling: async () => true,
+      },
+    );
+
+    assert.equal(editor.previewEnableLocalScheduling().operation, "install");
+    await editor.enableLocalScheduling();
+    const verified = await editor.verifyLocalScheduling();
+    const disabled = await editor.disableLocalScheduling();
+
+    assert.equal(verified.intent.operation, "verify");
+    assert.equal(verified.state.enabled, true);
+    assert.equal(disabled.intent.operation, "uninstall");
+    assert.equal(disabled.state.enabled, false);
+    assert.equal(provider.verifyRequests.length, 1);
+    assert.equal(provider.uninstallRequests.length, 1);
+  });
+
+  it("does not verify a stale trigger identity from a prior setup", async () => {
+    const provider = new RecordingWakeupProvider();
+    const store = new InMemoryLocalSchedulingSetupStore();
+    await store.saveLocalSchedulingSetup({
+      enabled: true,
+      platform: "windows",
+      triggerId: "UnexpectedTrigger",
+      installedAt: "2026-07-07T16:00:00.000Z",
+      verifiedAt: null,
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    });
+    const setup = new LocalSchedulingSetup({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      provider,
+      store,
+      request: {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: "/usr/local/bin/node",
+        workerArguments: ["workerCli.js", "scan-due-work"],
+        intervalMinutes: 5,
+      },
+    });
+
+    await assert.rejects(() => setup.verify(), /does not match the expected trigger/);
+    assert.equal(provider.verifyRequests.length, 0);
   });
 
   it("starts automatic due work only after local scheduling setup is enabled", async () => {
@@ -886,6 +1013,8 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
 class RecordingWakeupProvider implements WakeupProvider {
   readonly platform = "windows";
   readonly installRequests: WakeupTriggerRequest[] = [];
+  readonly verifyRequests: WakeupTriggerRequest[] = [];
+  readonly uninstallRequests: WakeupTriggerRequest[] = [];
 
   intentFor(
     operation: WakeupTriggerOperation,
@@ -917,12 +1046,40 @@ class RecordingWakeupProvider implements WakeupProvider {
   }
 
   async verify(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
+    this.verifyRequests.push(structuredClone(request));
     return { intent: this.intentFor("verify", request), applied: true };
   }
 
   async uninstall(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
+    this.uninstallRequests.push(structuredClone(request));
     return { intent: this.intentFor("uninstall", request), applied: true };
   }
+}
+
+class EvidenceCommandRunner implements WakeupCommandRunner {
+  constructor(private readonly stdout: string) {}
+
+  async run() {
+    return { stdout: this.stdout, stderr: "" };
+  }
+}
+
+class EvidenceFileReader implements WakeupFileReader {
+  constructor(private readonly contents: string) {}
+
+  async read(): Promise<string> {
+    return this.contents;
+  }
+}
+
+function launchdEvidenceFor(request: WakeupTriggerRequest): string {
+  return `gui/${request.userId}/${request.triggerId} = {
+  program = ${request.workerExecutable}
+  arguments = {
+    ${[request.workerExecutable, ...request.workerArguments].join("\n    ")}
+  }
+  run interval = ${request.intervalMinutes * 60} seconds
+}`;
 }
 
 class RecordingLocalSchedulingSetup {

@@ -1,12 +1,22 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 
 import {
   EditorControlSurface,
+  LocalSchedulingSetup,
+  MacOsLaunchdWakeupProvider,
   ScheduleLifecycle,
+  SqliteScheduleStore,
+  type WakeupProvider,
+  type WakeupTriggerOperation,
+  type WakeupTriggerRequest,
   type NaturalLanguageScheduleCreationResult,
+  type LocalSchedulingSetupResult,
   type ScheduleDetailView,
 } from "../src/index.js";
 import {
@@ -15,6 +25,7 @@ import {
   CREATE_SCHEDULE_COMMAND,
   CREATE_SCHEDULE_TOOL_NAME,
   DELETE_SCHEDULE_COMMAND,
+  ENABLE_LOCAL_SCHEDULING_ACTION,
   NEW_SCHEDULE_COMMAND,
   OPEN_SCHEDULE_COMMAND,
   SCHEDULE_DETAIL_VIEW_TYPE,
@@ -25,6 +36,11 @@ import {
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
   renderScheduleDetailWebviewHtml,
+  confirmEnableLocalScheduling,
+  createDefaultVsCodeSchedulerServices,
+  deployPackagedWorker,
+  localSchedulingWakeupRequestForVsCode,
+  resolveNodeRuntimeExecutable,
   scheduleTreeItemForSummary,
   sqliteLocalStorePath,
   type VsCodeCommandsLike,
@@ -51,6 +67,7 @@ import {
 import {
   FakeClock,
   FakeHarness,
+  InMemoryLocalSchedulingSetupStore,
   InMemoryScheduleStore,
   SequentialIdGenerator,
 } from "../src/testing.js";
@@ -141,9 +158,11 @@ describe("VS Code extension adapter", () => {
       };
       extensionKind?: string[];
       engines?: { vscode?: string };
+      scripts?: { "vscode:prepublish"?: string };
     };
 
     assert.equal(manifest.main, "./dist/src/vscodeExtension.js");
+    assert.equal(manifest.scripts?.["vscode:prepublish"], "npm run build");
     assert.deepEqual(manifest.extensionKind, ["ui"]);
     assert.equal(typeof manifest.engines?.vscode, "string");
     assert.deepEqual(manifest.activationEvents, [
@@ -265,6 +284,290 @@ describe("VS Code extension adapter", () => {
       }),
       join(globalStoragePath, SQLITE_LOCAL_STORE_FILENAME),
     );
+  });
+
+  it("builds packaged Windows and macOS wakeup requests from installed paths", async () => {
+    const extensionRoot = "/extensions/bedugan.agent-scheduler-0.1.0";
+    const globalStoragePath = "/user/globalStorage/bedugan.agent-scheduler";
+    const context = {
+      globalStorageUri: { fsPath: globalStoragePath },
+      extensionUri: { fsPath: extensionRoot },
+    };
+
+    const windows = localSchedulingWakeupRequestForVsCode(context, {
+      platform: "win32",
+      nodeExecutable: "C:\\Program Files\\nodejs\\node.exe",
+    });
+    assert.deepEqual(windows, {
+      triggerId: "AgentSchedulerLocalWakeup",
+      workerExecutable: "C:\\Program Files\\nodejs\\node.exe",
+      workerArguments: [
+        join(extensionRoot, "dist", "src", "workerCli.js"),
+        "scan-due-work",
+        "--store",
+        join(globalStoragePath, SQLITE_LOCAL_STORE_FILENAME),
+      ],
+      intervalMinutes: 5,
+    });
+
+    const macos = localSchedulingWakeupRequestForVsCode(context, {
+      platform: "darwin",
+      nodeExecutable: "/opt/homebrew/bin/node",
+      userId: 501,
+      homeDirectory: "/Users/ada",
+    });
+    assert.equal(macos.workerArguments[0], join(extensionRoot, "dist", "src", "workerCli.js"));
+    assert.equal(macos.triggerId, "com.bedugan.AgentScheduler.local-wakeup");
+    assert.equal(
+      macos.launchdPlistPath,
+      join(
+        "/Users/ada",
+        "Library",
+        "LaunchAgents",
+        "com.bedugan.AgentScheduler.local-wakeup.plist",
+      ),
+    );
+    assert.equal(macos.userId, 501);
+
+    const vscodeIgnore = await readFile(".vscodeignore", "utf8");
+    assert.equal(
+      vscodeIgnore.split(/\r?\n/).some((pattern) => pattern === "dist/**"),
+      false,
+    );
+    await readFile("dist/src/workerCli.js", "utf8");
+  });
+
+  it("resolves an absolute Node runtime without accepting Electron", () => {
+    assert.equal(
+      resolveNodeRuntimeExecutable({
+        configuredPath: "/opt/homebrew/bin/node",
+        processExecutable: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+        searchPath: "/usr/bin:/opt/homebrew/bin",
+        platform: "darwin",
+        fileExists: (path) => path === "/opt/homebrew/bin/node",
+        probeRuntime: () => true,
+      }),
+      "/opt/homebrew/bin/node",
+    );
+    assert.equal(
+      resolveNodeRuntimeExecutable({
+        processExecutable: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+        searchPath: "/usr/bin:/opt/homebrew/bin",
+        platform: "darwin",
+        fileExists: (path) => path === "/opt/homebrew/bin/node",
+        probeRuntime: () => true,
+      }),
+      "/opt/homebrew/bin/node",
+    );
+    assert.throws(
+      () =>
+        resolveNodeRuntimeExecutable({
+          processExecutable: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+          searchPath: "/usr/bin",
+          platform: "darwin",
+          fileExists: () => false,
+          probeRuntime: () => true,
+        }),
+      /absolute Node\.js executable/,
+    );
+  });
+
+  it("deploys the packaged worker to an immutable fingerprinted global-storage path", async () => {
+    const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-worker-"));
+    try {
+      const context = {
+        globalStorageUri: { fsPath: globalStoragePath },
+        extensionUri: { fsPath: process.cwd() },
+      };
+      const first = deployPackagedWorker(context);
+      const second = deployPackagedWorker(context);
+
+      assert.deepEqual(second, first);
+      assert.match(first.fingerprint, /^[a-f0-9]{64}$/);
+      assert.equal(first.workerPath.startsWith(globalStoragePath), true);
+      await readFile(first.workerPath, "utf8");
+      const marker = JSON.parse(
+        await readFile(
+          join(globalStoragePath, "worker", first.fingerprint, "deployment.json"),
+          "utf8",
+        ),
+      ) as { fingerprint: string };
+      assert.equal(marker.fingerprint, first.fingerprint);
+
+      await writeFile(first.workerPath, "corrupted worker", "utf8");
+      const repaired = deployPackagedWorker(context);
+      assert.deepEqual(repaired, first);
+      assert.doesNotMatch(await readFile(repaired.workerPath, "utf8"), /corrupted worker/);
+    } finally {
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
+  });
+
+  it("converges simultaneous first installs and corruption repairs", async () => {
+    const globalStoragePath = await mkdtemp(
+      join(tmpdir(), "agent-scheduler-race-"),
+    );
+    try {
+      const firstBarrier = join(globalStoragePath, "start-first");
+      const firstResults = await runConcurrentWorkerDeployments(
+        process.cwd(),
+        globalStoragePath,
+        firstBarrier,
+      );
+      assert.deepEqual(firstResults[0], firstResults[1]);
+
+      await writeFile(firstResults[0]!.workerPath, "corrupted worker", "utf8");
+      const repairBarrier = join(globalStoragePath, "start-repair");
+      const repairedResults = await runConcurrentWorkerDeployments(
+        process.cwd(),
+        globalStoragePath,
+        repairBarrier,
+      );
+      assert.deepEqual(repairedResults[0], repairedResults[1]);
+      assert.deepEqual(repairedResults[0], firstResults[0]);
+      assert.doesNotMatch(
+        await readFile(repairedResults[0]!.workerPath, "utf8"),
+        /corrupted worker/,
+      );
+      const workerEntries = await readdir(join(globalStoragePath, "worker"));
+      assert.equal(
+        workerEntries.some((entry) =>
+          /\.(?:tmp|corrupt|claim)(?:\.|$)/.test(entry),
+        ),
+        false,
+      );
+    } finally {
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
+  });
+
+  it("wires Local Scheduling into the shipped default service composition", async () => {
+    const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-vscode-"));
+    const provider = new TestWakeupProvider();
+    const window = new RecordingWindow();
+    window.warningMessageResponses.push(ENABLE_LOCAL_SCHEDULING_ACTION);
+    const services = createDefaultVsCodeSchedulerServices(
+      {
+        globalStorageUri: { fsPath: globalStoragePath },
+        extensionUri: { fsPath: process.cwd() },
+      },
+      {
+        window,
+        platform: process.platform === "win32" ? "win32" : "darwin",
+        nodeExecutable: process.execPath,
+        userId: 501,
+        provider,
+      },
+    );
+
+    try {
+      const intent = services.editor.previewEnableLocalScheduling?.();
+      assert.match(
+        intent?.workerCommand ?? "",
+        /[/\\]worker[/\\][a-f0-9]{64}[/\\]workerCli\.js/,
+      );
+      assert.equal(intent?.workerCommand.includes(SQLITE_LOCAL_STORE_FILENAME), true);
+      await services.editor.enableLocalScheduling?.();
+      assert.deepEqual(provider.operations, ["install"]);
+      assert.equal(window.warningMessages.length, 1);
+    } finally {
+      services.close?.();
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the extension available when Local Scheduling prerequisites are unavailable", async () => {
+    const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-linux-"));
+    const services = createDefaultVsCodeSchedulerServices(
+      {
+        globalStorageUri: { fsPath: globalStoragePath },
+        extensionUri: { fsPath: process.cwd() },
+      },
+      {
+        window: new RecordingWindow(),
+        platform: "linux",
+      },
+    );
+
+    try {
+      assert.equal(services.localSchedulingSetupAvailability?.available, false);
+      assert.match(
+        services.localSchedulingSetupAvailability?.reason ?? "",
+        /not supported on linux/,
+      );
+      const draft = await services.editor.createDraftSchedule({
+        runInstructions: "Editing still works without Local Scheduling.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/project" },
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+      });
+      assert.equal(draft.schedule.status, "draft");
+    } finally {
+      services.close?.();
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps editing available when Node exists but fails the worker capability probe", async () => {
+    const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-node-"));
+    const seededStore = new SqliteScheduleStore({
+      databasePath: join(globalStoragePath, SQLITE_LOCAL_STORE_FILENAME),
+    });
+    await seededStore.saveLocalSchedulingSetup({
+      enabled: true,
+      platform: "windows",
+      triggerId: "com.bedugan.AgentScheduler.local-wakeup",
+      installedAt: "2026-07-07T16:00:00.000Z",
+      verifiedAt: null,
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    });
+    seededStore.close();
+    const provider = new TestWakeupProvider();
+    const services = createDefaultVsCodeSchedulerServices(
+      {
+        globalStorageUri: { fsPath: globalStoragePath },
+        extensionUri: { fsPath: process.cwd() },
+      },
+      {
+        window: new RecordingWindow(),
+        platform: "darwin",
+        nodeExecutable: process.execPath,
+        userId: 501,
+        runtimeProbe: () => false,
+        provider,
+      },
+    );
+
+    try {
+      assert.equal(services.localSchedulingSetupAvailability?.available, false);
+      assert.match(
+        services.localSchedulingSetupAvailability?.reason ?? "",
+        /absolute Node\.js executable/,
+      );
+      assert.deepEqual(await services.editor.listSchedules(), []);
+      const draft = await services.editor.createDraftSchedule({
+        runInstructions: "Manage persisted setup after Node disappears.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/project" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "default-approvals",
+      });
+      assert.equal(draft.localScheduling.enabled, true);
+      assert.equal(services.localSchedulingSetupAvailability?.canManage, true);
+      await assert.rejects(
+        () => services.editor.enableLocalScheduling!(),
+        /absolute Node\.js executable/,
+      );
+      const disabled = await services.editor.disableLocalScheduling!();
+      assert.equal(disabled.state.enabled, false);
+      assert.deepEqual(provider.operations, ["uninstall"]);
+    } finally {
+      services.close?.();
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
   });
 
   it("builds New Schedule draft defaults from the current workspace", () => {
@@ -1951,6 +2254,263 @@ describe("VS Code extension adapter", () => {
     assert.match(panel.webview.html, /Cron Expression/);
   });
 
+  it("offers explicit Local Scheduling setup actions from Schedule Detail", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const detail = await editor.createDraftSchedule({
+      runInstructions: "Exercise Local Scheduling setup actions.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    const disabledHtml = renderScheduleDetailWebviewHtml(detail);
+    assert.match(
+      disabledHtml,
+      /data-action="enable-local-scheduling"[^>]*>Enable Local Scheduling<\/button>/,
+    );
+    assert.doesNotMatch(disabledHtml, /data-action="verify-local-scheduling"/);
+    assert.doesNotMatch(disabledHtml, /data-action="disable-local-scheduling"/);
+
+    const unavailableHtml = renderScheduleDetailWebviewHtml(detail, {
+      localSchedulingSetupAvailability: {
+        available: false,
+        reason: "Install a supported Node.js runtime to enable automatic runs.",
+      },
+    });
+    assert.match(
+      unavailableHtml,
+      /data-action="enable-local-scheduling"[^>]*disabled/,
+    );
+    assert.match(unavailableHtml, /Install a supported Node\.js runtime/);
+
+    const manageableHtml = renderScheduleDetailWebviewHtml(
+      {
+        ...detail,
+        localScheduling: {
+          enabled: true,
+          automaticRuns: "active",
+          message: "Persisted setup is enabled.",
+        },
+      },
+      {
+        localSchedulingSetupAvailability: {
+          available: false,
+          canManage: true,
+          reason: "Node is unavailable; automatic runs may fail.",
+        },
+      },
+    );
+    assert.match(manageableHtml, /data-action="verify-local-scheduling"/);
+    assert.match(manageableHtml, /data-action="disable-local-scheduling"/);
+
+    const enabledHtml = renderScheduleDetailWebviewHtml({
+      ...detail,
+      localScheduling: {
+        enabled: true,
+        automaticRuns: "active",
+        message: "Automatic runs are active.",
+      },
+    });
+    assert.match(enabledHtml, /data-action="verify-local-scheduling"/);
+    assert.match(enabledHtml, /data-action="disable-local-scheduling"/);
+    assert.doesNotMatch(enabledHtml, /data-action="enable-local-scheduling"/);
+  });
+
+  it("confirms the exact wakeup intent, enables setup, and refreshes every view", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const setupStore = new InMemoryLocalSchedulingSetupStore();
+    const provider = new TestWakeupProvider();
+    const setup = new LocalSchedulingSetup({
+      clock,
+      provider,
+      store: setupStore,
+      request: {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: "/usr/local/bin/node",
+        workerArguments: [
+          "/extensions/agent-scheduler/dist/src/workerCli.js",
+          "scan-due-work",
+          "--store",
+          "/global/agent-scheduler.sqlite",
+        ],
+        intervalMinutes: 5,
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingSetup: setup,
+      store,
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    window.warningMessageResponses.push("Enable Local Scheduling");
+    const editor = new EditorControlSurface(lifecycle, {
+      localSchedulingSetup: setup,
+      confirmEnableLocalScheduling: (intent) =>
+        confirmEnableLocalScheduling(window, intent),
+    });
+
+    const first = await editor.createDraftSchedule({
+      runInstructions: "First setup view.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///first" },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const second = await editor.createDraftSchedule({
+      runInstructions: "Second setup view.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///second" },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor },
+      viewColumn: 1,
+      eventEmitterFactory: new RecordingEventEmitterFactory(),
+    });
+    const tree = window.requiredTreeProvider(SCHEDULE_LIST_VIEW_ID);
+    const refreshes: Array<ScheduleTreeNode | undefined> = [];
+    tree.onDidChangeTreeData?.((event) => refreshes.push(event));
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(first.schedule.id);
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(second.schedule.id);
+
+    await window.panels[0]?.webview.postMessageFromWebview({
+      type: "enable-local-scheduling",
+      scheduleId: first.schedule.id,
+    });
+
+    assert.equal(provider.operations[0], "install");
+    assert.match(window.warningMessages[0] ?? "", /Enable Local Scheduling/);
+    assert.deepEqual(window.warningMessageItems[0]?.[0], {
+      modal: true,
+      detail: [
+        "One per-user OS wakeup trigger will be installed.",
+        "Platform: windows",
+        "Trigger: AgentSchedulerLocalWakeup",
+        "Interval: every 5 minutes",
+        "Worker: /usr/local/bin/node /extensions/agent-scheduler/dist/src/workerCli.js scan-due-work --store /global/agent-scheduler.sqlite",
+        "Command: install-test-trigger",
+      ].join("\n"),
+    });
+    assert.equal(refreshes.length, 1);
+    assert.match(window.panels[0]?.webview.html ?? "", /<strong>Enabled<\/strong>/);
+    assert.match(window.panels[1]?.webview.html ?? "", /<strong>Enabled<\/strong>/);
+
+    await window.panels[1]?.webview.postMessageFromWebview({
+      type: "verify-local-scheduling",
+      scheduleId: second.schedule.id,
+    });
+    await window.panels[0]?.webview.postMessageFromWebview({
+      type: "disable-local-scheduling",
+      scheduleId: first.schedule.id,
+    });
+
+    assert.deepEqual(provider.operations, ["install", "verify", "uninstall"]);
+    assert.deepEqual(window.informationMessages, [
+      "AgentScheduler Local Scheduling is enabled.",
+      "AgentScheduler Local Scheduling trigger was verified.",
+      "AgentScheduler Local Scheduling is disabled.",
+    ]);
+    assert.equal(refreshes.length, 3);
+    assert.match(window.panels[0]?.webview.html ?? "", /<strong>Disabled<\/strong>/);
+    assert.match(window.panels[1]?.webview.html ?? "", /<strong>Disabled<\/strong>/);
+  });
+
+  it("includes generated launchd plist contents in the exact confirmation", async () => {
+    const window = new RecordingWindow();
+    window.warningMessageResponses.push(ENABLE_LOCAL_SCHEDULING_ACTION);
+    const intent = new MacOsLaunchdWakeupProvider().intentFor("install", {
+      triggerId: "com.bedugan.AgentScheduler.local-wakeup",
+      workerExecutable: "/opt/homebrew/bin/node",
+      workerArguments: ["/stable/worker/workerCli.js", "scan-due-work"],
+      intervalMinutes: 5,
+      launchdPlistPath:
+        "/Users/ada/Library/LaunchAgents/com.bedugan.AgentScheduler.local-wakeup.plist",
+      userId: 501,
+    });
+
+    assert.equal(await confirmEnableLocalScheduling(window, intent), true);
+    const detail = JSON.stringify(window.warningMessageItems[0]?.[0]);
+    assert.match(detail, /Contents:/);
+    assert.match(detail, /&lt;\?xml|<\?xml/);
+    assert.match(detail, /ProgramArguments/);
+    assert.match(detail, /stable\/worker\/workerCli\.js/);
+  });
+
+  it("does not report Local Scheduling success when the provider did not apply the change", async () => {
+    const detail = await new EditorControlSurface(
+      new ScheduleLifecycle({
+        store: new InMemoryScheduleStore(),
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      }),
+    ).createDraftSchedule({
+      runInstructions: "Keep setup failures visible.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/project" },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const failedResult: LocalSchedulingSetupResult = {
+      applied: false,
+      intent: new TestWakeupProvider().intentFor("install", {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: process.execPath,
+        workerArguments: ["workerCli.js", "scan-due-work"],
+        intervalMinutes: 5,
+      }),
+      state: {
+        enabled: false,
+        platform: null,
+        triggerId: null,
+        installedAt: null,
+        verifiedAt: null,
+        updatedAt: "2026-07-07T16:00:00.000Z",
+      },
+    };
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new FailedSetupEditor(detail, failedResult) },
+      viewColumn: 1,
+    });
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(detail.schedule.id);
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "enable-local-scheduling",
+      scheduleId: detail.schedule.id,
+    });
+
+    assert.deepEqual(window.informationMessages, []);
+    assert.match(requiredPanel(window).webview.html, /trigger was not installed/);
+  });
+
   it("shows lifecycle validation failures inline in the Schedule Detail panel", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const store = new InMemoryScheduleStore();
@@ -2379,6 +2939,69 @@ describe("VS Code extension adapter", () => {
   });
 });
 
+async function runConcurrentWorkerDeployments(
+  extensionRoot: string,
+  globalStoragePath: string,
+  barrierPath: string,
+): Promise<Array<{ workerPath: string; fingerprint: string }>> {
+  const moduleUrl = pathToFileURL(
+    join(process.cwd(), "dist", "src", "vscodeExtensionAdapter.js"),
+  ).href;
+  const script = `
+    import { existsSync } from "node:fs";
+    import { setTimeout as delay } from "node:timers/promises";
+    import { deployPackagedWorker } from ${JSON.stringify(moduleUrl)};
+    const [extensionRoot, globalStoragePath, barrierPath] = process.argv.slice(1);
+    while (!existsSync(barrierPath)) await delay(2);
+    const result = deployPackagedWorker({
+      extensionUri: { fsPath: extensionRoot },
+      globalStorageUri: { fsPath: globalStoragePath },
+    });
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const children = [0, 1].map(
+    () =>
+      new Promise<{ workerPath: string; fingerprint: string }>(
+        (resolveChild, rejectChild) => {
+          const child = spawn(
+            process.execPath,
+            [
+              "--input-type=module",
+              "-e",
+              script,
+              extensionRoot,
+              globalStoragePath,
+              barrierPath,
+            ],
+            { stdio: ["ignore", "pipe", "pipe"] },
+          );
+          let stdout = "";
+          let stderr = "";
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+          });
+          child.stderr.on("data", (chunk: string) => {
+            stderr += chunk;
+          });
+          child.on("error", rejectChild);
+          child.on("exit", (code) => {
+            if (code === 0) {
+              resolveChild(JSON.parse(stdout));
+            } else {
+              rejectChild(
+                new Error(`Worker deployment child failed: ${stderr}`),
+              );
+            }
+          });
+        },
+      ),
+  );
+  await writeFile(barrierPath, "start", "utf8");
+  return Promise.all(children);
+}
+
 function recordingContext(): {
   globalStorageUri: { fsPath: string };
   subscriptions: VsCodeDisposableLike[];
@@ -2509,6 +3132,43 @@ function interactiveTaskRequest() {
   };
 }
 
+class TestWakeupProvider implements WakeupProvider {
+  readonly platform = "windows" as const;
+  readonly operations: WakeupTriggerOperation[] = [];
+
+  intentFor(operation: WakeupTriggerOperation, request: WakeupTriggerRequest) {
+    return {
+      operation,
+      platform: this.platform,
+      triggerId: request.triggerId,
+      intervalMinutes: request.intervalMinutes,
+      workerCommand: [request.workerExecutable, ...request.workerArguments].join(" "),
+      commands: [
+        {
+          executable: "test-trigger",
+          args: [operation],
+          shellCommand: `${operation}-test-trigger`,
+        },
+      ],
+      files: [],
+    };
+  }
+
+  async install(request: WakeupTriggerRequest) {
+    this.operations.push("install");
+    return { intent: this.intentFor("install", request), applied: true };
+  }
+
+  async verify(request: WakeupTriggerRequest) {
+    this.operations.push("verify");
+    return { intent: this.intentFor("verify", request), applied: true };
+  }
+
+  async uninstall(request: WakeupTriggerRequest) {
+    this.operations.push("uninstall");
+    return { intent: this.intentFor("uninstall", request), applied: true };
+  }
+}
 interface RecordingPanel extends VsCodeWebviewPanelLike {
   viewType: string;
   showOptions: unknown;
@@ -2809,6 +3469,23 @@ class EmptyScheduleEditor implements VsCodeScheduleEditor {
     Awaited<ReturnType<VsCodeScheduleEditor["listHarnessModeAvailability"]>>
   > {
     return [];
+  }
+}
+
+class FailedSetupEditor extends EmptyScheduleEditor {
+  constructor(
+    private readonly detail: ScheduleDetailView,
+    private readonly result: LocalSchedulingSetupResult,
+  ) {
+    super();
+  }
+
+  override async openScheduleDetail(): Promise<ScheduleDetailView> {
+    return this.detail;
+  }
+
+  async enableLocalScheduling(): Promise<LocalSchedulingSetupResult> {
+    return this.result;
   }
 }
 

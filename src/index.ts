@@ -136,6 +136,8 @@ export type {
   LocalSchedulingSetupStore,
   LocalSchedulingStateSource,
   WakeupCommandRunner,
+  WakeupCommandResult,
+  WakeupFileReader,
   WakeupFileWriter,
   WakeupProvider,
   WakeupProviderOptions,

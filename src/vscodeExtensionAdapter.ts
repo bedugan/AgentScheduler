@@ -1,5 +1,19 @@
-import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { pathToFileURL } from "node:url";
+import { dirname, join, posix, win32 } from "node:path";
 
 import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
 import type { CopilotInteractiveExecutor } from "./copilotCliClient.js";
@@ -21,7 +35,18 @@ import type {
   WorkspaceTargetContext,
 } from "./domain.js";
 import { EditorControlSurface } from "./editorControlSurface.js";
-import { ScheduleLifecycle } from "./scheduleLifecycle.js";
+import {
+  LocalSchedulingSetup,
+  MacOsLaunchdWakeupProvider,
+  WindowsTaskSchedulerWakeupProvider,
+  type WakeupProvider,
+  type WakeupTriggerRequest,
+} from "./localSchedulingSetup.js";
+import type {
+  LocalSchedulingSetupResult,
+  WakeupTriggerIntent,
+} from "./localSchedulingSetup.js";
+import { ScheduleLifecycle, SystemClock } from "./scheduleLifecycle.js";
 import type {
   ScheduleModelCatalog,
   ScheduleModelOption,
@@ -54,6 +79,7 @@ export const DELETE_SCHEDULE_COMMAND = "agentScheduler.deleteSchedule";
 export const SCHEDULE_LIST_VIEW_ID = "agentScheduler.scheduleList";
 export const SCHEDULE_DETAIL_VIEW_TYPE = "agentScheduler.scheduleDetail";
 export const SQLITE_LOCAL_STORE_FILENAME = "agent-scheduler.sqlite";
+export const ENABLE_LOCAL_SCHEDULING_ACTION = "Enable Local Scheduling";
 
 const DEFAULT_HOURLY_CADENCE = {
   type: "cron",
@@ -81,6 +107,11 @@ export interface VsCodeGlobalStorageContextLike {
   globalStorageUri: {
     fsPath: string;
   };
+}
+
+export interface VsCodeInstalledExtensionContextLike
+  extends VsCodeGlobalStorageContextLike {
+  extensionUri: { fsPath: string };
 }
 
 export interface VsCodeExtensionContextLike
@@ -283,11 +314,20 @@ export interface VsCodeScheduleEditor {
   listHarnessModels?(
     mode: HarnessMode,
   ): Promise<readonly ScheduleModelOption[]>;
+  previewEnableLocalScheduling?(): WakeupTriggerIntent;
+  enableLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
+  verifyLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
+  disableLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
 }
 
 export interface VsCodeSchedulerServices {
   editor: VsCodeScheduleEditor;
   lifecycle?: ScheduleLifecycle;
+  localSchedulingSetupAvailability?: {
+    available: boolean;
+    canManage?: boolean;
+    reason?: string;
+  };
   close?(): void;
 }
 
@@ -322,6 +362,11 @@ interface ScheduleDetailRenderState {
   errorMessage?: string;
   modelOptions?: readonly ScheduleModelOption[];
   modelCatalogAvailable?: boolean;
+  localSchedulingSetupAvailability?: {
+    available: boolean;
+    canManage?: boolean;
+    reason?: string;
+  };
 }
 
 interface ScheduleDetailFormFields {
@@ -345,7 +390,42 @@ type ScheduleDetailWebviewMessage =
       type: ScheduleDetailActionKind;
       scheduleId: string;
       fields?: ScheduleDetailFormFields;
+    }
+  | {
+      type: LocalSchedulingWebviewAction;
+      scheduleId: string;
     };
+
+type LocalSchedulingWebviewAction =
+  | "enable-local-scheduling"
+  | "verify-local-scheduling"
+  | "disable-local-scheduling";
+
+export async function confirmEnableLocalScheduling(
+  window: VsCodeWindowLike,
+  intent: WakeupTriggerIntent,
+): Promise<boolean> {
+  const selected = await window.showWarningMessage?.(
+    "Enable Local Scheduling?",
+    {
+      modal: true,
+      detail: [
+        "One per-user OS wakeup trigger will be installed.",
+        `Platform: ${intent.platform}`,
+        `Trigger: ${intent.triggerId}`,
+        `Interval: every ${intent.intervalMinutes} minutes`,
+        `Worker: ${intent.workerCommand}`,
+        ...intent.commands.map((command) => `Command: ${command.shellCommand}`),
+        ...intent.files.flatMap((file) => [
+          `File: ${file.path}`,
+          `Contents:\n${file.contents}`,
+        ]),
+      ].join("\n"),
+    },
+    ENABLE_LOCAL_SCHEDULING_ACTION,
+  );
+  return selected === ENABLE_LOCAL_SCHEDULING_ACTION;
+}
 
 export function sqliteLocalStorePath(
   context: VsCodeGlobalStorageContextLike,
@@ -353,13 +433,441 @@ export function sqliteLocalStorePath(
   return join(context.globalStorageUri.fsPath, SQLITE_LOCAL_STORE_FILENAME);
 }
 
+export interface ResolveNodeRuntimeExecutableOptions {
+  configuredPath?: string;
+  processExecutable?: string;
+  searchPath?: string;
+  platform?: NodeJS.Platform;
+  fileExists?: (path: string) => boolean;
+  probeRuntime?: (path: string) => boolean;
+  workerPath?: string;
+  workerPlatform?: "windows" | "macos";
+  userId?: number;
+}
+
+export function resolveNodeRuntimeExecutable(
+  options: ResolveNodeRuntimeExecutableOptions = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  const fileExists = options.fileExists ?? existsSync;
+  const probeRuntime =
+    options.probeRuntime ??
+    ((candidate: string) => probeNodeRuntime(candidate, options));
+  const pathApi = platform === "win32" ? win32 : posix;
+  const candidates = [
+    options.configuredPath,
+    options.processExecutable ?? process.execPath,
+    ...(options.searchPath ?? process.env.PATH ?? "")
+      .split(platform === "win32" ? ";" : ":")
+      .filter(Boolean)
+      .map((directory) =>
+        pathApi.join(directory, platform === "win32" ? "node.exe" : "node"),
+      ),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate || !pathApi.isAbsolute(candidate) || !fileExists(candidate)) {
+      continue;
+    }
+    const executableName = pathApi.basename(candidate).toLowerCase();
+    if (
+      (executableName === "node" || executableName === "node.exe") &&
+      probeRuntime(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    "Local Scheduling requires an absolute Node.js executable. Configure AGENT_SCHEDULER_NODE_PATH or install node on PATH; the VS Code Electron executable cannot run the worker.",
+  );
+}
+
+function probeNodeRuntime(
+  candidate: string,
+  options: ResolveNodeRuntimeExecutableOptions,
+): boolean {
+  const capabilityProbe = spawnSync(
+    candidate,
+    [
+      "-e",
+      "const major=Number(process.versions.node.split('.')[0]);require('node:sqlite');if(major<26)process.exit(1)",
+    ],
+    { encoding: "utf8", timeout: 5_000, windowsHide: true },
+  );
+  if (capabilityProbe.status !== 0 || !options.workerPath) {
+    return capabilityProbe.status === 0 && options.workerPath === undefined;
+  }
+
+  const platform = options.workerPlatform ?? "windows";
+  const args = [
+    options.workerPath,
+    "local-scheduling",
+    "install",
+    "--dry-run",
+    "--platform",
+    platform,
+    "--store",
+    join(dirname(options.workerPath), "probe.sqlite"),
+    "--node",
+    candidate,
+    "--worker",
+    options.workerPath,
+  ];
+  if (platform === "macos") {
+    args.push("--user-id", String(options.userId ?? 0));
+  }
+  const workerModuleUrl = pathToFileURL(options.workerPath).href;
+  const probeScript = `import { runWorkerCli } from ${JSON.stringify(workerModuleUrl)}; process.exitCode = await runWorkerCli(${JSON.stringify(args.slice(1))}, { stdout: process.stdout, stderr: process.stderr });`;
+  const workerProbe = spawnSync(candidate, ["--input-type=module", "-e", probeScript], {
+    encoding: "utf8",
+    timeout: 5_000,
+    windowsHide: true,
+  });
+  return workerProbe.status === 0 && /"dryRun":true/.test(workerProbe.stdout);
+}
+
+export interface DeployedWorker {
+  workerPath: string;
+  fingerprint: string;
+}
+
+export function deployPackagedWorker(
+  context: VsCodeInstalledExtensionContextLike,
+): DeployedWorker {
+  const sourceDirectory = join(context.extensionUri.fsPath, "dist", "src");
+  const manifest = workerManifestFor(sourceDirectory);
+  const fingerprint = manifest.fingerprint;
+  const targetDirectory = join(
+    context.globalStorageUri.fsPath,
+    "worker",
+    fingerprint,
+  );
+  if (!validWorkerDeployment(targetDirectory, manifest)) {
+    mkdirSync(dirname(targetDirectory), { recursive: true, mode: 0o700 });
+    const claimDirectory = `${targetDirectory}.claim`;
+    const ownsClaim = acquireWorkerDeploymentClaim(
+      claimDirectory,
+      targetDirectory,
+      manifest,
+    );
+    if (ownsClaim) {
+      try {
+        if (!validWorkerDeployment(targetDirectory, manifest)) {
+          installWorkerDeployment(targetDirectory, sourceDirectory, manifest);
+        }
+      } finally {
+        rmSync(claimDirectory, { recursive: true, force: true });
+      }
+    }
+  }
+  if (!validWorkerDeployment(targetDirectory, manifest)) {
+    throw new Error("Worker deployment did not converge on a valid manifest.");
+  }
+  return {
+    workerPath: join(targetDirectory, "workerCli.js"),
+    fingerprint,
+  };
+}
+
+function installWorkerDeployment(
+  targetDirectory: string,
+  sourceDirectory: string,
+  manifest: WorkerDeploymentManifest,
+): void {
+  const suffix = `${process.pid}.${randomBytes(8).toString("hex")}`;
+  const temporaryDirectory = `${targetDirectory}.tmp.${suffix}`;
+  const corruptDirectory = `${targetDirectory}.corrupt.${suffix}`;
+  let movedCorruptDeployment = false;
+  try {
+    mkdirSync(temporaryDirectory, { recursive: true, mode: 0o700 });
+    cpSync(sourceDirectory, temporaryDirectory, { recursive: true });
+    writeFileSync(
+      join(temporaryDirectory, "deployment.json"),
+      `${JSON.stringify(manifest)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    if (!validWorkerDeployment(temporaryDirectory, manifest)) {
+      throw new Error("Deployed Worker failed manifest verification.");
+    }
+    if (existsSync(targetDirectory)) {
+      renameSync(targetDirectory, corruptDirectory);
+      movedCorruptDeployment = true;
+    }
+    renameSync(temporaryDirectory, targetDirectory);
+    rmSync(corruptDirectory, { recursive: true, force: true });
+    movedCorruptDeployment = false;
+  } catch (error) {
+    if (movedCorruptDeployment && !existsSync(targetDirectory)) {
+      renameSync(corruptDirectory, targetDirectory);
+    }
+    throw error;
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+    rmSync(corruptDirectory, { recursive: true, force: true });
+  }
+}
+
+function acquireWorkerDeploymentClaim(
+  claimDirectory: string,
+  targetDirectory: string,
+  manifest: WorkerDeploymentManifest,
+): boolean {
+  const deadline = Date.now() + 10_000;
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(claimDirectory, { mode: 0o700 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+    if (validWorkerDeployment(targetDirectory, manifest)) {
+      return false;
+    }
+    try {
+      if (Date.now() - statSync(claimDirectory).mtimeMs > 30_000) {
+        const staleClaim = [
+          claimDirectory,
+          "stale",
+          String(process.pid),
+          randomBytes(4).toString("hex"),
+        ].join(".");
+        renameSync(claimDirectory, staleClaim);
+        rmSync(staleClaim, { recursive: true, force: true });
+        continue;
+      }
+    } catch {
+      // The owner may have completed between the existence check and cleanup.
+    }
+    Atomics.wait(waiter, 0, 0, 20);
+  }
+  if (validWorkerDeployment(targetDirectory, manifest)) {
+    return false;
+  }
+  throw new Error("Timed out waiting for another Worker deployment process.");
+}
+
+interface WorkerDeploymentManifest {
+  fingerprint: string;
+  files: Record<string, string>;
+}
+
+function workerManifestFor(directory: string): WorkerDeploymentManifest {
+  const files: Record<string, string> = {};
+  const visit = (current: string): void => {
+    for (const name of readdirSync(current).sort()) {
+      const path = join(current, name);
+      const stats = statSync(path);
+      if (stats.isDirectory()) {
+        visit(path);
+      } else if (name !== "deployment.json") {
+        const relativePath = path.slice(directory.length + 1).replaceAll("\\", "/");
+        files[relativePath] = createHash("sha256")
+          .update(readFileSync(path))
+          .digest("hex");
+      }
+    }
+  };
+  visit(directory);
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify(files))
+    .digest("hex");
+  return { fingerprint, files };
+}
+
+function validWorkerDeployment(
+  directory: string,
+  expected: WorkerDeploymentManifest,
+): boolean {
+  try {
+    const recorded = JSON.parse(
+      readFileSync(join(directory, "deployment.json"), "utf8"),
+    ) as WorkerDeploymentManifest;
+    const actual = workerManifestFor(directory);
+    return (
+      recorded.fingerprint === expected.fingerprint &&
+      JSON.stringify(recorded.files) === JSON.stringify(expected.files) &&
+      actual.fingerprint === expected.fingerprint &&
+      JSON.stringify(actual.files) === JSON.stringify(expected.files)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function localSchedulingWakeupRequestForVsCode(
+  context: VsCodeInstalledExtensionContextLike,
+  options: {
+    nodeExecutable: string;
+    platform: NodeJS.Platform;
+    userId?: number;
+    homeDirectory?: string;
+    workerPath?: string;
+  },
+): WakeupTriggerRequest {
+  const triggerId =
+    options.platform === "darwin"
+      ? "com.bedugan.AgentScheduler.local-wakeup"
+      : "AgentSchedulerLocalWakeup";
+  const workerPath =
+    options.workerPath ??
+    join(context.extensionUri.fsPath, "dist", "src", "workerCli.js");
+  const request: WakeupTriggerRequest = {
+    triggerId,
+    workerExecutable: options.nodeExecutable,
+    workerArguments: [
+      workerPath,
+      "scan-due-work",
+      "--store",
+      sqliteLocalStorePath(context),
+    ],
+    intervalMinutes: 5,
+  };
+  if (options.platform === "darwin") {
+    request.launchdPlistPath = join(
+      options.homeDirectory ?? homedir(),
+      "Library",
+      "LaunchAgents",
+      `${triggerId}.plist`,
+    );
+    if (options.userId === undefined) {
+      throw new Error("Local Scheduling requires a macOS user id for launchd.");
+    }
+    request.userId = options.userId;
+  }
+  return request;
+}
+
+export interface CreateDefaultVsCodeSchedulerServicesOptions {
+  window: VsCodeWindowLike;
+  interactiveExecutor?: CopilotInteractiveExecutor;
+  platform?: NodeJS.Platform;
+  nodeExecutable?: string;
+  userId?: number;
+  provider?: WakeupProvider;
+  homeDirectory?: string;
+  runtimeProbe?: (path: string) => boolean;
+}
+
 export function createDefaultVsCodeSchedulerServices(
-  context: VsCodeGlobalStorageContextLike,
+  context: VsCodeInstalledExtensionContextLike,
+  options: CreateDefaultVsCodeSchedulerServicesOptions,
+): VsCodeSchedulerServices {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32" && platform !== "darwin") {
+    return createUnavailableLocalSchedulingServices(
+      context,
+      `Local Scheduling is not supported on ${platform}. Schedule editing and Manual Run Now remain available.`,
+      options.interactiveExecutor,
+    );
+  }
+  const deployedWorker = deployPackagedWorker(context);
+  const provider =
+    options.provider ??
+    (platform === "win32"
+      ? new WindowsTaskSchedulerWakeupProvider()
+      : new MacOsLaunchdWakeupProvider());
+  const userId =
+    platform === "darwin" ? options.userId ?? process.getuid?.() : undefined;
+  const configuredNodeExecutable =
+    options.nodeExecutable ?? process.env.AGENT_SCHEDULER_NODE_PATH;
+  let nodeExecutable: string;
+  try {
+    nodeExecutable = resolveNodeRuntimeExecutable({
+      ...(configuredNodeExecutable && {
+        configuredPath: configuredNodeExecutable,
+      }),
+      processExecutable: process.execPath,
+      ...(process.env.PATH && { searchPath: process.env.PATH }),
+      platform,
+      ...(options.runtimeProbe && { probeRuntime: options.runtimeProbe }),
+      workerPath: deployedWorker.workerPath,
+      workerPlatform: platform === "win32" ? "windows" : "macos",
+      ...(options.userId !== undefined && { userId: options.userId }),
+    });
+  } catch (error) {
+    const managementRequest = localSchedulingWakeupRequestForVsCode(context, {
+      nodeExecutable: configuredNodeExecutable ?? process.execPath,
+      platform,
+      ...(userId !== undefined && { userId }),
+      ...(options.homeDirectory && { homeDirectory: options.homeDirectory }),
+      workerPath: deployedWorker.workerPath,
+    });
+    return createUnavailableLocalSchedulingServices(
+      context,
+      `${errorMessageFor(error)} Schedule editing and Manual Run Now remain available.`,
+      options.interactiveExecutor,
+      {
+        provider,
+        request: managementRequest,
+        window: options.window,
+      },
+    );
+  }
+  const request = localSchedulingWakeupRequestForVsCode(context, {
+    nodeExecutable,
+    platform,
+    ...(userId !== undefined && { userId }),
+    ...(options.homeDirectory && { homeDirectory: options.homeDirectory }),
+    workerPath: deployedWorker.workerPath,
+  });
+  const store = new SqliteScheduleStore({
+    databasePath: sqliteLocalStorePath(context),
+  });
+  const localSchedulingSetup = new LocalSchedulingSetup({
+    store,
+    provider,
+    request,
+    clock: new SystemClock(),
+  });
+  const lifecycle = new ScheduleLifecycle({
+    store,
+    harnesses: [
+      createDefaultCopilotLocalHarness(
+        options.interactiveExecutor
+          ? { interactiveExecutor: options.interactiveExecutor }
+          : {},
+      ),
+    ],
+    localSchedulingSetup,
+  });
+
+  return {
+    editor: new EditorControlSurface(lifecycle, {
+      localSchedulingSetup,
+      confirmEnableLocalScheduling: (intent) =>
+        confirmEnableLocalScheduling(options.window, intent),
+    }),
+    lifecycle,
+    localSchedulingSetupAvailability: { available: true },
+    close: () => store.close(),
+  };
+}
+
+function createUnavailableLocalSchedulingServices(
+  context: VsCodeInstalledExtensionContextLike,
+  reason: string,
   interactiveExecutor?: CopilotInteractiveExecutor,
+  management?: {
+    provider: WakeupProvider;
+    request: WakeupTriggerRequest;
+    window: VsCodeWindowLike;
+  },
 ): VsCodeSchedulerServices {
   const store = new SqliteScheduleStore({
     databasePath: sqliteLocalStorePath(context),
   });
+  const localSchedulingSetup = management
+    ? new LocalSchedulingSetup({
+        store,
+        provider: management.provider,
+        request: management.request,
+        clock: new SystemClock(),
+      })
+    : undefined;
   const lifecycle = new ScheduleLifecycle({
     store,
     harnesses: [
@@ -367,17 +875,32 @@ export function createDefaultVsCodeSchedulerServices(
         interactiveExecutor ? { interactiveExecutor } : {},
       ),
     ],
-    localSchedulingSetup: {
-      isLocalSchedulingEnabled: async () =>
-        (await store.getLocalSchedulingSetup()).enabled,
-      getLocalSchedulingSetupState: async () =>
-        store.getLocalSchedulingSetup(),
-    },
+    localSchedulingSetup:
+      localSchedulingSetup ?? {
+        isLocalSchedulingEnabled: async () =>
+          (await store.getLocalSchedulingSetup()).enabled,
+        getLocalSchedulingSetupState: async () =>
+          store.getLocalSchedulingSetup(),
+      },
   });
-
   return {
-    editor: new EditorControlSurface(lifecycle),
+    editor: new EditorControlSurface(
+      lifecycle,
+      localSchedulingSetup
+        ? {
+            localSchedulingSetup,
+            enableLocalSchedulingUnavailableReason: reason,
+            confirmEnableLocalScheduling: (intent) =>
+              confirmEnableLocalScheduling(management!.window, intent),
+          }
+        : {},
+    ),
     lifecycle,
+    localSchedulingSetupAvailability: {
+      available: false,
+      canManage: localSchedulingSetup !== undefined,
+      reason,
+    },
     close: () => store.close(),
   };
 }
@@ -920,6 +1443,10 @@ export function renderScheduleDetailWebviewHtml(
     <h2 id="local-scheduling-heading">Local Scheduling</h2>
     <p><strong>${view.localScheduling.enabled ? "Enabled" : "Disabled"}</strong></p>
     <p>${escapeHtml(view.localScheduling.message)}</p>
+    ${state.localSchedulingSetupAvailability?.available === false && state.localSchedulingSetupAvailability.reason ? `<p class="field-note">${escapeHtml(state.localSchedulingSetupAvailability.reason)}</p>` : ""}
+    <div class="actions">
+      ${renderLocalSchedulingActions(view.localScheduling.enabled, state.localSchedulingSetupAvailability)}
+    </div>
   </section>
 
   <section aria-labelledby="previous-runs-heading">
@@ -929,6 +1456,30 @@ export function renderScheduleDetailWebviewHtml(
   ${renderScheduleDetailScript(scriptNonce)}
 </body>
 </html>`;
+}
+
+function renderLocalSchedulingActions(
+  enabled: boolean,
+  availability: ScheduleDetailRenderState["localSchedulingSetupAvailability"],
+): string {
+  if (availability?.available === false) {
+    const reason = availability.reason
+      ? ` title="${escapeHtml(availability.reason)}"`
+      : "";
+    if (enabled && availability.canManage) {
+      return [
+        '<button type="button" data-action="verify-local-scheduling">Verify Local Scheduling</button>',
+        '<button type="button" data-action="disable-local-scheduling">Disable Local Scheduling</button>',
+      ].join("\n");
+    }
+    return `<button type="button" data-action="enable-local-scheduling" disabled${reason}>Enable Local Scheduling</button>`;
+  }
+  return enabled
+    ? [
+        '<button type="button" data-action="verify-local-scheduling">Verify Local Scheduling</button>',
+        '<button type="button" data-action="disable-local-scheduling">Disable Local Scheduling</button>',
+      ].join("\n")
+    : '<button type="button" data-action="enable-local-scheduling">Enable Local Scheduling</button>';
 }
 
 function renderInlineError(message: string): string {
@@ -1683,6 +2234,10 @@ function parseScheduleDetailWebviewMessage(
     };
   }
 
+  if (isLocalSchedulingWebviewAction(message.type)) {
+    return { type: message.type, scheduleId: message.scheduleId };
+  }
+
   if (message.type === "save" && isRecord(message.fields)) {
     return {
       type: "save",
@@ -1692,6 +2247,16 @@ function parseScheduleDetailWebviewMessage(
   }
 
   return undefined;
+}
+
+function isLocalSchedulingWebviewAction(
+  value: unknown,
+): value is LocalSchedulingWebviewAction {
+  return (
+    value === "enable-local-scheduling" ||
+    value === "verify-local-scheduling" ||
+    value === "disable-local-scheduling"
+  );
 }
 
 function isScheduleDetailActionKind(
@@ -1816,6 +2381,8 @@ class VsCodeScheduleCommandController {
   private readonly languageModelToolResultFactory:
     | VsCodeLanguageModelToolResultFactory
     | undefined;
+  private readonly localSchedulingSetupAvailability:
+    | VsCodeSchedulerServices["localSchedulingSetupAvailability"];
   private readonly scheduleDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
 
   constructor(options: VsCodeScheduleCommandControllerOptions) {
@@ -1828,6 +2395,8 @@ class VsCodeScheduleCommandController {
     this.scheduleTreeProvider = options.scheduleTreeProvider;
     this.scheduleCreationFlow = options.scheduleCreationFlow;
     this.languageModelToolResultFactory = options.languageModelToolResultFactory;
+    this.localSchedulingSetupAvailability =
+      options.services.localSchedulingSetupAvailability;
     const modelRefreshSubscription = this.modelCatalog?.onDidChangeScheduleModels?.(
       () => {
         void this.refreshOpenScheduleDetailPanels();
@@ -1994,6 +2563,10 @@ class VsCodeScheduleCommandController {
       ...state,
       modelOptions,
       modelCatalogAvailable: this.modelCatalog !== undefined,
+      ...(this.localSchedulingSetupAvailability && {
+        localSchedulingSetupAvailability:
+          this.localSchedulingSetupAvailability,
+      }),
     });
   }
 
@@ -2007,6 +2580,13 @@ class VsCodeScheduleCommandController {
     }
 
     try {
+      if (isLocalSchedulingWebviewAction(message.type)) {
+        await this.runLocalSchedulingAction(message.type);
+        await this.refreshOpenScheduleDetailPanels();
+        this.refreshScheduleTree();
+        return;
+      }
+
       if (message.type === "delete") {
         await this.confirmAndDeleteSchedule(message.scheduleId);
         return;
@@ -2020,8 +2600,8 @@ class VsCodeScheduleCommandController {
             )
           : await this.runScheduleDetailAction(
               message.scheduleId,
-              message.type,
-              message.fields,
+              message.type as ScheduleDetailActionKind,
+              "fields" in message ? message.fields : undefined,
             );
       await this.renderScheduleDetailPanel(panel, detail);
       this.refreshScheduleTree();
@@ -2031,6 +2611,49 @@ class VsCodeScheduleCommandController {
         message.scheduleId,
         errorMessageFor(error),
       );
+    }
+  }
+
+  private async runLocalSchedulingAction(
+    action: LocalSchedulingWebviewAction,
+  ): Promise<void> {
+    switch (action) {
+      case "enable-local-scheduling":
+        if (!this.editor.enableLocalScheduling) {
+          throw new Error("Local scheduling setup is not configured.");
+        }
+        const enableResult = await this.editor.enableLocalScheduling();
+        if (enableResult.applied === false) {
+          throw new Error("The Local Scheduling trigger was not installed.");
+        }
+        await this.window.showInformationMessage?.(
+          "AgentScheduler Local Scheduling is enabled.",
+        );
+        return;
+      case "verify-local-scheduling":
+        if (!this.editor.verifyLocalScheduling) {
+          throw new Error("Local scheduling verification is not configured.");
+        }
+        const verifyResult = await this.editor.verifyLocalScheduling();
+        if (verifyResult.applied === false) {
+          throw new Error("The Local Scheduling trigger could not be verified.");
+        }
+        await this.window.showInformationMessage?.(
+          "AgentScheduler Local Scheduling trigger was verified.",
+        );
+        return;
+      case "disable-local-scheduling":
+        if (!this.editor.disableLocalScheduling) {
+          throw new Error("Local scheduling removal is not configured.");
+        }
+        const disableResult = await this.editor.disableLocalScheduling();
+        if (disableResult.applied === false) {
+          throw new Error("The Local Scheduling trigger was not removed.");
+        }
+        await this.window.showInformationMessage?.(
+          "AgentScheduler Local Scheduling is disabled.",
+        );
+        return;
     }
   }
 
