@@ -21,6 +21,7 @@ import {
   SCHEDULE_LIST_VIEW_ID,
   SQLITE_LOCAL_STORE_FILENAME,
   ScheduleTreeDataProvider,
+  VsCodeTaskCopilotInteractiveExecutor,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
   renderScheduleDetailWebviewHtml,
@@ -45,6 +46,7 @@ import {
   type VsCodeWebviewPanelLike,
   type VsCodeWebviewLike,
   type VsCodeWindowLike,
+  type VsCodeTasksLike,
 } from "../src/vscodeExtensionAdapter.js";
 import {
   FakeClock,
@@ -54,6 +56,51 @@ import {
 } from "../src/testing.js";
 
 describe("VS Code extension adapter", () => {
+  it("runs interactive Copilot through a VS Code Task terminal and waits for completion", async () => {
+    const tasks = new RecordingTasks();
+    const created: Array<{ name: string; command: string; args: readonly string[] }> = [];
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(tasks, {
+      createCopilotTask: (name, command, args) => {
+        created.push({ name, command, args });
+        return { name };
+      },
+    });
+
+    const resultPromise = executor.run("copilot", ["-i", "Review once."], {
+      schedule: {
+        id: "schedule_1",
+        revision: 1,
+        status: "draft",
+        enabled: false,
+        runInstructions: "Review once.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/project" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "default-approvals",
+        runCounter: { completed: 0, limit: null },
+        nextRunAt: null,
+        lastRunAt: null,
+        createdAt: "2026-07-07T16:00:00.000Z",
+        updatedAt: "2026-07-07T16:00:00.000Z",
+      },
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:05:00.000Z",
+      runInstructions: "Review once.",
+      resolvedHarnessPolicy: {} as never,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    tasks.finish(0);
+
+    assert.equal((await resultPromise).status, "completed");
+    assert.deepEqual(created, [
+      {
+        name: "AgentScheduler: schedule_1",
+        command: "copilot",
+        args: ["-i", "Review once."],
+      },
+    ]);
+  });
   it("registers the root package as a local UI extension with schedule commands", async () => {
     const manifest = JSON.parse(
       await readFile("package.json", "utf8"),
@@ -224,7 +271,7 @@ describe("VS Code extension adapter", () => {
         label: "AgentScheduler",
       },
       harnessMode: "local-copilot",
-      model: "gpt-5",
+      model: "auto",
       approvalMode: "default-approvals",
     });
     assert.equal(Object.hasOwn(input, "runCap"), false);
@@ -318,8 +365,42 @@ describe("VS Code extension adapter", () => {
     );
     assert.match(
       requiredPanel(window).webview.html,
-      /Saved model is unavailable or legacy in this VS Code environment\./,
+      /Saved model is unavailable or legacy for the selected harness\./,
     );
+  });
+
+  it("prefers Local Copilot harness model selectors over VS Code chat model ids", async () => {
+    class ModelAwareHarness extends FakeHarness {
+      async models() {
+        return [{ id: "auto", displayName: "Auto", vendor: "GitHub Copilot" }];
+      }
+    }
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new ModelAwareHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle), lifecycle },
+      viewColumn: 1,
+      languageModel: new RecordingLanguageModel([
+        { id: "vscode-chat-model", displayName: "VS Code Chat Model" },
+      ]),
+    });
+
+    const detail = (await commandCallback(commands, NEW_SCHEDULE_COMMAND)()) as ScheduleDetailView;
+    assert.equal(detail.schedule.model, "auto");
+    assert.match(requiredPanel(window).webview.html, /value="auto" selected/);
+    assert.doesNotMatch(requiredPanel(window).webview.html, /vscode-chat-model/);
   });
 
   it("keeps a manual model input fallback when VS Code reports no chat models", async () => {
@@ -357,14 +438,14 @@ describe("VS Code extension adapter", () => {
       NEW_SCHEDULE_COMMAND,
     )()) as ScheduleDetailView;
 
-    assert.equal(detail.schedule.model, "gpt-5");
+    assert.equal(detail.schedule.model, "auto");
     assert.match(
       requiredPanel(window).webview.html,
-      /name="model"[^>]*value="gpt-5"/,
+      /name="model"[^>]*value="auto"/,
     );
     assert.match(
       requiredPanel(window).webview.html,
-      /No VS Code chat models were reported; enter a model id manually\./,
+      /selected harness reported no model choices/,
     );
   });
 
@@ -694,7 +775,7 @@ describe("VS Code extension adapter", () => {
       label: "AgentScheduler",
     });
     assert.equal(result.schedule.harnessMode, "local-copilot");
-    assert.equal(result.schedule.model, "gpt-5");
+    assert.equal(result.schedule.model, "auto");
     assert.equal(result.schedule.approvalMode, "default-approvals");
     assert.deepEqual(result.schedule.runCounter, { completed: 0, limit: 2 });
     assert.equal(window.informationMessages.length, 1);
@@ -1336,7 +1417,7 @@ describe("VS Code extension adapter", () => {
       label: "AgentScheduler",
     });
     assert.equal(detail.schedule.harnessMode, "local-copilot");
-    assert.equal(detail.schedule.model, "gpt-5");
+    assert.equal(detail.schedule.model, "auto");
     assert.equal(detail.schedule.approvalMode, "default-approvals");
     assert.deepEqual(detail.schedule.runCounter, { completed: 0, limit: null });
 
@@ -1348,7 +1429,7 @@ describe("VS Code extension adapter", () => {
       retainContextWhenHidden: true,
     });
     assert.match(panel?.webview.html ?? "", /Editable Fields/);
-    assert.match(panel?.webview.html ?? "", /name="model"[^>]*value="gpt-5"/);
+    assert.match(panel?.webview.html ?? "", /name="model"[^>]*value="auto"/);
     assert.match(panel?.webview.html ?? "", /data-action="activate"/);
     assert.match(
       panel?.webview.html ?? "",
@@ -2149,7 +2230,7 @@ describe("VS Code extension adapter", () => {
     assert.match(requiredPanel(window).webview.html, /role="alert"/);
     assert.match(
       requiredPanel(window).webview.html,
-      /Selected model &#39;legacy-model&#39; is not available in this VS Code\/Copilot environment\./,
+      /Selected model &#39;legacy-model&#39; is not runnable by the selected harness\./,
     );
 
     await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(active.id);
@@ -2161,7 +2242,7 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual(await store.listRunHistory(active.id), []);
     assert.match(
       requiredPanel(window).webview.html,
-      /Selected model &#39;legacy-model&#39; is not available in this VS Code\/Copilot environment\./,
+      /Selected model &#39;legacy-model&#39; is not runnable by the selected harness\./,
     );
   });
 
@@ -2360,6 +2441,24 @@ class RecordingCommands implements VsCodeCommandsLike {
         this.registrations.delete(command);
       },
     };
+  }
+}
+
+class RecordingTasks implements VsCodeTasksLike {
+  private readonly execution = {};
+  private listener: ((event: { execution: object; exitCode: number }) => unknown) | undefined;
+
+  async executeTask(): Promise<object> {
+    return this.execution;
+  }
+
+  onDidEndTaskProcess(listener: (event: { execution: object; exitCode: number }) => unknown) {
+    this.listener = listener;
+    return { dispose: () => { this.listener = undefined; } };
+  }
+
+  finish(exitCode: number): void {
+    this.listener?.({ execution: this.execution, exitCode });
   }
 }
 

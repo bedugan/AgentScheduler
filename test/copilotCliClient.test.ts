@@ -10,6 +10,7 @@ import {
   type CopilotCliCommandResult,
   type CopilotCliCommandRunOptions,
   type CopilotCliCommandRunner,
+  type CopilotInteractiveExecutor,
   type Schedule,
 } from "../src/index.js";
 
@@ -60,23 +61,19 @@ describe("Copilot CLI local client", () => {
     assert.match(availability.reason, /COPILOT_GITHUB_TOKEN/);
   });
 
-  it("checks availability lazily through the injected runner and caches the result", async () => {
-    const runner = new RecordingCopilotCliCommandRunner({
-      exitCode: 0,
-      stdout: "GitHub Copilot CLI 1.0.25",
-      stderr: "",
-    });
+  it("refreshes availability so repairing Copilot CLI is detected without restart", async () => {
+    const runner = new RecordingCopilotCliCommandRunner([
+      { exitCode: null, stdout: "", stderr: "", errorCode: "ENOENT" },
+      { exitCode: 0, stdout: "GitHub Copilot CLI 1.0.25", stderr: "" },
+    ]);
     const client = new CopilotCliLocalClient({
       command: "/custom/copilot",
       runner,
     });
 
     assert.equal(client.currentAvailability(), undefined);
-    assert.deepEqual(await client.checkAvailability(), {
-      status: "available",
-      approvalSurfaceAvailable: false,
-    });
-    assert.deepEqual(await client.checkAvailability(), {
+    assert.equal((await client.refreshAvailability()).status, "unavailable");
+    assert.deepEqual(await client.refreshAvailability(), {
       status: "available",
       approvalSurfaceAvailable: false,
     });
@@ -87,7 +84,57 @@ describe("Copilot CLI local client", () => {
         args: ["--version"],
         options: { timeoutMs: 5_000 },
       },
+      {
+        command: "/custom/copilot",
+        args: ["--version"],
+        options: { timeoutMs: 5_000 },
+      },
     ]);
+  });
+
+  it("runs manual Default Approvals through the configured interactive approval surface", async () => {
+    const runner = new RecordingCopilotCliCommandRunner({
+      exitCode: 0,
+      stdout: "GitHub Copilot CLI 1.0.25",
+      stderr: "",
+    });
+    const interactiveExecutor = new RecordingInteractiveExecutor();
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+      interactiveExecutor,
+    });
+    const schedule = createSchedule({
+      approvalMode: "default-approvals",
+      model: "auto",
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+      },
+    });
+
+    assert.deepEqual(await client.checkAvailability(schedule), {
+      status: "available",
+      approvalSurfaceAvailable: true,
+    });
+    const result = await client.start({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      runInstructions: schedule.runInstructions,
+      resolvedHarnessPolicy: resolveCopilotLocalHarnessPolicy({
+        approvalMode: "default-approvals",
+        unattended: false,
+      }),
+    });
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(interactiveExecutor.calls[0]?.args.slice(0, -1), [
+      "-C",
+      "/Users/ada/src/AgentScheduler",
+      "-i",
+    ]);
+    assert.equal(runner.calls.length, 1);
   });
 
   it("adds supported permission flags from help when Bypass Approvals needs them", async () => {
@@ -373,6 +420,21 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
       throw new Error("RecordingCopilotCliCommandRunner has no results.");
     }
     return structuredClone(result);
+  }
+}
+
+class RecordingInteractiveExecutor implements CopilotInteractiveExecutor {
+  readonly calls: Array<{ command: string; args: string[] }> = [];
+
+  async run(command: string, args: readonly string[]) {
+    this.calls.push({ command, args: [...args] });
+    return {
+      externalRunId: "vscode-task:1",
+      status: "completed" as const,
+      completedAt: "2026-07-07T16:00:00.000Z",
+      summary: "Interactive Copilot task completed.",
+      executedModel: null,
+    };
   }
 }
 

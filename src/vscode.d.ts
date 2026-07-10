@@ -35,6 +35,39 @@ declare module "vscode" {
     subscriptions: Disposable[];
   }
 
+  export interface TaskExecution {}
+  export interface TaskProcessEndEvent {
+    execution: TaskExecution;
+    exitCode: number | undefined;
+  }
+  export class ProcessExecution {
+    constructor(process: string, args?: string[]);
+  }
+  export class Task {
+    constructor(
+      definition: { type: string },
+      scope: unknown,
+      name: string,
+      source: string,
+      execution: ProcessExecution,
+    );
+    presentationOptions: {
+      reveal?: unknown;
+      panel?: unknown;
+      focus?: boolean;
+      clear?: boolean;
+    };
+  }
+  export const TaskScope: { Workspace: unknown };
+  export const TaskRevealKind: { Always: unknown };
+  export const TaskPanelKind: { Dedicated: unknown };
+  export const tasks: {
+    executeTask(task: Task): Promise<TaskExecution>;
+    onDidEndTaskProcess(
+      listener: (event: TaskProcessEndEvent) => unknown,
+    ): Disposable;
+  };
+
   export interface WorkspaceFolder {
     name: string;
     uri: Uri;

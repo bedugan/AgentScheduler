@@ -28,5 +28,5 @@ export function isScheduleModelAvailable(
 }
 
 export function unavailableScheduleModelMessage(modelId: string): string {
-  return `Selected model '${modelId}' is not available in this VS Code/Copilot environment. Choose an available model or refresh VS Code's chat model list.`;
+  return `Selected model '${modelId}' is not runnable by the selected harness. Choose a model reported by that Harness Mode.`;
 }

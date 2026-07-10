@@ -51,6 +51,7 @@ import type {
 } from "./localSchedulingSetup.js";
 import { defaultLocalSchedulingSetupState } from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
+import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 
 export interface Clock {
   now(): Date;
@@ -157,6 +158,21 @@ export class ScheduleLifecycle {
     return SUPPORTED_HARNESS_MODES.map((mode) =>
       this.harnessModeAvailabilityFor(mode),
     );
+  }
+
+  async refreshHarnessModeAvailability(
+    mode: HarnessMode,
+    schedule?: Schedule,
+  ): Promise<ScheduleHarnessModeAvailability> {
+    const harness = this.harnesses.get(mode);
+    if (harness?.refreshAvailability) {
+      return harness.refreshAvailability(schedule);
+    }
+    return this.harnessModeAvailabilityFor(mode);
+  }
+
+  async listHarnessModels(mode: HarnessMode): Promise<readonly ScheduleModelOption[]> {
+    return (await this.harnesses.get(mode)?.models?.()) ?? [];
   }
 
   async exportSchedules(
@@ -344,6 +360,9 @@ export class ScheduleLifecycle {
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
     const schedule = await this.requireSchedule(scheduleId);
+    if (schedule.harnessMode) {
+      await this.refreshHarnessModeAvailability(schedule.harnessMode, schedule);
+    }
     const previousRuns = await this.store.listRunHistory(scheduleId);
     const localSchedulingEnabled = await this.isLocalSchedulingEnabled();
 
@@ -1293,7 +1312,17 @@ export class ScheduleLifecycle {
       selected,
       message: selected
         ? selected.available
-          ? `${selected.label} is available for activation and manual runs.`
+          ? [
+              `${selected.label} harness is available.`,
+              selected.manualRunReady === false
+                ? selected.manualRunReason
+                : "Manual Run Now is ready in the editor.",
+              selected.unattendedRunReady === false
+                ? selected.unattendedRunReason
+                : "Unattended policy is ready for automatic runs.",
+            ]
+              .filter((message): message is string => Boolean(message))
+              .join(" ")
           : selected.reason ?? unavailableHarnessModeMessage(selected.mode)
         : "Choose an available harness mode before activating or running this schedule.",
     };

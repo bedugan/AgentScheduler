@@ -147,6 +147,10 @@ export interface ScheduleHarnessModeAvailability {
   label: string;
   available: boolean;
   reason?: string;
+  manualRunReady?: boolean;
+  manualRunReason?: string;
+  unattendedRunReady?: boolean;
+  unattendedRunReason?: string;
 }
 
 export interface ScheduleDetailHarnessAvailabilityState {

@@ -587,8 +587,6 @@ describe("local scheduling setup", () => {
       assert.deepEqual(runner.calls[2]?.args.slice(0, -1), [
         "-C",
         "/tmp/agent-scheduler",
-        "--model",
-        "gpt-5",
         "--output-format",
         "json",
         "--no-color",
@@ -847,7 +845,7 @@ function workerSchedule(input: {
       uri: "file:///tmp/agent-scheduler",
     },
     harnessMode: "local-copilot",
-    model: "gpt-5",
+    model: "auto",
     approvalMode: input.approvalMode,
     runCounter: { completed: 0, limit: null },
     nextRunAt: "2000-01-01T00:00:00.000Z",

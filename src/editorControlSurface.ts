@@ -7,7 +7,9 @@ import type {
   ScheduleDetailView,
   ScheduleSummary,
   UpdateScheduleInput,
+  HarnessMode,
 } from "./domain.js";
+import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 import type {
   LocalSchedulingSetup,
   LocalSchedulingSetupResult,
@@ -52,7 +54,18 @@ export class EditorControlSurface {
   }
 
   async listHarnessModeAvailability(): Promise<ScheduleHarnessModeAvailability[]> {
+    await Promise.all(
+      this.lifecycle
+        .listHarnessModeAvailability()
+        .map((availability) =>
+          this.lifecycle.refreshHarnessModeAvailability(availability.mode),
+        ),
+    );
     return this.lifecycle.listHarnessModeAvailability();
+  }
+
+  async listHarnessModels(mode: HarnessMode): Promise<readonly ScheduleModelOption[]> {
+    return this.lifecycle.listHarnessModels(mode);
   }
 
   async openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView> {
