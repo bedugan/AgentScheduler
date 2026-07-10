@@ -151,6 +151,7 @@ export interface ScheduleHarnessModeAvailability {
   manualRunReason?: string;
   unattendedRunReady?: boolean;
   unattendedRunReason?: string;
+  readinessNote?: string;
 }
 
 export interface ScheduleDetailHarnessAvailabilityState {

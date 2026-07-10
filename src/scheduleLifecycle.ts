@@ -1304,7 +1304,7 @@ export class ScheduleLifecycle {
   ): ScheduleDetailView["harnessAvailability"] {
     const modes = this.listHarnessModeAvailability();
     const selected = schedule.harnessMode
-      ? this.harnessModeAvailabilityFor(schedule.harnessMode)
+      ? this.harnessModeAvailabilityFor(schedule.harnessMode, schedule)
       : null;
 
     return {
@@ -1320,6 +1320,7 @@ export class ScheduleLifecycle {
               selected.unattendedRunReady === false
                 ? selected.unattendedRunReason
                 : "Unattended policy is ready for automatic runs.",
+              selected.readinessNote,
             ]
               .filter((message): message is string => Boolean(message))
               .join(" ")
@@ -1488,16 +1489,22 @@ export class ScheduleLifecycle {
       return "Choose an available harness mode before activating or running this schedule.";
     }
 
-    const availability = this.harnessModeAvailabilityFor(schedule.harnessMode);
+    const availability = this.harnessModeAvailabilityFor(
+      schedule.harnessMode,
+      schedule,
+    );
     return availability.available
       ? undefined
       : availability.reason ?? unavailableHarnessModeMessage(schedule.harnessMode);
   }
 
-  harnessModeAvailabilityFor(mode: HarnessMode): ScheduleHarnessModeAvailability {
+  harnessModeAvailabilityFor(
+    mode: HarnessMode,
+    schedule?: Schedule,
+  ): ScheduleHarnessModeAvailability {
     const harness = this.harnesses.get(mode);
     if (harness?.availability) {
-      return harness.availability();
+      return harness.availability(schedule);
     }
 
     const available = !!harness;

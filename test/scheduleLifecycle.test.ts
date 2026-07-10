@@ -1898,6 +1898,67 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.match(repaired.harnessAvailability.message, /available/);
   });
 
+  it("keeps concurrent schedule policy readiness isolated per Schedule Detail", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new CopilotLocalHarness({
+          client: new CopilotCliLocalClient({
+            command: "/custom/copilot",
+            runner: new RecordingCopilotCliCommandRunner({
+              exitCode: 0,
+              stdout: "GitHub Copilot CLI 1.0.25",
+              stderr: "",
+            }),
+            interactiveExecutor: {
+              run: async (_command, _args, request) => ({
+                externalRunId: "unused",
+                status: "completed",
+                completedAt: request.requestedAt,
+                summary: null,
+              }),
+            },
+          }),
+        }),
+      ],
+    });
+    const defaultSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Use user-approved tools.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/default" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const bypassSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run with bypass approvals.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/bypass" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "bypass-approvals",
+    });
+
+    const [defaultDetail, bypassDetail] = await Promise.all([
+      lifecycle.openScheduleDetail(defaultSchedule.id),
+      lifecycle.openScheduleDetail(bypassSchedule.id),
+    ]);
+
+    assert.equal(defaultDetail.harnessAvailability.selected?.manualRunReady, true);
+    assert.equal(
+      defaultDetail.harnessAvailability.selected?.unattendedRunReady,
+      false,
+    );
+    assert.equal(bypassDetail.harnessAvailability.selected?.manualRunReady, true);
+    assert.equal(
+      bypassDetail.harnessAvailability.selected?.unattendedRunReady,
+      true,
+    );
+  });
+
   it("blocks activation when a registered harness reports itself unavailable", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:05:00.000Z"),

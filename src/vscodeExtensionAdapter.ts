@@ -397,28 +397,53 @@ export class VsCodeTaskCopilotInteractiveExecutor
   ) {
     const name = `AgentScheduler: ${request.schedule.id}`;
     const task = this.taskFactory.createCopilotTask(name, command, args);
-    const execution = await this.tasks.executeTask(task);
+    let execution: VsCodeTaskExecutionLike | undefined;
+    const earlyEvents: VsCodeTaskProcessEndEventLike[] = [];
+    let resolveCompletion:
+      | ((result: Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>) => void)
+      | undefined;
+    const completion = new Promise<
+      Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>
+    >((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const complete = (event: VsCodeTaskProcessEndEventLike): void => {
+      subscription.dispose();
+      const completed = event.exitCode === 0;
+      resolveCompletion?.({
+        externalRunId: `vscode-task:${request.schedule.id}:${request.requestedAt}`,
+        status: completed ? "completed" : "failed",
+        completedAt: new Date().toISOString(),
+        summary: completed
+          ? "Interactive Copilot task completed in the VS Code terminal."
+          : `Interactive Copilot task exited with code ${event.exitCode ?? "unknown"}.`,
+        executedModel: null,
+      });
+    };
+    const subscription = this.tasks.onDidEndTaskProcess((event) => {
+      if (!execution) {
+        earlyEvents.push(event);
+        return;
+      }
+      if (event.execution === execution) {
+        complete(event);
+      }
+    });
 
-    return new Promise<Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>>(
-      (resolve) => {
-        const subscription = this.tasks.onDidEndTaskProcess((event) => {
-          if (event.execution !== execution) {
-            return;
-          }
-          subscription.dispose();
-          const completed = event.exitCode === 0;
-          resolve({
-            externalRunId: `vscode-task:${request.schedule.id}:${request.requestedAt}`,
-            status: completed ? "completed" : "failed",
-            completedAt: new Date().toISOString(),
-            summary: completed
-              ? "Interactive Copilot task completed in the VS Code terminal."
-              : `Interactive Copilot task exited with code ${event.exitCode ?? "unknown"}.`,
-            executedModel: null,
-          });
-        });
-      },
+    try {
+      execution = await this.tasks.executeTask(task);
+    } catch (error) {
+      subscription.dispose();
+      throw error;
+    }
+
+    const earlyCompletion = earlyEvents.find(
+      (event) => event.execution === execution,
     );
+    if (earlyCompletion) {
+      complete(earlyCompletion);
+    }
+    return completion;
   }
 }
 

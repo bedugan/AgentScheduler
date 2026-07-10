@@ -101,6 +101,23 @@ describe("VS Code extension adapter", () => {
       },
     ]);
   });
+
+  it("captures an interactive task exit emitted before executeTask resolves", async () => {
+    const tasks = new RecordingTasks();
+    tasks.exitDuringExecute = 0;
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(tasks, {
+      createCopilotTask: (name) => ({ name }),
+    });
+
+    const result = await Promise.race([
+      executor.run("copilot", ["-i", "Review once."], interactiveTaskRequest()),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Interactive Task completion was missed.")), 50),
+      ),
+    ]);
+
+    assert.equal(result.status, "completed");
+  });
   it("registers the root package as a local UI extension with schedule commands", async () => {
     const manifest = JSON.parse(
       await readFile("package.json", "utf8"),
@@ -2447,8 +2464,12 @@ class RecordingCommands implements VsCodeCommandsLike {
 class RecordingTasks implements VsCodeTasksLike {
   private readonly execution = {};
   private listener: ((event: { execution: object; exitCode: number }) => unknown) | undefined;
+  exitDuringExecute: number | undefined;
 
   async executeTask(): Promise<object> {
+    if (this.exitDuringExecute !== undefined) {
+      this.finish(this.exitDuringExecute);
+    }
     return this.execution;
   }
 
@@ -2460,6 +2481,32 @@ class RecordingTasks implements VsCodeTasksLike {
   finish(exitCode: number): void {
     this.listener?.({ execution: this.execution, exitCode });
   }
+}
+
+function interactiveTaskRequest() {
+  return {
+    schedule: {
+      id: "schedule_early_exit",
+      revision: 1,
+      status: "draft" as const,
+      enabled: false,
+      runInstructions: "Review once.",
+      cadence: { type: "cron" as const, expression: "0 * * * *" },
+      targetContext: { type: "workspace" as const, uri: "file:///tmp/project" },
+      harnessMode: "local-copilot" as const,
+      model: "auto",
+      approvalMode: "default-approvals" as const,
+      runCounter: { completed: 0, limit: null },
+      nextRunAt: null,
+      lastRunAt: null,
+      createdAt: "2026-07-07T16:00:00.000Z",
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    },
+    trigger: "manual" as const,
+    requestedAt: "2026-07-07T16:05:00.000Z",
+    runInstructions: "Review once.",
+    resolvedHarnessPolicy: {} as never,
+  };
 }
 
 interface RecordingPanel extends VsCodeWebviewPanelLike {

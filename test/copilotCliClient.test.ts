@@ -92,6 +92,30 @@ describe("Copilot CLI local client", () => {
     ]);
   });
 
+  it("refreshes a probe-reported authentication failure after login without restart", async () => {
+    const runner = new RecordingCopilotCliCommandRunner([
+      {
+        exitCode: null,
+        stdout: "",
+        stderr: "ERROR: SecItemCopyMatching failed -50",
+      },
+      { exitCode: 0, stdout: "GitHub Copilot CLI 1.0.25", stderr: "" },
+    ]);
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+    });
+
+    assert.deepEqual(await client.refreshAvailability(), {
+      status: "unavailable",
+      reason: COPILOT_CLI_AUTH_UNAVAILABLE_REASON,
+    });
+    assert.deepEqual(await client.refreshAvailability(), {
+      status: "available",
+      approvalSurfaceAvailable: false,
+    });
+  });
+
   it("runs manual Default Approvals through the configured interactive approval surface", async () => {
     const runner = new RecordingCopilotCliCommandRunner({
       exitCode: 0,

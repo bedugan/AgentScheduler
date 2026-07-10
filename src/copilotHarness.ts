@@ -148,7 +148,7 @@ export class CopilotLocalHarness implements AgentHarness {
   private readonly availabilityProvider:
     | (() => ScheduleHarnessModeAvailability)
     | undefined;
-  private lastAvailability: ScheduleHarnessModeAvailability | undefined;
+  private lastClientAvailability: CopilotLocalClientAvailability | undefined;
 
   constructor(options: CopilotLocalHarnessOptions) {
     this.client = options.client;
@@ -159,27 +159,36 @@ export class CopilotLocalHarness implements AgentHarness {
     return [{ id: "auto", displayName: "Auto", vendor: "GitHub Copilot" }];
   }
 
-  availability(): ScheduleHarnessModeAvailability {
-    return (
-      this.lastAvailability ?? this.availabilityProvider?.() ?? {
-        mode: this.mode,
-        label: HARNESS_MODE_LABELS[this.mode],
-        available: true,
-      }
-    );
+  availability(schedule?: Schedule): ScheduleHarnessModeAvailability {
+    if (this.lastClientAvailability) {
+      return this.availabilityProjection(this.lastClientAvailability, schedule);
+    }
+    return this.availabilityProvider?.() ?? {
+      mode: this.mode,
+      label: HARNESS_MODE_LABELS[this.mode],
+      available: true,
+    };
   }
 
   async refreshAvailability(
     schedule?: Schedule,
   ): Promise<ScheduleHarnessModeAvailability> {
     if (!this.client.refreshAvailability && !schedule) {
-      return this.availability();
+      return this.availability(schedule);
     }
     const availability = this.client.refreshAvailability
       ? await this.client.refreshAvailability(schedule)
       : await this.client.checkAvailability(schedule as Schedule);
+    this.lastClientAvailability = availability;
+    return this.availabilityProjection(availability, schedule);
+  }
+
+  private availabilityProjection(
+    availability: CopilotLocalClientAvailability,
+    schedule?: Schedule,
+  ): ScheduleHarnessModeAvailability {
     const defaultApprovals = schedule?.approvalMode === "default-approvals";
-    this.lastAvailability = availability.status === "available"
+    return availability.status === "available"
       ? {
           mode: this.mode,
           label: HARNESS_MODE_LABELS[this.mode],
@@ -196,6 +205,8 @@ export class CopilotLocalHarness implements AgentHarness {
             unattendedRunReason:
               "Unattended Default Approvals blocks before start because no approval surface is available to the background worker.",
           }),
+          readinessNote:
+            "Copilot authentication is verified when a run starts; Copilot CLI exposes no non-mutating authentication-status command.",
         }
       : {
           mode: this.mode,
@@ -203,7 +214,6 @@ export class CopilotLocalHarness implements AgentHarness {
           available: false,
           reason: availability.reason,
         };
-    return this.lastAvailability;
   }
 
   async preflight(

@@ -114,7 +114,7 @@ export type HarnessOpenResult =
 
 export interface AgentHarness {
   readonly mode: HarnessMode;
-  availability?(): ScheduleHarnessModeAvailability;
+  availability?(schedule?: Schedule): ScheduleHarnessModeAvailability;
   refreshAvailability?(
     schedule?: Schedule,
   ): Promise<ScheduleHarnessModeAvailability>;
