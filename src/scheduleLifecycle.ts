@@ -1120,6 +1120,9 @@ export class ScheduleLifecycle {
       if (!commit.committed) {
         continue;
       }
+      if (!commit.applied) {
+        return;
+      }
 
       if (
         pendingDeferredRun &&

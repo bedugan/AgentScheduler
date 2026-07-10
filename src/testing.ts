@@ -120,6 +120,17 @@ export class InMemoryScheduleStore implements ScheduleStore {
     entry: RunHistoryEntry,
     scheduleUpdate: ScheduleRunStateUpdate,
   ): Promise<RunResultCommit> {
+    const existingRun = (this.runHistory.get(entry.scheduleId) ?? []).find(
+      (candidate) => candidate.id === entry.id,
+    );
+    if (
+      !isActiveRunStatus(entry.status) &&
+      existingRun &&
+      !isActiveRunStatus(existingRun.status)
+    ) {
+      return { committed: true, applied: false };
+    }
+
     const schedule = this.schedules.get(scheduleUpdate.scheduleId);
     if (
       !schedule ||
@@ -145,7 +156,7 @@ export class InMemoryScheduleStore implements ScheduleStore {
       updatedAt: scheduleUpdate.updatedAt,
     }));
     this.upsertRunHistory(entry);
-    return { committed: true };
+    return { committed: true, applied: true };
   }
 
   async reserveActiveRun(

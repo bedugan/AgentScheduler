@@ -14,6 +14,7 @@ import type {
   ScheduleStatus,
   TargetContext,
 } from "./domain.js";
+import { isActiveRunStatus } from "./domain.js";
 import {
   defaultLocalSchedulingSetupState,
   type LocalSchedulingSetupState,
@@ -315,6 +316,18 @@ export class SqliteScheduleStore
   ): Promise<RunResultCommit> {
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
+      const existingRun = this.database
+        .prepare("SELECT status FROM run_history WHERE id = $id")
+        .get({ id: entry.id }) as { status: RunStatus } | undefined;
+      if (
+        !isActiveRunStatus(entry.status) &&
+        existingRun &&
+        !isActiveRunStatus(existingRun.status)
+      ) {
+        this.database.exec("COMMIT");
+        return { committed: true, applied: false };
+      }
+
       const result = this.database
         .prepare(`
           UPDATE schedules
@@ -358,7 +371,7 @@ export class SqliteScheduleStore
 
       this.upsertRunHistory(entry);
       this.database.exec("COMMIT");
-      return { committed: true };
+      return { committed: true, applied: true };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

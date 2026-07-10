@@ -1297,6 +1297,56 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     }
   });
 
+  it("applies a concurrent terminal Run Result only once", async () => {
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          startResult: (request) => ({
+            externalRunId: "active-run",
+            status: "running",
+            completedAt: null,
+            summary: `Running ${request.schedule.id}.`,
+          }),
+        }),
+      ],
+    });
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Complete exactly once.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+      runCap: { maxRuns: 2 },
+    });
+    const activeRun = await lifecycle.startManualRun(schedule.id);
+
+    await Promise.all([
+      lifecycle.resolveActiveRun(activeRun.id, {
+        status: "completed",
+        summary: "First completion report.",
+      }),
+      lifecycle.resolveActiveRun(activeRun.id, {
+        status: "completed",
+        summary: "Duplicate completion report.",
+      }),
+    ]);
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+
+    assert.deepEqual(detail.runCounter, { completed: 1, limit: 2 });
+    assert.equal(detail.previousRuns.length, 1);
+    assert.equal(detail.previousRuns[0]?.status, "completed");
+  });
+
   it("keeps approval-waiting runs active until they resolve, then starts deferred catch-up work", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     let startAttempts = 0;

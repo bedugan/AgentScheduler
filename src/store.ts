@@ -36,7 +36,7 @@ export interface ScheduleRunStateUpdate {
 }
 
 export type RunResultCommit =
-  | { committed: true }
+  | { committed: true; applied: boolean }
   | { committed: false };
 
 export interface ScheduleStore {
