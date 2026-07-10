@@ -27,7 +27,6 @@ export const SQLITE_LOCAL_STORE_FILENAME = "agent-scheduler.sqlite";
 export interface VsCodeGlobalStorageContextLike {
   globalStorageUri: { fsPath: string };
 }
-
 export interface VsCodeInstalledExtensionContextLike
   extends VsCodeGlobalStorageContextLike {
   extensionUri: { fsPath: string };
@@ -425,4 +424,3 @@ export function prepareVsCodeLocalScheduling(
     };
   }
 }
-

@@ -21,7 +21,6 @@ export interface ScheduleDetailRenderState {
     reason?: string;
   };
 }
-
 export function renderScheduleDetailWebviewHtml(
   view: ScheduleDetailView,
   state: ScheduleDetailRenderState = {},
@@ -771,4 +770,3 @@ function escapeHtml(value: string): string {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 }
-
