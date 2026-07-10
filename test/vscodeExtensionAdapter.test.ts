@@ -759,6 +759,57 @@ describe("VS Code extension adapter", () => {
     );
   });
 
+  it("strips recurrence wording from VS Code tool-created run instructions", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const languageModel = new RecordingLanguageModel();
+    const window = new RecordingWindow();
+    window.informationMessageResponses.push("Create Active Schedule");
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands: new RecordingCommands(),
+      window,
+      workspace: {
+        workspaceFolders: [
+          {
+            name: "AgentScheduler",
+            uri: {
+              toString: () => "file:///Users/ada/src/AgentScheduler",
+            },
+          },
+        ],
+      },
+      services: { editor, lifecycle },
+      viewColumn: 1,
+      languageModel,
+    });
+
+    const result = (await languageModel
+      .requiredTool(CREATE_SCHEDULE_TOOL_NAME)
+      .invoke({
+        input: {
+          naturalLanguageRequest: "Run every hour and check the current time",
+          runInstructions: "Run every hour and check the current time",
+        },
+      })) as NaturalLanguageScheduleCreationResult;
+
+    assert.equal(result.outcome, "activated");
+    assert.deepEqual(result.schedule.cadence, {
+      type: "cron",
+      expression: "0 * * * *",
+    });
+    assert.equal(result.schedule.runInstructions, "Check the current time.");
+    assert.doesNotMatch(result.schedule.runInstructions, /run every hour/i);
+    assert.match(requiredPanel(window).webview.html, /Check the current time\./);
+  });
+
   it("creates a draft from natural language when the requested harness is unavailable", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:05:00.000Z"),
@@ -1466,7 +1517,20 @@ describe("VS Code extension adapter", () => {
     runNowButton.click();
 
     assert.deepEqual(postedMessages, [
-      { type: "run-now", scheduleId: detail.schedule.id },
+      {
+        type: "run-now",
+        scheduleId: detail.schedule.id,
+        fields: {
+          runInstructions: "",
+          cadenceExpression: "",
+          targetContextUri: "",
+          targetContextLabel: "",
+          harnessMode: "",
+          model: "",
+          approvalMode: "",
+          runCapMaxRuns: "",
+        },
+      },
     ]);
     assert.equal(runNowButton.disabled, true);
     assert.equal(runNowButton.dataset.state, "busy");
@@ -1615,6 +1679,98 @@ describe("VS Code extension adapter", () => {
     assert.match(panel.webview.html, /name="model"[^>]*value="gpt-5\.1"/);
     assert.match(panel.webview.html, /name="runCapMaxRuns"[^>]*value="3"/);
     assert.doesNotMatch(panel.webview.html, /role="alert"/);
+  });
+
+  it("runs Run Now with the current Schedule Detail approval mode fields", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const fakeHarness = new FakeHarness({ mode: "local-copilot" });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [fakeHarness],
+    });
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Run with the current form values.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///Users/ada/src/AgentScheduler",
+        label: "AgentScheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(schedule.id);
+    const panel = requiredPanel(window);
+    clock.set("2026-07-07T17:05:00.000Z");
+    await panel.webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: schedule.id,
+      fields: {
+        runInstructions: "Run with bypass approvals.",
+        cadenceExpression: "0 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "bypass-approvals",
+        runCapMaxRuns: "",
+      },
+    });
+
+    const runs = await store.listRunHistory(schedule.id);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0]?.approvalModeSnapshot, "bypass-approvals");
+    assert.equal(runs[0]?.runInstructionsSnapshot, "Run with bypass approvals.");
+    assert.deepEqual(runs[0]?.resolvedHarnessPolicy, {
+      harnessMode: "local-copilot",
+      approvalMode: "bypass-approvals",
+      sandbox: "fake",
+    });
+    assert.equal(fakeHarness.startRequests.length, 1);
+    const updatedSchedule = await store.getSchedule(schedule.id);
+    assert.equal(updatedSchedule?.revision, 2);
+    assert.equal(updatedSchedule?.nextRunAt, "2026-07-07T17:00:00.000Z");
+    assert.equal(
+      fakeHarness.startRequests[0]?.schedule.approvalMode,
+      "bypass-approvals",
+    );
+    assert.match(panel.webview.html, /Bypass Approvals/);
+
+    await panel.webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: schedule.id,
+      fields: {
+        runInstructions: "Run with bypass approvals.",
+        cadenceExpression: "0 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "bypass-approvals",
+        runCapMaxRuns: "",
+      },
+    });
+
+    const unchangedSchedule = await store.getSchedule(schedule.id);
+    assert.equal(unchangedSchedule?.revision, 2);
+    assert.equal(unchangedSchedule?.nextRunAt, "2026-07-07T17:00:00.000Z");
   });
 
   it("activates a draft schedule from the Schedule Detail panel and refreshes action state", async () => {
@@ -1809,7 +1965,18 @@ describe("VS Code extension adapter", () => {
       idGenerator: new SequentialIdGenerator(),
       localSchedulingEnabled: false,
       store,
-      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          startResult: (request) => ({
+            externalRunId: "history-model-run",
+            status: "completed",
+            completedAt: request.requestedAt,
+            summary: "Fake harness completed the draft run.",
+            executedModel: "claude-haiku-4.5",
+          }),
+        }),
+      ],
     });
     const schedule = await lifecycle.createActiveSchedule({
       runInstructions: "Run the history refresh smoke test.",
@@ -1849,6 +2016,8 @@ describe("VS Code extension adapter", () => {
     assert.deepEqual(completed?.runCounter, { completed: 1, limit: 1 });
     assert.match(panel.webview.html, /Previous Runs/);
     assert.match(panel.webview.html, /<th>Details<\/th>/);
+    assert.match(panel.webview.html, /<th>Executed Model<\/th>/);
+    assert.match(panel.webview.html, /claude-haiku-4\.5/);
     assert.match(panel.webview.html, /completed/);
     assert.match(panel.webview.html, /Fake harness completed the draft run\./);
   });

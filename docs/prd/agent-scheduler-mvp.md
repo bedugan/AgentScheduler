@@ -12,7 +12,7 @@ Build AgentScheduler as a VS Code extension plus a small local worker CLI. VS Co
 
 Users can create schedules through a Codex-like schedule detail view or through natural language in VS Code agent mode. Natural-language creation uses a VS Code language model tool so Copilot can create schedules from prompts such as "run every hour to..." with one confirmation when the request is complete. A chat participant and slash command provide explicit fallback entry points.
 
-Schedules live in a per-user SQLite local store. Run history is stored separately from the schedule registry but linked to it. Run history snapshots the resolved run instructions, approval mode, and resolved harness policy used for each run so past behavior remains auditable after a schedule changes.
+Schedules live in a per-user SQLite local store. Run history is stored separately from the schedule registry but linked to it. Run history snapshots the resolved run instructions, approval mode, scheduled model, executed model when reported by the harness, and resolved harness policy used for each run so past behavior remains auditable after a schedule changes.
 
 Automatic runs require an explicitly installed OS wakeup trigger. AgentScheduler installs that trigger only after user confirmation and prioritizes Windows Task Scheduler first, macOS launchd second, and Linux systemd timer or cron later. Manual runs continue to work when local scheduling is disabled if the selected harness can run from the current VS Code session.
 
@@ -87,6 +87,7 @@ Automatic runs require an explicitly installed OS wakeup trigger. AgentScheduler
 - Present Copilot Approval Modes using the VS Code vocabulary: Default Approvals, Bypass Approvals, and Autopilot.
 - Resolve visible Approval Modes to concrete harness-specific backend settings at run time. For Copilot CLI this may include tool availability, allow/deny tool permissions, permissive modes, and sandbox settings.
 - Snapshot the resolved harness policy in Run History for every run.
+- Snapshot the scheduled model and harness-reported executed model in Run History.
 - Store inline Run Instructions in the schedule for MVP. External prompt files are out of the MVP but should remain possible later.
 - Snapshot the resolved Run Instructions in Run History for every run.
 - Allow editing schedules while runs are active, but edits apply only to future runs. Active runs keep the Schedule Revision they started with.
@@ -96,6 +97,7 @@ Automatic runs require an explicitly installed OS wakeup trigger. AgentScheduler
 - If a selected Agent Harness is unavailable, block the run with a meaningful description. Do not silently fall back.
 - Treat approval-needed after start as an active run state. It occupies the Run Slot until approval resolves, times out, or the user cancels.
 - If Default Approvals would require an approval but no Approval Surface is available, block during Harness Preflight before start.
+- Local Copilot Mode must block run instructions that ask the harness to create secondary schedulers for recurrence. AgentScheduler owns recurrence through Run Cadence and Local Scheduling Setup.
 - Enforce one active run per Run Slot by default. A Run Slot is Target Context plus Harness Mode.
 - When a due run finds its Run Slot occupied, defer and coalesce. Produce at most one catch-up run per schedule.
 - After machine downtime or sleep, coalesce missed due times into at most one Catch-up Run per schedule.

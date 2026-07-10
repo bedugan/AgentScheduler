@@ -541,6 +541,11 @@ describe("local scheduling setup", () => {
         },
         {
           exitCode: 0,
+          stdout: "--no-ask-user\n--allow-all-tools\n--autopilot\n--allow-all",
+          stderr: "",
+        },
+        {
+          exitCode: 0,
           stdout: [
             JSON.stringify({
               type: "assistant",
@@ -567,14 +572,19 @@ describe("local scheduling setup", () => {
       assert.equal(scan.startedRunIds.length, 1);
       assert.equal(scan.diagnostics.dueScheduleCount, 1);
       assert.equal(scan.diagnostics.outcomes.completed, 1);
-      assert.equal(runner.calls.length, 2);
+      assert.equal(runner.calls.length, 3);
       assert.deepEqual(runner.calls[0], {
         command: "/worker/bin/copilot",
         args: ["--version"],
         options: { timeoutMs: 5_000 },
       });
-      assert.equal(runner.calls[1]?.command, "/worker/bin/copilot");
-      assert.deepEqual(runner.calls[1]?.args.slice(0, -1), [
+      assert.deepEqual(runner.calls[1], {
+        command: "/worker/bin/copilot",
+        args: ["--help"],
+        options: { timeoutMs: 5_000 },
+      });
+      assert.equal(runner.calls[2]?.command, "/worker/bin/copilot");
+      assert.deepEqual(runner.calls[2]?.args.slice(0, -1), [
         "-C",
         "/tmp/agent-scheduler",
         "--model",
@@ -586,13 +596,13 @@ describe("local scheduling setup", () => {
         "--allow-all-tools",
         "-p",
       ]);
-      assert.equal(runner.calls[1]?.options?.timeoutMs, 1_800_000);
+      assert.equal(runner.calls[2]?.options?.timeoutMs, 1_800_000);
       assert.match(
-        runner.calls[1]?.args.at(-1) ?? "",
+        runner.calls[2]?.args.at(-1) ?? "",
         /AgentScheduler execution frame/,
       );
       assert.match(
-        runner.calls[1]?.args.at(-1) ?? "",
+        runner.calls[2]?.args.at(-1) ?? "",
         /Run from the worker CLI due scan\./,
       );
 

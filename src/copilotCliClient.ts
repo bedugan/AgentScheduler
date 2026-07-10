@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import type {
+  Schedule,
   ScheduleHarnessModeAvailability,
   TargetContext,
 } from "./domain.js";
@@ -89,16 +90,18 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
     return this.cachedAvailability;
   }
 
-  async checkAvailability(): Promise<CopilotLocalClientAvailability> {
+  async checkAvailability(
+    schedule?: Schedule,
+  ): Promise<CopilotLocalClientAvailability> {
     if (this.cachedAvailability) {
-      return this.cachedAvailability;
+      return this.availabilityWithPermissionFlagSupport(schedule);
     }
 
     const result = await this.runner.run(this.command, ["--version"], {
       timeoutMs: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
     });
     this.cachedAvailability = classifyCopilotCliAvailability(result);
-    return this.cachedAvailability;
+    return this.availabilityWithPermissionFlagSupport(schedule);
   }
 
   async start(request: CopilotLocalStartRequest): Promise<HarnessStartResult> {
@@ -137,6 +140,36 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
       status: "blocked",
       reason: `Copilot CLI run '${request.externalRunId}' cannot be opened until Local Copilot Mode execution is wired.`,
     };
+  }
+
+  private async availabilityWithPermissionFlagSupport(
+    schedule: Schedule | undefined,
+  ): Promise<CopilotLocalClientAvailability> {
+    const availability = this.cachedAvailability;
+    if (!availability) {
+      throw new Error("Copilot CLI availability has not been checked.");
+    }
+    if (
+      availability.status !== "available" ||
+      !scheduleRequiresPermissionFlags(schedule) ||
+      availability.supportedPermissionFlags
+    ) {
+      return availability;
+    }
+
+    const helpResult = await this.runner.run(this.command, ["--help"], {
+      timeoutMs: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
+    });
+    this.cachedAvailability = {
+      ...availability,
+      supportedPermissionFlags:
+        helpResult.exitCode === 0
+          ? supportedPermissionFlagsFromHelp(
+              `${helpResult.stdout}\n${helpResult.stderr}`,
+            )
+          : [],
+    };
+    return this.cachedAvailability;
   }
 }
 
@@ -253,6 +286,21 @@ export function copilotLocalHarnessAvailabilityFor(
   };
 }
 
+function scheduleRequiresPermissionFlags(schedule: Schedule | undefined): boolean {
+  return (
+    schedule?.approvalMode === "bypass-approvals" ||
+    schedule?.approvalMode === "autopilot"
+  );
+}
+
+function supportedPermissionFlagsFromHelp(helpOutput: string): string[] {
+  const supportedFlags = new Set<string>();
+  for (const match of helpOutput.matchAll(/--[a-z][a-z0-9-]*/gi)) {
+    supportedFlags.add(match[0]);
+  }
+  return [...supportedFlags].sort();
+}
+
 class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
   async run(
     command: string,
@@ -340,6 +388,7 @@ function harnessStartResultForCopilotCliCommand(
     status,
     completedAt: request.requestedAt,
     summary: summaryForCopilotCliCommand(status, result, parsed),
+    executedModel: parsed.executedModel ?? null,
   };
 }
 
@@ -348,6 +397,7 @@ interface ParsedCopilotJsonOutput {
   exitCode?: number;
   assistantSummary?: string;
   errorSummary?: string;
+  executedModel?: string;
 }
 
 function parseCopilotJsonOutput(output: string): ParsedCopilotJsonOutput {
@@ -374,6 +424,11 @@ function parseCopilotJsonOutput(output: string): ParsedCopilotJsonOutput {
       parsed.errorSummary = errorSummary;
     }
 
+    const executedModel = executedModelFromEvent(event);
+    if (executedModel) {
+      parsed.executedModel = executedModel;
+    }
+
     if (event.type === "result") {
       const sessionId = stringProperty(event, "sessionId");
       if (sessionId) {
@@ -387,6 +442,38 @@ function parseCopilotJsonOutput(output: string): ParsedCopilotJsonOutput {
   }
 
   return parsed;
+}
+
+function executedModelFromEvent(
+  event: Record<string, unknown>,
+): string | undefined {
+  return (
+    stringProperty(event, "model") ??
+    stringProperty(event, "modelId") ??
+    stringProperty(event, "resolvedModel") ??
+    stringPropertyFromNested(event, ["data", "model"]) ??
+    stringPropertyFromNested(event, ["data", "modelId"]) ??
+    stringPropertyFromNested(event, ["data", "resolvedModel"]) ??
+    stringPropertyFromNested(event, ["response", "model"]) ??
+    stringPropertyFromNested(event, ["message", "model"])
+  );
+}
+
+function stringPropertyFromNested(
+  value: Record<string, unknown>,
+  path: readonly string[],
+): string | undefined {
+  let current: unknown = value;
+  for (const segment of path) {
+    if (!isRecord(current)) {
+      return undefined;
+    }
+    current = current[segment];
+  }
+
+  return typeof current === "string" && current.trim().length > 0
+    ? current.trim()
+    : undefined;
 }
 
 function summaryForCopilotCliCommand(
@@ -481,7 +568,7 @@ function stringProperty(
 ): string | undefined {
   const property = value[propertyName];
   return typeof property === "string" && property.trim().length > 0
-    ? property
+    ? property.trim()
     : undefined;
 }
 

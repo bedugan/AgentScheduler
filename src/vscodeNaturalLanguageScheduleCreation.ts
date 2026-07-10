@@ -244,9 +244,9 @@ export class VsCodeNaturalLanguageScheduleCreationFlow {
     input: NaturalLanguageScheduleCreationInput,
     availableModels: readonly ScheduleModelOption[],
   ): CreateDraftScheduleInput {
-    const runInstructions =
-      normalizeSentence(input.runInstructions) ??
-      inferRunInstructions(input.naturalLanguageRequest);
+    const runInstructions = normalizedRunInstructionsFrom(
+      input.runInstructions ?? input.naturalLanguageRequest,
+    );
     const cadence = input.cadence ?? inferCadence(input.naturalLanguageRequest);
     const targetContext = input.targetContext ?? this.currentWorkspace;
     const harnessMode =
@@ -420,7 +420,7 @@ function inferHarnessMode(request: string): HarnessMode | undefined {
   return undefined;
 }
 
-function inferRunInstructions(request: string): string | undefined {
+function normalizedRunInstructionsFrom(request: string): string | undefined {
   const singleRunRequest = stripCadenceControlText(request);
   const match = /\bto\s+(.+)$/i.exec(singleRunRequest);
   return normalizeSentence(match?.[1] ?? singleRunRequest);

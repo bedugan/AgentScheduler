@@ -112,6 +112,7 @@ export interface RunHistoryEntry {
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
   harnessMode: HarnessMode | null;
   model: string;
+  executedModel: string | null;
   targetContext: TargetContext | null;
   externalRunId: string | null;
   summary: string | null;
@@ -250,6 +251,8 @@ export interface RunHistoryDetailView {
   scheduleRevision: number;
   resolvedRunInstructions: string;
   approvalMode: ApprovalMode;
+  selectedModel: string;
+  executedModel: string | null;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
   outcome: RunOutcomeView;
 }

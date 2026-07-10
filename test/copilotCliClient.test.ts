@@ -90,6 +90,51 @@ describe("Copilot CLI local client", () => {
     ]);
   });
 
+  it("adds supported permission flags from help when Bypass Approvals needs them", async () => {
+    const runner = new RecordingCopilotCliCommandRunner([
+      {
+        exitCode: 0,
+        stdout: "GitHub Copilot CLI 1.0.25",
+        stderr: "",
+      },
+      {
+        exitCode: 0,
+        stdout: "",
+        stderr: "Usage: copilot [--no-ask-user] [--allow-all-tools]",
+      },
+    ]);
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+    });
+
+    const availability = await client.checkAvailability(
+      createSchedule({
+        approvalMode: "bypass-approvals",
+        model: "gpt-5",
+        targetContext: null,
+      }),
+    );
+
+    assert.deepEqual(availability, {
+      status: "available",
+      approvalSurfaceAvailable: false,
+      supportedPermissionFlags: ["--allow-all-tools", "--no-ask-user"],
+    });
+    assert.deepEqual(runner.calls, [
+      {
+        command: "/custom/copilot",
+        args: ["--version"],
+        options: { timeoutMs: 5_000 },
+      },
+      {
+        command: "/custom/copilot",
+        args: ["--help"],
+        options: { timeoutMs: 5_000 },
+      },
+    ]);
+  });
+
   it("runs a bypass-approval manual schedule through Copilot CLI prompt mode", async () => {
     const runner = new RecordingCopilotCliCommandRunner({
       exitCode: 0,
@@ -108,6 +153,7 @@ describe("Copilot CLI local client", () => {
           type: "result",
           sessionId: "fec78c0b-fe67-4e92-90d3-6147089dab90",
           exitCode: 0,
+          model: "claude-haiku-4.5",
         }),
       ].join("\n"),
       stderr: "",
@@ -142,6 +188,7 @@ describe("Copilot CLI local client", () => {
       status: "completed",
       completedAt: "2026-07-07T16:00:00.000Z",
       summary: "Reviewed the workspace and finished.",
+      executedModel: "claude-haiku-4.5",
     });
     assert.equal(runner.calls.length, 1);
     assert.equal(runner.calls[0]?.command, "/custom/copilot");
@@ -296,6 +343,7 @@ describe("Copilot CLI local client", () => {
       status: "failed",
       completedAt: "2026-07-07T16:00:00.000Z",
       summary: "Copilot CLI could not complete the request.",
+      executedModel: null,
     });
   });
 });

@@ -26,7 +26,11 @@ import {
   type LocalSchedulingSetupState,
   type LocalSchedulingSetupStore,
 } from "./localSchedulingSetup.js";
-import { cloneStoreValue, type ScheduleStore } from "./store.js";
+import {
+  cloneStoreValue,
+  type ActiveRunReservationResult,
+  type ScheduleStore,
+} from "./store.js";
 
 export class FakeClock implements Clock {
   private current: Date;
@@ -104,6 +108,22 @@ export class InMemoryScheduleStore implements ScheduleStore {
       entries[existingIndex] = cloneStoreValue(entry);
     }
     this.runHistory.set(entry.scheduleId, entries);
+  }
+
+  async reserveActiveRun(
+    entry: RunHistoryEntry,
+  ): Promise<ActiveRunReservationResult> {
+    const occupyingRun = (await this.listActiveRuns()).find(
+      (candidate) =>
+        candidate.scheduleId === entry.scheduleId ||
+        sameRunSlot(candidate, entry),
+    );
+    if (occupyingRun) {
+      return { reserved: false, occupyingRun };
+    }
+
+    await this.saveRunHistory(entry);
+    return { reserved: true, run: cloneStoreValue(entry) };
   }
 
   async getRunHistoryEntry(id: string): Promise<RunHistoryEntry | undefined> {
@@ -313,4 +333,16 @@ export class FakeHarness implements AgentHarness {
       sandbox: "fake",
     };
   }
+}
+
+function sameRunSlot(left: RunHistoryEntry, right: RunHistoryEntry): boolean {
+  return (
+    left.harnessMode !== null &&
+    right.harnessMode !== null &&
+    left.targetContext !== null &&
+    right.targetContext !== null &&
+    left.harnessMode === right.harnessMode &&
+    left.targetContext.type === right.targetContext.type &&
+    left.targetContext.uri === right.targetContext.uri
+  );
 }

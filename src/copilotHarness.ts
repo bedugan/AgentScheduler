@@ -84,6 +84,7 @@ export type CopilotLocalClientAvailability =
   | {
       status: "available";
       approvalSurfaceAvailable: boolean;
+      supportedPermissionFlags?: readonly string[];
     }
   | {
       status: "unavailable";
@@ -166,12 +167,35 @@ export class CopilotLocalHarness implements AgentHarness {
       approvalMode: request.schedule.approvalMode,
       unattended: isUnattendedRun(request),
     });
+    const secondarySchedulerReason = secondarySchedulerPolicyReason(
+      request.schedule.runInstructions,
+    );
+    if (secondarySchedulerReason) {
+      return {
+        status: "blocked",
+        reason: secondarySchedulerReason,
+        resolvedHarnessPolicy,
+      };
+    }
+
     const availability = await this.client.checkAvailability(request.schedule);
 
     if (availability.status === "unavailable") {
       return {
         status: "blocked",
         reason: availability.reason,
+        resolvedHarnessPolicy,
+      };
+    }
+
+    const unsupportedPermissionFlags = unsupportedRequiredPermissionFlags(
+      resolvedHarnessPolicy.localCopilotMode.cli.permissionFlags,
+      availability.supportedPermissionFlags,
+    );
+    if (unsupportedPermissionFlags.length > 0) {
+      return {
+        status: "blocked",
+        reason: `Local Copilot Mode cannot verify the selected Approval Mode because GitHub Copilot CLI does not report support for required permission flag(s): ${unsupportedPermissionFlags.join(", ")}.`,
         resolvedHarnessPolicy,
       };
     }
@@ -379,4 +403,40 @@ function defaultApprovalsApprovalSurfaceReason(unattended: boolean): string {
   return unattended
     ? "Default Approvals requires an approval surface for unattended Local Copilot Mode runs, but no approval surface is available."
     : "Default Approvals requires an approval surface for Local Copilot Mode, but no approval surface is available.";
+}
+
+function unsupportedRequiredPermissionFlags(
+  requiredFlags: readonly string[],
+  supportedFlags: readonly string[] | undefined,
+): string[] {
+  if (!supportedFlags) {
+    return [];
+  }
+
+  const supported = new Set(supportedFlags);
+  return requiredFlags.filter((flag) => !supported.has(flag));
+}
+
+function secondarySchedulerPolicyReason(
+  runInstructions: string,
+): string | undefined {
+  if (!requestsSecondaryScheduler(runInstructions)) {
+    return undefined;
+  }
+
+  return "Local Copilot Mode cannot run instructions that ask the harness to create scheduled tasks, cron entries, launch agents, timers, background loops, detached processes, or other secondary schedulers. AgentScheduler owns recurrence; move recurrence into the schedule cadence or use AgentScheduler Local Scheduling Setup.";
+}
+
+function requestsSecondaryScheduler(value: string): boolean {
+  const normalized = value.toLowerCase();
+  const requestsRecurringExecution =
+    /\b(run|check|execute|perform)\s+every\s+(hour|day|week|[1-9]\d?\s+minutes?)\b/.test(
+      normalized,
+    );
+  const requestsSchedulerCreation =
+    /\b(create|register|install|configure|set\s+up|add|start|launch)\b[^.!?\n]{0,160}\b(task scheduler|scheduled task|scheduled job|schtasks|cron(?: entry)?|crontab|systemd timer|launch agent|launchd|background loop|detached process|daemon|watcher)\b/.test(
+      normalized,
+    );
+
+  return requestsRecurringExecution || requestsSchedulerCreation;
 }

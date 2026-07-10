@@ -627,6 +627,64 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.equal(detail.nextRunAt, null);
   });
 
+  it("records selected and executed models separately in run history", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const executedModels = ["claude-haiku-4.5", "gpt-5.1"];
+    let runIndex = 0;
+    const fakeHarness = new FakeHarness({
+      mode: "local-copilot",
+      startResult: (request) => {
+        const executedModel = executedModels[runIndex] ?? "unknown-model";
+        runIndex += 1;
+        return {
+          externalRunId: `model-run-${runIndex}`,
+          status: "completed",
+          completedAt: request.requestedAt,
+          summary: `Ran with ${executedModel}.`,
+          executedModel,
+        };
+      },
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [fakeHarness],
+    });
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Run with the auto-selected model.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+
+    await lifecycle.startManualRun(schedule.id);
+    clock.set("2026-07-07T16:10:00.000Z");
+    await lifecycle.startManualRun(schedule.id);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.deepEqual(
+      detail.previousRuns.map((run) => run.model),
+      ["auto", "auto"],
+    );
+    assert.deepEqual(
+      detail.previousRuns.map((run) => run.executedModel),
+      ["gpt-5.1", "claude-haiku-4.5"],
+    );
+
+    const historyDetail = await lifecycle.openRunHistoryDetail(
+      detail.previousRuns[0]?.id ?? "",
+    );
+    assert.equal(historyDetail.selectedModel, "auto");
+    assert.equal(historyDetail.executedModel, "gpt-5.1");
+  });
+
   it("rejects manual runs after a finite run cap is completed until explicit restart", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const fakeHarness = new FakeHarness({ mode: "local-copilot" });
@@ -871,7 +929,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     );
   });
 
-  it("blocks concurrent manual starts for the same schedule or Run Slot before harness start completes", async () => {
+  it("keeps concurrent manual starts idempotent for the same schedule and blocks the Run Slot", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const slowHarness = new SlowStartHarness("local-copilot");
     const lifecycle = new ScheduleLifecycle({
@@ -908,8 +966,9 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const sameScheduleRun = await lifecycle.startManualRun(firstSchedule.id);
     const sameSlotRun = await lifecycle.startManualRun(sameSlotSchedule.id);
 
-    assert.equal(sameScheduleRun.status, "blocked");
-    assert.match(sameScheduleRun.error ?? "", /Run slot is occupied/);
+    assert.equal(sameScheduleRun.status, "running");
+    assert.equal(sameScheduleRun.scheduleId, firstSchedule.id);
+    assert.equal(sameScheduleRun.summary, "Run is starting.");
     assert.equal(sameSlotRun.status, "blocked");
     assert.match(sameSlotRun.error ?? "", /Run slot is occupied/);
     assert.equal(slowHarness.startRequests.length, 1);
@@ -918,14 +977,75 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const firstRun = await firstRunPromise;
 
     assert.equal(firstRun.status, "completed");
+    assert.equal(firstRun.id, sameScheduleRun.id);
     assert.equal(slowHarness.startRequests.length, 1);
 
     const firstDetail = await lifecycle.openScheduleDetail(firstSchedule.id);
-    assert.equal(firstDetail.previousRuns.length, 2);
-    assert.deepEqual(
-      firstDetail.previousRuns.map((run) => run.status).sort(),
-      ["blocked", "completed"],
-    );
+    assert.equal(firstDetail.previousRuns.length, 1);
+    assert.equal(firstDetail.previousRuns[0]?.status, "completed");
+
+    const sameSlotDetail = await lifecycle.openScheduleDetail(sameSlotSchedule.id);
+    assert.equal(sameSlotDetail.previousRuns.length, 1);
+    assert.equal(sameSlotDetail.previousRuns[0]?.status, "blocked");
+  });
+
+  it("uses the SQLite local store reservation to suppress duplicate Run Now starts across lifecycle instances", async () => {
+    const tempDirectory = await mkdtemp(join(tmpdir(), "agent-scheduler-"));
+    const databasePath = join(tempDirectory, "schedules.sqlite");
+
+    try {
+      const store = new SqliteScheduleStore({ databasePath });
+      const slowHarness = new SlowStartHarness("local-copilot");
+      const firstLifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store,
+        harnesses: [slowHarness],
+      });
+      const schedule = await firstLifecycle.createActiveSchedule({
+        runInstructions: "Start one persisted manual run slowly.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: {
+          type: "workspace",
+          uri: "file:///tmp/agent-scheduler",
+        },
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "default-approvals",
+      });
+
+      const firstRunPromise = firstLifecycle.startManualRun(schedule.id);
+      await slowHarness.started;
+
+      const secondLifecycle = new ScheduleLifecycle({
+        clock: new FakeClock("2026-07-07T16:05:01.000Z"),
+        idGenerator: new SequentialIdGenerator(),
+        localSchedulingEnabled: false,
+        store,
+        harnesses: [slowHarness],
+      });
+      const duplicateRun = await secondLifecycle.startManualRun(schedule.id);
+
+      assert.equal(duplicateRun.status, "running");
+      assert.equal(slowHarness.startRequests.length, 1);
+
+      slowHarness.finishStart();
+      const completedRun = await firstRunPromise;
+
+      assert.equal(completedRun.status, "completed");
+      assert.equal(completedRun.id, duplicateRun.id);
+      assert.equal(slowHarness.startRequests.length, 1);
+
+      const detail = await secondLifecycle.openScheduleDetail(schedule.id);
+      assert.equal(detail.previousRuns.length, 1);
+      assert.equal(detail.previousRuns[0]?.id, completedRun.id);
+      assert.equal(detail.previousRuns[0]?.status, "completed");
+
+      store.close();
+    } finally {
+      await rm(tempDirectory, { recursive: true, force: true });
+    }
   });
 
   it("keeps approval-waiting runs active until they resolve, then starts deferred catch-up work", async () => {
@@ -1142,6 +1262,45 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     });
   });
 
+  it("records unexpected harness start errors against the reserved run", async () => {
+    const store = new InMemoryScheduleStore();
+    const throwingHarness = new ThrowingStartHarness("local-copilot");
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [throwingHarness],
+    });
+
+    const schedule = await lifecycle.createActiveSchedule({
+      runInstructions: "Exercise a throwing harness start.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: {
+        type: "workspace",
+        uri: "file:///tmp/agent-scheduler",
+      },
+      harnessMode: "local-copilot",
+      model: "gpt-5",
+      approvalMode: "default-approvals",
+    });
+
+    await assert.rejects(
+      () => lifecycle.startManualRun(schedule.id),
+      /Harness start crashed./,
+    );
+
+    assert.equal(throwingHarness.startRequests.length, 1);
+    assert.equal((await store.listActiveRuns()).length, 0);
+
+    const detail = await lifecycle.openScheduleDetail(schedule.id);
+    assert.equal(detail.previousRuns.length, 1);
+    assert.equal(detail.previousRuns[0]?.id, "run_2");
+    assert.equal(detail.previousRuns[0]?.status, "failed");
+    assert.equal(detail.previousRuns[0]?.completedAt, "2026-07-07T16:05:00.000Z");
+    assert.equal(detail.previousRuns[0]?.error, "Harness start crashed.");
+  });
+
   it("starts manual Local Copilot Mode runs through the Copilot CLI client", async () => {
     const runner = new RecordingCopilotCliCommandRunner({
       exitCode: 0,
@@ -1169,6 +1328,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
         cachedAvailability: {
           status: "available",
           approvalSurfaceAvailable: false,
+          supportedPermissionFlags: ["--no-ask-user", "--allow-all-tools"],
         },
       }),
     });
@@ -1467,6 +1627,19 @@ class SlowStartHarness extends FakeHarness {
   }
 }
 
+class ThrowingStartHarness extends FakeHarness {
+  constructor(mode: HarnessMode) {
+    super({ mode });
+  }
+
+  override async start(
+    request: HarnessStartRequest,
+  ): Promise<HarnessStartResult> {
+    this.startRequests.push(structuredClone(request));
+    throw new Error("Harness start crashed.");
+  }
+}
+
 describe("VS Code natural-language schedule creation", () => {
   it("activates a complete request after one confirmation with VS Code defaults", async () => {
     const clock = new FakeClock("2026-07-07T20:00:00.000Z");
@@ -1603,7 +1776,7 @@ describe("VS Code natural-language schedule creation", () => {
     });
 
     const toolResult = await creationFlow.languageModelTool.invoke({
-      naturalLanguageRequest: "Run every hour and retrieve the time",
+      naturalLanguageRequest: "Run every hour and check the current time",
     });
     const chatResult = await creationFlow.chatParticipant.handleRequest({
       naturalLanguageRequest: "hourly to check open pull requests",
@@ -1611,13 +1784,19 @@ describe("VS Code natural-language schedule creation", () => {
     const slashResult = await creationFlow.slashCommand.execute({
       naturalLanguageRequest: "run every 15 minutes and summarize CI status",
     });
+    const explicitInstructionsResult =
+      await creationFlow.languageModelTool.invoke({
+        naturalLanguageRequest: "Create an hourly status check schedule.",
+        runInstructions: "Run every hour and check the current time",
+        cadence: { type: "cron", expression: "0 * * * *" },
+      });
 
     assert.equal(toolResult.outcome, "activated");
     assert.deepEqual(toolResult.schedule.cadence, {
       type: "cron",
       expression: "0 * * * *",
     });
-    assert.equal(toolResult.schedule.runInstructions, "Retrieve the time.");
+    assert.equal(toolResult.schedule.runInstructions, "Check the current time.");
 
     assert.equal(chatResult.outcome, "activated");
     assert.deepEqual(chatResult.schedule.cadence, {
@@ -1633,7 +1812,18 @@ describe("VS Code natural-language schedule creation", () => {
     });
     assert.equal(slashResult.schedule.runInstructions, "Summarize CI status.");
 
-    for (const result of [toolResult, chatResult, slashResult]) {
+    assert.equal(explicitInstructionsResult.outcome, "activated");
+    assert.equal(
+      explicitInstructionsResult.schedule.runInstructions,
+      "Check the current time.",
+    );
+
+    for (const result of [
+      toolResult,
+      chatResult,
+      slashResult,
+      explicitInstructionsResult,
+    ]) {
       assert.doesNotMatch(result.schedule.runInstructions, /every hour/i);
       assert.doesNotMatch(result.schedule.runInstructions, /hourly/i);
       assert.doesNotMatch(result.schedule.runInstructions, /every \d+ minutes/i);
