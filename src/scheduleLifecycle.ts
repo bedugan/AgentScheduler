@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 
 import type {
-  ApprovalMode,
   DueWorkScanDiagnostics,
   CreateActiveScheduleInput,
   CreateDraftScheduleInput,
@@ -12,32 +11,27 @@ import type {
   IsoTimestamp,
   ResolvedHarnessPolicy,
   ResolveActiveRunInput,
-  RunCapInput,
   RunHistoryEntry,
   RunHistoryDetailView,
   RunOutcomeView,
-  RunCadence,
   RunTrigger,
   Schedule,
   ScheduleHarnessModeAvailability,
-  ScheduleExportEntry,
   ScheduleExportFile,
   ScheduleDetailPreviousRun,
   ScheduleDetailView,
   ScheduleImportResult,
-  ScheduleImportWarning,
-  TargetContext,
   UpdateScheduleInput,
 } from "./domain.js";
 import {
   HARNESS_MODE_LABELS,
-  SCHEDULE_EXPORT_SCHEMA_VERSION,
   SUPPORTED_HARNESS_MODES,
   isActiveRunStatus,
   isStartedRunStatus,
 } from "./domain.js";
 import { nextRunAtAfter } from "./recurrencePolicy.js";
 import { ScheduleDefinition } from "./scheduleDefinition.js";
+import { ScheduleFile } from "./scheduleFile.js";
 import type {
   AgentHarness,
   HarnessCancelResult,
@@ -101,6 +95,7 @@ export class ScheduleLifecycle {
   private readonly manualRunReservations = new Set<string>();
   private readonly executionOwnerId: string;
   private readonly scheduleDefinition: ScheduleDefinition;
+  private readonly scheduleFile: ScheduleFile;
 
   constructor(options: ScheduleLifecycleOptions) {
     this.store = options.store;
@@ -115,6 +110,9 @@ export class ScheduleLifecycle {
     this.scheduleDefinition = new ScheduleDefinition(
       this.idGenerator,
       (schedule) => this.selectedHarnessUnavailableReason(schedule),
+    );
+    this.scheduleFile = new ScheduleFile(this.idGenerator, (mode) =>
+      this.harnesses.has(mode),
     );
   }
 
@@ -167,11 +165,7 @@ export class ScheduleLifecycle {
       ? await Promise.all(input.scheduleIds.map((id) => this.requireSchedule(id)))
       : await this.store.listSchedules();
 
-    return {
-      schemaVersion: SCHEDULE_EXPORT_SCHEMA_VERSION,
-      exportedAt: this.nowIso(),
-      schedules: schedules.map((schedule) => this.exportEntryFor(schedule)),
-    };
+    return this.scheduleFile.export(schedules, this.nowIso());
   }
 
   async exportSchedulesAsJson(input: ExportSchedulesInput = {}): Promise<string> {
@@ -182,30 +176,30 @@ export class ScheduleLifecycle {
     exportFile: unknown,
     options: ImportSchedulesOptions = {},
   ): Promise<ScheduleImportResult> {
-    const entries = parseScheduleExportFile(exportFile);
-    const warnings = await this.collectImportWarnings(entries, options);
-    const now = this.nowIso();
-    const schedules = entries.map((entry) => this.importedScheduleFor(entry, now));
-
-    for (const schedule of schedules) {
+    const result = await this.scheduleFile.import(
+      exportFile,
+      options,
+      this.nowIso(),
+    );
+    for (const schedule of result.schedules) {
       await this.store.saveSchedule(schedule);
     }
-
-    return { schedules, warnings };
+    return result;
   }
 
   async importSchedulesJson(
     json: string,
     options: ImportSchedulesOptions = {},
   ): Promise<ScheduleImportResult> {
-    let exportFile: unknown;
-    try {
-      exportFile = JSON.parse(json);
-    } catch (error) {
-      throw new Error("Schedule export JSON is invalid.", { cause: error });
+    const result = await this.scheduleFile.importJson(
+      json,
+      options,
+      this.nowIso(),
+    );
+    for (const schedule of result.schedules) {
+      await this.store.saveSchedule(schedule);
     }
-
-    return this.importSchedules(exportFile, options);
+    return result;
   }
 
   async activateSchedule(scheduleId: string): Promise<Schedule> {
@@ -1415,111 +1409,6 @@ export class ScheduleLifecycle {
     };
   }
 
-  private exportEntryFor(schedule: Schedule): ScheduleExportEntry {
-    return {
-      sourceScheduleId: schedule.id,
-      revision: schedule.revision,
-      runInstructions: schedule.runInstructions,
-      cadence: schedule.cadence,
-      targetContext: schedule.targetContext,
-      harnessMode: schedule.harnessMode,
-      model: schedule.model,
-      approvalMode: schedule.approvalMode,
-      runCap:
-        schedule.runCounter.limit === null
-          ? null
-          : { maxRuns: schedule.runCounter.limit },
-    };
-  }
-
-  private async collectImportWarnings(
-    entries: ParsedScheduleExportEntry[],
-    options: ImportSchedulesOptions,
-  ): Promise<ScheduleImportWarning[]> {
-    const warnings: ScheduleImportWarning[] = [];
-
-    for (const entry of entries) {
-      const workspaceAvailable = entry.targetContext
-        ? entry.targetContext.uri.trim().length > 0 &&
-          (options.isWorkspaceAvailable
-            ? await options.isWorkspaceAvailable(entry.targetContext.uri)
-            : true)
-        : false;
-
-      if (!workspaceAvailable) {
-        warnings.push({
-          sourceScheduleId: entry.sourceScheduleId,
-          code: "missing-workspace",
-          message: entry.targetContext
-            ? `Blocked: Workspace '${entry.targetContext.uri}' is not available on this machine.`
-            : "Blocked: Target context is required before activation.",
-        });
-      }
-
-      if (!entry.harnessMode || !this.harnesses.has(entry.harnessMode)) {
-        warnings.push({
-          sourceScheduleId: entry.sourceScheduleId,
-          code: "unavailable-harness-mode",
-          message: entry.harnessMode
-            ? `Blocked: Harness mode '${entry.harnessMode}' is unavailable.`
-            : "Blocked: Harness mode is required before activation.",
-        });
-      }
-
-      if (entry.runInstructions.trim().length === 0) {
-        warnings.push({
-          sourceScheduleId: entry.sourceScheduleId,
-          code: "activation-blocker",
-          message: "Blocked: Run instructions are required before activation.",
-        });
-      }
-
-      if (!entry.cadence) {
-        warnings.push({
-          sourceScheduleId: entry.sourceScheduleId,
-          code: "activation-blocker",
-          message: "Blocked: Run cadence is required before activation.",
-        });
-      }
-
-      if (entry.originalApprovalMode !== entry.approvalMode) {
-        warnings.push({
-          sourceScheduleId: entry.sourceScheduleId,
-          code: "stale-policy-setting",
-          message: `Blocked: Approval mode '${entry.originalApprovalMode}' is no longer supported; imported schedule uses Default Approvals.`,
-        });
-      }
-    }
-
-    return warnings;
-  }
-
-  private importedScheduleFor(
-    entry: ParsedScheduleExportEntry,
-    now: IsoTimestamp,
-  ): Schedule {
-    return {
-      id: this.idGenerator.nextId("schedule"),
-      revision: 1,
-      status: "paused",
-      enabled: false,
-      runInstructions: entry.runInstructions,
-      cadence: entry.cadence,
-      targetContext: entry.targetContext,
-      harnessMode: entry.harnessMode,
-      model: entry.model,
-      approvalMode: entry.approvalMode,
-      runCounter: {
-        completed: 0,
-        limit: entry.runCap?.maxRuns ?? null,
-      },
-      nextRunAt: null,
-      lastRunAt: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-  }
-
   private selectedHarnessUnavailableReason(schedule: Schedule): string | undefined {
     if (!schedule.harnessMode) {
       return "Choose an available harness mode before activating or running this schedule.";
@@ -1632,184 +1521,6 @@ export class ScheduleLifecycle {
       },
     };
   }
-}
-
-interface ParsedScheduleExportEntry {
-  sourceScheduleId: string;
-  revision: number;
-  runInstructions: string;
-  cadence: RunCadence | null;
-  targetContext: TargetContext | null;
-  harnessMode: HarnessMode | null;
-  model: string;
-  approvalMode: ApprovalMode;
-  originalApprovalMode: string;
-  runCap: RunCapInput | null;
-}
-
-function parseScheduleExportFile(exportFile: unknown): ParsedScheduleExportEntry[] {
-  const file = requireRecord(exportFile, "schedule export file");
-  const schemaVersion = file.schemaVersion;
-
-  if (schemaVersion !== SCHEDULE_EXPORT_SCHEMA_VERSION) {
-    throw new Error(
-      `Unsupported schedule export schema version '${String(schemaVersion)}'.`,
-    );
-  }
-
-  requireString(file, "exportedAt", "schedule export file");
-
-  if (!Array.isArray(file.schedules)) {
-    throw new Error("Schedule export file must contain a schedules array.");
-  }
-
-  return file.schedules.map((entry, index) =>
-    parseScheduleExportEntry(entry, `schedules[${index}]`),
-  );
-}
-
-function parseScheduleExportEntry(
-  value: unknown,
-  path: string,
-): ParsedScheduleExportEntry {
-  const entry = requireRecord(value, path);
-  const originalApprovalMode = requireString(entry, "approvalMode", path);
-
-  return {
-    sourceScheduleId: requireString(entry, "sourceScheduleId", path),
-    revision: requirePositiveInteger(entry, "revision", path),
-    runInstructions: requireString(entry, "runInstructions", path),
-    cadence: parseNullableCadence(entry.cadence, `${path}.cadence`),
-    targetContext: parseNullableTargetContext(
-      entry.targetContext,
-      `${path}.targetContext`,
-    ),
-    harnessMode: parseNullableHarnessMode(
-      entry.harnessMode,
-      `${path}.harnessMode`,
-    ),
-    model: requireString(entry, "model", path),
-    approvalMode: parseApprovalMode(originalApprovalMode),
-    originalApprovalMode,
-    runCap: parseRunCap(entry.runCap, `${path}.runCap`),
-  };
-}
-
-function parseNullableCadence(value: unknown, path: string): RunCadence | null {
-  return value === null ? null : parseCadence(value, path);
-}
-
-function parseCadence(value: unknown, path: string): RunCadence {
-  const cadence = requireRecord(value, path);
-  const type = requireString(cadence, "type", path);
-
-  if (type !== "cron") {
-    throw new Error(`${path}.type must be 'cron'.`);
-  }
-
-  return {
-    type,
-    expression: requireString(cadence, "expression", path),
-  };
-}
-
-function parseNullableTargetContext(
-  value: unknown,
-  path: string,
-): TargetContext | null {
-  return value === null ? null : parseTargetContext(value, path);
-}
-
-function parseTargetContext(value: unknown, path: string): TargetContext {
-  const targetContext = requireRecord(value, path);
-  const type = requireString(targetContext, "type", path);
-
-  if (type !== "workspace") {
-    throw new Error(`${path}.type must be 'workspace'.`);
-  }
-
-  const parsed: TargetContext = {
-    type,
-    uri: requireString(targetContext, "uri", path),
-  };
-
-  if (targetContext.label !== undefined) {
-    parsed.label = requireString(targetContext, "label", path);
-  }
-
-  return parsed;
-}
-
-function parseNullableHarnessMode(
-  value: unknown,
-  path: string,
-): HarnessMode | null {
-  return value === null ? null : parseHarnessMode(value, path);
-}
-
-function parseHarnessMode(value: unknown, path: string): HarnessMode {
-  if (value === "local-copilot" || value === "cloud-copilot") {
-    return value;
-  }
-
-  throw new Error(`${path} must be a supported harness mode.`);
-}
-
-function parseApprovalMode(value: string): ApprovalMode {
-  if (
-    value === "default-approvals" ||
-    value === "bypass-approvals" ||
-    value === "autopilot"
-  ) {
-    return value;
-  }
-
-  return "default-approvals";
-}
-
-function parseRunCap(value: unknown, path: string): RunCapInput | null {
-  if (value === null || value === undefined) {
-    return null;
-  }
-
-  const runCap = requireRecord(value, path);
-  return {
-    maxRuns: requirePositiveInteger(runCap, "maxRuns", path),
-  };
-}
-
-function requireRecord(value: unknown, path: string): Record<string, unknown> {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
-
-  throw new Error(`${path} must be an object.`);
-}
-
-function requireString(
-  record: Record<string, unknown>,
-  key: string,
-  path: string,
-): string {
-  const value = record[key];
-  if (typeof value === "string") {
-    return value;
-  }
-
-  throw new Error(`${path}.${key} must be a string.`);
-}
-
-function requirePositiveInteger(
-  record: Record<string, unknown>,
-  key: string,
-  path: string,
-): number {
-  const value = record[key];
-  if (Number.isInteger(value) && typeof value === "number" && value > 0) {
-    return value;
-  }
-
-  throw new Error(`${path}.${key} must be a positive integer.`);
 }
 
 function unavailableHarnessModeMessage(mode: HarnessMode): string {
