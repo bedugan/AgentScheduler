@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 
 import {
@@ -396,6 +398,44 @@ describe("VS Code extension adapter", () => {
       const repaired = deployPackagedWorker(context);
       assert.deepEqual(repaired, first);
       assert.doesNotMatch(await readFile(repaired.workerPath, "utf8"), /corrupted worker/);
+    } finally {
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
+  });
+
+  it("converges simultaneous first installs and corruption repairs", async () => {
+    const globalStoragePath = await mkdtemp(
+      join(tmpdir(), "agent-scheduler-race-"),
+    );
+    try {
+      const firstBarrier = join(globalStoragePath, "start-first");
+      const firstResults = await runConcurrentWorkerDeployments(
+        process.cwd(),
+        globalStoragePath,
+        firstBarrier,
+      );
+      assert.deepEqual(firstResults[0], firstResults[1]);
+
+      await writeFile(firstResults[0]!.workerPath, "corrupted worker", "utf8");
+      const repairBarrier = join(globalStoragePath, "start-repair");
+      const repairedResults = await runConcurrentWorkerDeployments(
+        process.cwd(),
+        globalStoragePath,
+        repairBarrier,
+      );
+      assert.deepEqual(repairedResults[0], repairedResults[1]);
+      assert.deepEqual(repairedResults[0], firstResults[0]);
+      assert.doesNotMatch(
+        await readFile(repairedResults[0]!.workerPath, "utf8"),
+        /corrupted worker/,
+      );
+      const workerEntries = await readdir(join(globalStoragePath, "worker"));
+      assert.equal(
+        workerEntries.some((entry) =>
+          /\.(?:tmp|corrupt|claim)(?:\.|$)/.test(entry),
+        ),
+        false,
+      );
     } finally {
       await rm(globalStoragePath, { recursive: true, force: true });
     }
@@ -2898,6 +2938,69 @@ describe("VS Code extension adapter", () => {
     );
   });
 });
+
+async function runConcurrentWorkerDeployments(
+  extensionRoot: string,
+  globalStoragePath: string,
+  barrierPath: string,
+): Promise<Array<{ workerPath: string; fingerprint: string }>> {
+  const moduleUrl = pathToFileURL(
+    join(process.cwd(), "dist", "src", "vscodeExtensionAdapter.js"),
+  ).href;
+  const script = `
+    import { existsSync } from "node:fs";
+    import { setTimeout as delay } from "node:timers/promises";
+    import { deployPackagedWorker } from ${JSON.stringify(moduleUrl)};
+    const [extensionRoot, globalStoragePath, barrierPath] = process.argv.slice(1);
+    while (!existsSync(barrierPath)) await delay(2);
+    const result = deployPackagedWorker({
+      extensionUri: { fsPath: extensionRoot },
+      globalStorageUri: { fsPath: globalStoragePath },
+    });
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const children = [0, 1].map(
+    () =>
+      new Promise<{ workerPath: string; fingerprint: string }>(
+        (resolveChild, rejectChild) => {
+          const child = spawn(
+            process.execPath,
+            [
+              "--input-type=module",
+              "-e",
+              script,
+              extensionRoot,
+              globalStoragePath,
+              barrierPath,
+            ],
+            { stdio: ["ignore", "pipe", "pipe"] },
+          );
+          let stdout = "";
+          let stderr = "";
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+          });
+          child.stderr.on("data", (chunk: string) => {
+            stderr += chunk;
+          });
+          child.on("error", rejectChild);
+          child.on("exit", (code) => {
+            if (code === 0) {
+              resolveChild(JSON.parse(stdout));
+            } else {
+              rejectChild(
+                new Error(`Worker deployment child failed: ${stderr}`),
+              );
+            }
+          });
+        },
+      ),
+  );
+  await writeFile(barrierPath, "start", "utf8");
+  return Promise.all(children);
+}
 
 function recordingContext(): {
   globalStorageUri: { fsPath: string };

@@ -544,41 +544,110 @@ export function deployPackagedWorker(
     fingerprint,
   );
   if (!validWorkerDeployment(targetDirectory, manifest)) {
-    const suffix = `${process.pid}.${randomBytes(8).toString("hex")}`;
-    const temporaryDirectory = `${targetDirectory}.tmp.${suffix}`;
-    const corruptDirectory = `${targetDirectory}.corrupt.${suffix}`;
-    let movedCorruptDeployment = false;
-    try {
-      mkdirSync(temporaryDirectory, { recursive: true, mode: 0o700 });
-      cpSync(sourceDirectory, temporaryDirectory, { recursive: true });
-      writeFileSync(
-        join(temporaryDirectory, "deployment.json"),
-        `${JSON.stringify(manifest)}\n`,
-        { encoding: "utf8", mode: 0o600 },
-      );
-      if (!validWorkerDeployment(temporaryDirectory, manifest)) {
-        throw new Error("Deployed Worker failed manifest verification.");
+    mkdirSync(dirname(targetDirectory), { recursive: true, mode: 0o700 });
+    const claimDirectory = `${targetDirectory}.claim`;
+    const ownsClaim = acquireWorkerDeploymentClaim(
+      claimDirectory,
+      targetDirectory,
+      manifest,
+    );
+    if (ownsClaim) {
+      try {
+        if (!validWorkerDeployment(targetDirectory, manifest)) {
+          installWorkerDeployment(targetDirectory, sourceDirectory, manifest);
+        }
+      } finally {
+        rmSync(claimDirectory, { recursive: true, force: true });
       }
-      if (existsSync(targetDirectory)) {
-        renameSync(targetDirectory, corruptDirectory);
-        movedCorruptDeployment = true;
-      }
-      renameSync(temporaryDirectory, targetDirectory);
-      rmSync(corruptDirectory, { recursive: true, force: true });
-      movedCorruptDeployment = false;
-    } catch (error) {
-      if (movedCorruptDeployment && !existsSync(targetDirectory)) {
-        renameSync(corruptDirectory, targetDirectory);
-      }
-      throw error;
-    } finally {
-      rmSync(temporaryDirectory, { recursive: true, force: true });
     }
+  }
+  if (!validWorkerDeployment(targetDirectory, manifest)) {
+    throw new Error("Worker deployment did not converge on a valid manifest.");
   }
   return {
     workerPath: join(targetDirectory, "workerCli.js"),
     fingerprint,
   };
+}
+
+function installWorkerDeployment(
+  targetDirectory: string,
+  sourceDirectory: string,
+  manifest: WorkerDeploymentManifest,
+): void {
+  const suffix = `${process.pid}.${randomBytes(8).toString("hex")}`;
+  const temporaryDirectory = `${targetDirectory}.tmp.${suffix}`;
+  const corruptDirectory = `${targetDirectory}.corrupt.${suffix}`;
+  let movedCorruptDeployment = false;
+  try {
+    mkdirSync(temporaryDirectory, { recursive: true, mode: 0o700 });
+    cpSync(sourceDirectory, temporaryDirectory, { recursive: true });
+    writeFileSync(
+      join(temporaryDirectory, "deployment.json"),
+      `${JSON.stringify(manifest)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    if (!validWorkerDeployment(temporaryDirectory, manifest)) {
+      throw new Error("Deployed Worker failed manifest verification.");
+    }
+    if (existsSync(targetDirectory)) {
+      renameSync(targetDirectory, corruptDirectory);
+      movedCorruptDeployment = true;
+    }
+    renameSync(temporaryDirectory, targetDirectory);
+    rmSync(corruptDirectory, { recursive: true, force: true });
+    movedCorruptDeployment = false;
+  } catch (error) {
+    if (movedCorruptDeployment && !existsSync(targetDirectory)) {
+      renameSync(corruptDirectory, targetDirectory);
+    }
+    throw error;
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+    rmSync(corruptDirectory, { recursive: true, force: true });
+  }
+}
+
+function acquireWorkerDeploymentClaim(
+  claimDirectory: string,
+  targetDirectory: string,
+  manifest: WorkerDeploymentManifest,
+): boolean {
+  const deadline = Date.now() + 10_000;
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    try {
+      mkdirSync(claimDirectory, { mode: 0o700 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+    if (validWorkerDeployment(targetDirectory, manifest)) {
+      return false;
+    }
+    try {
+      if (Date.now() - statSync(claimDirectory).mtimeMs > 30_000) {
+        const staleClaim = [
+          claimDirectory,
+          "stale",
+          String(process.pid),
+          randomBytes(4).toString("hex"),
+        ].join(".");
+        renameSync(claimDirectory, staleClaim);
+        rmSync(staleClaim, { recursive: true, force: true });
+        continue;
+      }
+    } catch {
+      // The owner may have completed between the existence check and cleanup.
+    }
+    Atomics.wait(waiter, 0, 0, 20);
+  }
+  if (validWorkerDeployment(targetDirectory, manifest)) {
+    return false;
+  }
+  throw new Error("Timed out waiting for another Worker deployment process.");
 }
 
 interface WorkerDeploymentManifest {

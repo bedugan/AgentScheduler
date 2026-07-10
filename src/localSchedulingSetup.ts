@@ -316,9 +316,7 @@ export class MacOsLaunchdWakeupProvider implements WakeupProvider {
     return {
       intent,
       applied:
-        (evidence?.stdout ?? "").includes(
-          `${launchdUserDomain(request)}/${request.triggerId}`,
-        ) &&
+        launchdJobMatchesRequest(evidence?.stdout ?? "", request) &&
         plistContents === launchdPlistFor(request),
     };
   }
@@ -502,6 +500,34 @@ function windowsTaskMatchesRequest(
       `<Interval>PT${request.intervalMinutes}M</Interval>`,
       "i",
     ).test(xml)
+  );
+}
+
+function launchdJobMatchesRequest(
+  output: string,
+  request: WakeupTriggerRequest,
+): boolean {
+  const identity = `${launchdUserDomain(request)}/${request.triggerId}`;
+  if (!output.includes(identity)) {
+    return false;
+  }
+  const program = /^\s*program\s*=\s*(.+?)\s*$/im.exec(output)?.[1]?.trim();
+  const argumentsBlock = /^\s*arguments\s*=\s*\{([\s\S]*?)^\s*\}/im.exec(
+    output,
+  )?.[1];
+  const argumentsList = (argumentsBlock ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^\d+\s*=\s*/, ""));
+  const interval = Number(
+    /^\s*run interval\s*=\s*(\d+)\s+seconds\s*$/im.exec(output)?.[1],
+  );
+  return (
+    program === request.workerExecutable &&
+    JSON.stringify(argumentsList) ===
+      JSON.stringify([request.workerExecutable, ...request.workerArguments]) &&
+    interval === request.intervalMinutes * 60
   );
 }
 

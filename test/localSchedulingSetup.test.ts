@@ -142,18 +142,17 @@ describe("local scheduling setup", () => {
     };
     const intent = new MacOsLaunchdWakeupProvider().intentFor("install", request);
     const matching = new MacOsLaunchdWakeupProvider({
-      commandRunner: new EvidenceCommandRunner(
-        `gui/501/${request.triggerId} = { active count = 0 }`,
-      ),
+      commandRunner: new EvidenceCommandRunner(launchdEvidenceFor(request)),
       fileReader: new EvidenceFileReader(intent.files[0]!.contents),
     });
     const stale = new MacOsLaunchdWakeupProvider({
       commandRunner: new EvidenceCommandRunner(
-        `gui/501/${request.triggerId} = { active count = 0 }`,
+        launchdEvidenceFor(request).replace(
+          "full-fingerprint",
+          "stale-loaded-fingerprint",
+        ),
       ),
-      fileReader: new EvidenceFileReader(
-        intent.files[0]!.contents.replace("full-fingerprint", "stale-fingerprint"),
-      ),
+      fileReader: new EvidenceFileReader(intent.files[0]!.contents),
     });
 
     assert.equal((await matching.verify(request)).applied, true);
@@ -1071,6 +1070,16 @@ class EvidenceFileReader implements WakeupFileReader {
   async read(): Promise<string> {
     return this.contents;
   }
+}
+
+function launchdEvidenceFor(request: WakeupTriggerRequest): string {
+  return `gui/${request.userId}/${request.triggerId} = {
+  program = ${request.workerExecutable}
+  arguments = {
+    ${[request.workerExecutable, ...request.workerArguments].join("\n    ")}
+  }
+  run interval = ${request.intervalMinutes * 60} seconds
+}`;
 }
 
 class RecordingLocalSchedulingSetup {
