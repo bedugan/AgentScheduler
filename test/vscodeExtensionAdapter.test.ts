@@ -1157,6 +1157,129 @@ describe("VS Code extension adapter", () => {
     assert.doesNotMatch(requiredPanel(window).webview.html, /vscode-chat-model/);
   });
 
+  it("filters CLI-supported models by the signed-in user's Copilot catalog", async () => {
+    class ModelAwareHarness extends FakeHarness {
+      async models() {
+        return [
+          { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+          { id: "claude-sonnet-5", displayName: "Claude Sonnet 5", vendor: "GitHub Copilot" },
+          { id: "gpt-5.4", displayName: "GPT 5.4", vendor: "GitHub Copilot" },
+        ];
+      }
+    }
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new ModelAwareHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor: new EditorControlSurface(lifecycle) },
+      viewColumn: 1,
+      languageModel: new RecordingLanguageModel([
+        {
+          id: "copilot-provider-sonnet",
+          vendor: "copilot",
+          family: "claude-sonnet-5",
+          displayName: "Claude Sonnet 5",
+        },
+        {
+          id: "unrelated-openai-model",
+          vendor: "openai",
+          family: "gpt-5.4",
+          displayName: "GPT 5.4",
+        },
+      ]),
+    });
+
+    await commandCallback(commands, NEW_SCHEDULE_COMMAND)();
+    const html = requiredPanel(window).webview.html;
+    assert.match(html, /value="auto"/);
+    assert.match(html, /value="claude-sonnet-5"/);
+    assert.doesNotMatch(html, /value="gpt-5\.4"/);
+    assert.doesNotMatch(html, /value="copilot-provider-sonnet"/);
+  });
+
+  it("falls back to CLI-supported models while authenticated discovery is empty", async () => {
+    class ModelAwareHarness extends FakeHarness {
+      async models() {
+        return [
+          { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+          { id: "claude-haiku-4.5", displayName: "Claude Haiku 4.5", vendor: "GitHub Copilot" },
+        ];
+      }
+    }
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new ModelAwareHarness({ mode: "local-copilot" })],
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const editor = new EditorControlSurface(lifecycle);
+    registerVsCodeScheduleCommands({
+      context: recordingContext(), commands, window, workspace: {},
+      services: { editor }, viewColumn: 1,
+      languageModel: new RecordingLanguageModel([]),
+    });
+
+    await commandCallback(commands, NEW_SCHEDULE_COMMAND)();
+    assert.match(requiredPanel(window).webview.html, /value="claude-haiku-4\.5"/);
+  });
+
+  it("blocks editor preflight when a saved model is restricted for the signed-in user", async () => {
+    class ModelAwareHarness extends FakeHarness {
+      async models() {
+        return [
+          { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+          { id: "claude-sonnet-5", displayName: "Claude Sonnet 5", vendor: "GitHub Copilot" },
+        ];
+      }
+    }
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new ModelAwareHarness({ mode: "local-copilot" })],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Use a model restricted by Enterprise policy.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/restricted" },
+      harnessMode: "local-copilot",
+      model: "claude-sonnet-5",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    const editor = new EditorControlSurface(lifecycle);
+    registerVsCodeScheduleCommands({
+      context: recordingContext(), commands, window, workspace: {},
+      services: { editor }, viewColumn: 1,
+      languageModel: new RecordingLanguageModel([
+        { id: "copilot-auto", vendor: "copilot", family: "auto", displayName: "Auto" },
+      ]),
+    });
+
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(schedule.id);
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "activate", scheduleId: schedule.id,
+    });
+    assert.match(requiredPanel(window).webview.html, /not runnable by the selected harness/);
+    assert.equal((await editor.openScheduleDetail(schedule.id)).schedule.status, "draft");
+  });
+
   it("keeps a manual model input fallback when VS Code reports no chat models", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:05:00.000Z"),
