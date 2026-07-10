@@ -64,7 +64,7 @@ import type {
   VsCodeTreeItemLike,
   VsCodeWindowLike,
   VsCodeWorkspaceLike,
-} from "./vscodeExtensionAdapter.js";
+} from "./vscodeContracts.js";
 
 export const CREATE_SCHEDULE_COMMAND = "agentScheduler.createSchedule";
 export const CREATE_SCHEDULE_TOOL_NAME = "agentScheduler_createSchedule";
