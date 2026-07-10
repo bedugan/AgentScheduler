@@ -14,6 +14,7 @@ import type {
   ScheduleStatus,
   TargetContext,
 } from "./domain.js";
+import { isActiveRunStatus } from "./domain.js";
 import {
   defaultLocalSchedulingSetupState,
   type LocalSchedulingSetupState,
@@ -22,12 +23,16 @@ import {
 } from "./localSchedulingSetup.js";
 import type {
   ActiveRunReservationResult,
+  RunResultCommit,
+  ScheduleRunStateUpdate,
   ScheduleStore,
 } from "./store.js";
 
 export interface SqliteScheduleStoreOptions {
   databasePath: string;
 }
+
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 interface ScheduleRow {
   id: string;
@@ -86,7 +91,13 @@ export class SqliteScheduleStore
       mkdirSync(dirname(options.databasePath), { recursive: true });
     }
 
-    this.database = new DatabaseSync(options.databasePath);
+    this.database = new DatabaseSync(options.databasePath, {
+      timeout: SQLITE_BUSY_TIMEOUT_MS,
+    });
+    if (options.databasePath !== ":memory:") {
+      this.database.exec("PRAGMA journal_mode = WAL");
+    }
+    this.database.exec("PRAGMA foreign_keys = ON");
     this.initializeSchema();
   }
 
@@ -217,6 +228,10 @@ export class SqliteScheduleStore
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
+    this.upsertRunHistory(entry);
+  }
+
+  private upsertRunHistory(entry: RunHistoryEntry): void {
     this.database
       .prepare(`
         INSERT INTO run_history (
@@ -293,6 +308,74 @@ export class SqliteScheduleStore
         summary: entry.summary,
         error: entry.error,
       });
+  }
+
+  async commitRunResult(
+    entry: RunHistoryEntry,
+    scheduleUpdate: ScheduleRunStateUpdate,
+  ): Promise<RunResultCommit> {
+    this.database.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      const existingRun = this.database
+        .prepare("SELECT status FROM run_history WHERE id = $id")
+        .get({ id: entry.id }) as { status: RunStatus } | undefined;
+      if (
+        !isActiveRunStatus(entry.status) &&
+        existingRun &&
+        !isActiveRunStatus(existingRun.status)
+      ) {
+        this.database.exec("COMMIT");
+        return { committed: true, applied: false };
+      }
+
+      const result = this.database
+        .prepare(`
+          UPDATE schedules
+          SET status = $status,
+              enabled = $enabled,
+              run_counter_json = $run_counter_json,
+              next_run_at = $next_run_at,
+              last_run_at = $last_run_at,
+              updated_at = $updated_at
+          WHERE id = $id
+            AND revision = $expected_revision
+            AND status = $expected_status
+            AND enabled = $expected_enabled
+            AND run_counter_json = $expected_run_counter_json
+            AND next_run_at IS $expected_next_run_at
+            AND last_run_at IS $expected_last_run_at
+            AND updated_at = $expected_updated_at
+        `)
+        .run({
+          id: scheduleUpdate.scheduleId,
+          expected_revision: scheduleUpdate.expectedRevision,
+          expected_status: scheduleUpdate.expectedState.status,
+          expected_enabled: scheduleUpdate.expectedState.enabled ? 1 : 0,
+          expected_run_counter_json: JSON.stringify(
+            scheduleUpdate.expectedState.runCounter,
+          ),
+          expected_next_run_at: scheduleUpdate.expectedState.nextRunAt,
+          expected_last_run_at: scheduleUpdate.expectedState.lastRunAt,
+          expected_updated_at: scheduleUpdate.expectedState.updatedAt,
+          status: scheduleUpdate.status,
+          enabled: scheduleUpdate.enabled ? 1 : 0,
+          run_counter_json: JSON.stringify(scheduleUpdate.runCounter),
+          next_run_at: scheduleUpdate.nextRunAt,
+          last_run_at: scheduleUpdate.lastRunAt,
+          updated_at: scheduleUpdate.updatedAt,
+        });
+      if (result.changes === 0) {
+        this.database.exec("ROLLBACK");
+        return { committed: false };
+      }
+
+      this.upsertRunHistory(entry);
+      this.database.exec("COMMIT");
+      return { committed: true, applied: true };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async reserveActiveRun(

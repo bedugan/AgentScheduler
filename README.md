@@ -217,6 +217,8 @@ Automatic Local Copilot Mode runs use the same Copilot CLI harness as manual run
 
 **A run is blocked with Default Approvals**: Default Approvals may need an Approval Surface. For unattended automatic runs, use Bypass Approvals or Autopilot only when that permission behavior is acceptable for the schedule.
 
+Blocked and failed automatic runs are recorded once per due occurrence and retry at the next Run Cadence. They do not remain immediately due on every Wakeup Trigger scan.
+
 **Delete is disabled**: The schedule has an active run. Wait for the run to finish or cancel it through the harness before deleting the schedule.
 
 **Worker CLI says `--store is required`**: Local scheduling install, verify, and uninstall commands need the SQLite Local Store path. The VS Code extension stores it in the extension global storage directory as `agent-scheduler.sqlite`.

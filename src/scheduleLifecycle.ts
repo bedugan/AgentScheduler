@@ -587,15 +587,7 @@ export class ScheduleLifecycle {
         error:
           "Run cap has been reached. Restart the completed schedule before running again.",
       });
-      await this.store.saveRunHistory(blockedRun);
-      await this.store.saveSchedule({
-        ...schedule,
-        status: "completed",
-        enabled: false,
-        nextRunAt: null,
-        lastRunAt: requestedAt,
-        updatedAt: requestedAt,
-      });
+      await this.persistRunResult(schedule, blockedRun, trigger);
       return blockedRun;
     }
 
@@ -1039,65 +1031,107 @@ export class ScheduleLifecycle {
     run: RunHistoryEntry,
     trigger: RunTrigger,
   ): Promise<void> {
-    await this.store.saveRunHistory(run);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const currentSchedule = await this.requireSchedule(schedule.id);
+      const completedAt = run.completedAt ?? run.startedAt;
+      const recurrenceAnchor = new Date(
+        Math.max(
+          new Date(completedAt).getTime(),
+          this.clock.now().getTime(),
+        ),
+      );
+      const nextRunCounter = { ...currentSchedule.runCounter };
+      let nextStatus = currentSchedule.status;
+      let nextEnabled = currentSchedule.enabled;
+      let nextRunAt = currentSchedule.nextRunAt;
 
-    const completedAt = run.completedAt ?? run.startedAt;
-    const nextRunCounter = { ...schedule.runCounter };
-    let nextStatus = schedule.status;
-    let nextEnabled = schedule.enabled;
-    let nextRunAt = schedule.nextRunAt;
-
-    if (isActiveRunStatus(run.status)) {
-      if (trigger === "automatic" && schedule.cadence) {
-        nextRunAt = nextRunAtAfter(schedule.cadence, new Date(run.startedAt));
+      if (isActiveRunStatus(run.status)) {
+        if (trigger === "automatic" && currentSchedule.cadence) {
+          nextRunAt = nextRunAtAfter(
+            currentSchedule.cadence,
+            new Date(run.startedAt),
+          );
+        }
+      } else if (trigger !== "draft-manual" && run.status === "completed") {
+        nextRunCounter.completed += 1;
       }
 
-      await this.store.saveSchedule({
-        ...schedule,
+      const pendingDeferredRun =
+        trigger === "automatic" && run.status === "completed"
+          ? await this.store.getPendingDeferredRun(currentSchedule.id)
+          : undefined;
+
+      if (!isActiveRunStatus(run.status)) {
+        if (this.hasRunCounterReachedLimit(nextRunCounter)) {
+          nextStatus = "completed";
+          nextEnabled = false;
+          nextRunAt = null;
+        } else if (
+          trigger === "automatic" &&
+          run.status === "completed" &&
+          currentSchedule.cadence
+        ) {
+          nextRunAt = pendingDeferredRun
+            ? currentSchedule.nextRunAt
+            : nextRunAtAfter(currentSchedule.cadence, recurrenceAnchor);
+        } else if (
+          trigger === "automatic" &&
+          currentSchedule.status === "active" &&
+          currentSchedule.enabled &&
+          currentSchedule.cadence
+        ) {
+          nextRunAt = nextRunAtAfter(
+            currentSchedule.cadence,
+            recurrenceAnchor,
+          );
+        }
+      }
+
+      const commit = await this.store.commitRunResult(run, {
+        scheduleId: currentSchedule.id,
+        expectedRevision: currentSchedule.revision,
+        expectedState: {
+          status: currentSchedule.status,
+          enabled: currentSchedule.enabled,
+          runCounter: currentSchedule.runCounter,
+          nextRunAt: currentSchedule.nextRunAt,
+          lastRunAt: currentSchedule.lastRunAt,
+          updatedAt: currentSchedule.updatedAt,
+        },
+        status: nextStatus,
+        enabled: nextEnabled,
+        runCounter: nextRunCounter,
         nextRunAt,
-        lastRunAt: run.startedAt,
-        updatedAt: run.startedAt,
+        lastRunAt: isActiveRunStatus(run.status)
+          ? run.startedAt
+          : completedAt,
+        updatedAt: isActiveRunStatus(run.status)
+          ? run.startedAt
+          : completedAt,
       });
+      if (!commit.committed) {
+        continue;
+      }
+      if (!commit.applied) {
+        return;
+      }
+
+      if (
+        pendingDeferredRun &&
+        this.hasRunCounterReachedLimit(nextRunCounter)
+      ) {
+        await this.completePendingDeferredRun(
+          pendingDeferredRun,
+          completedAt,
+          "Deferred run ended because the schedule completed before catch-up work started.",
+        );
+      }
       return;
     }
 
-    if (trigger !== "draft-manual" && run.status === "completed") {
-      nextRunCounter.completed += 1;
-    }
-
-    const pendingDeferredRun =
-      trigger === "automatic" && run.status === "completed"
-        ? await this.store.getPendingDeferredRun(schedule.id)
-        : undefined;
-
-    if (this.hasRunCounterReachedLimit(nextRunCounter)) {
-      nextStatus = "completed";
-      nextEnabled = false;
-      nextRunAt = null;
-      await this.completePendingDeferredRun(
-        pendingDeferredRun,
-        completedAt,
-        "Deferred run ended because the schedule completed before catch-up work started.",
-      );
-    } else if (
-      trigger === "automatic" &&
-      run.status === "completed" &&
-      schedule.cadence
-    ) {
-      nextRunAt = pendingDeferredRun
-        ? schedule.nextRunAt
-        : nextRunAtAfter(schedule.cadence, new Date(completedAt));
-    }
-
-    await this.store.saveSchedule({
-      ...schedule,
-      status: nextStatus,
-      enabled: nextEnabled,
-      runCounter: nextRunCounter,
-      nextRunAt,
-      lastRunAt: completedAt,
-      updatedAt: completedAt,
-    });
+    throw new Error(
+      `Schedule '${schedule.id}' changed repeatedly while AgentScheduler was saving Run History. Retry after schedule edits settle.`,
+    );
   }
 
   private hasRunCounterReachedLimit(runCounter: Schedule["runCounter"]): boolean {

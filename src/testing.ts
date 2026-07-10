@@ -29,6 +29,8 @@ import {
 import {
   cloneStoreValue,
   type ActiveRunReservationResult,
+  type RunResultCommit,
+  type ScheduleRunStateUpdate,
   type ScheduleStore,
 } from "./store.js";
 
@@ -98,6 +100,10 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
+    this.upsertRunHistory(entry);
+  }
+
+  private upsertRunHistory(entry: RunHistoryEntry): void {
     const entries = this.runHistory.get(entry.scheduleId) ?? [];
     const existingIndex = entries.findIndex(
       (existingEntry) => existingEntry.id === entry.id,
@@ -108,6 +114,49 @@ export class InMemoryScheduleStore implements ScheduleStore {
       entries[existingIndex] = cloneStoreValue(entry);
     }
     this.runHistory.set(entry.scheduleId, entries);
+  }
+
+  async commitRunResult(
+    entry: RunHistoryEntry,
+    scheduleUpdate: ScheduleRunStateUpdate,
+  ): Promise<RunResultCommit> {
+    const existingRun = (this.runHistory.get(entry.scheduleId) ?? []).find(
+      (candidate) => candidate.id === entry.id,
+    );
+    if (
+      !isActiveRunStatus(entry.status) &&
+      existingRun &&
+      !isActiveRunStatus(existingRun.status)
+    ) {
+      return { committed: true, applied: false };
+    }
+
+    const schedule = this.schedules.get(scheduleUpdate.scheduleId);
+    if (
+      !schedule ||
+      schedule.revision !== scheduleUpdate.expectedRevision ||
+      schedule.status !== scheduleUpdate.expectedState.status ||
+      schedule.enabled !== scheduleUpdate.expectedState.enabled ||
+      JSON.stringify(schedule.runCounter) !==
+        JSON.stringify(scheduleUpdate.expectedState.runCounter) ||
+      schedule.nextRunAt !== scheduleUpdate.expectedState.nextRunAt ||
+      schedule.lastRunAt !== scheduleUpdate.expectedState.lastRunAt ||
+      schedule.updatedAt !== scheduleUpdate.expectedState.updatedAt
+    ) {
+      return { committed: false };
+    }
+
+    this.schedules.set(schedule.id, cloneStoreValue({
+      ...schedule,
+      status: scheduleUpdate.status,
+      enabled: scheduleUpdate.enabled,
+      runCounter: scheduleUpdate.runCounter,
+      nextRunAt: scheduleUpdate.nextRunAt,
+      lastRunAt: scheduleUpdate.lastRunAt,
+      updatedAt: scheduleUpdate.updatedAt,
+    }));
+    this.upsertRunHistory(entry);
+    return { committed: true, applied: true };
   }
 
   async reserveActiveRun(
