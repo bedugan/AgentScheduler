@@ -2847,7 +2847,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -2918,7 +2918,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -2959,7 +2959,7 @@ describe("VS Code natural-language schedule creation", () => {
       label: "AgentScheduler",
     };
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async () => true,
@@ -3031,7 +3031,7 @@ describe("VS Code natural-language schedule creation", () => {
     });
     let confirmationRequests = 0;
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       defaultModel: "gpt-5",
       confirmActivation: async () => {
         confirmationRequests += 1;
@@ -3078,7 +3078,7 @@ describe("VS Code natural-language schedule creation", () => {
     };
     const confirmationRequests: unknown[] = [];
     const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-      lifecycle,
+      editor: new EditorControlSurface(lifecycle),
       currentWorkspace: workspace,
       defaultModel: "gpt-5",
       confirmActivation: async (proposal) => {
@@ -3140,7 +3140,7 @@ describe("VS Code natural-language schedule creation", () => {
         harnesses: [new FakeHarness({ mode: "local-copilot" })],
       });
       const creationFlow = new VsCodeNaturalLanguageScheduleCreationFlow({
-        lifecycle,
+        editor: new EditorControlSurface(lifecycle),
         defaultModel: "gpt-5",
         confirmActivation: async () => true,
       });

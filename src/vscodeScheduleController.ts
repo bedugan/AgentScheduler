@@ -248,14 +248,10 @@ function isCopilotScheduleModel(model: ScheduleModelOption): boolean {
 function createScheduleCreationFlow(
   options: RegisterVsCodeScheduleCommandsOptions,
   modelCatalog: ScheduleModelCatalog | undefined,
-): VsCodeNaturalLanguageScheduleCreationFlow | undefined {
-  if (!options.services.lifecycle) {
-    return undefined;
-  }
-
+): VsCodeNaturalLanguageScheduleCreationFlow {
   const currentWorkspace = currentWorkspaceTargetContext(options.workspace);
   return new VsCodeNaturalLanguageScheduleCreationFlow({
-    lifecycle: options.services.lifecycle,
+    editor: options.services.editor,
     ...(currentWorkspace ? { currentWorkspace } : {}),
     defaultModel: "auto",
     ...(modelCatalog ? { modelCatalog } : {}),
@@ -335,14 +331,12 @@ export function registerVsCodeScheduleCommands(
       controller.deleteSchedule(target),
     ),
   ];
-  if (scheduleCreationFlow) {
-    disposables.push(
-      options.commands.registerCommand(CREATE_SCHEDULE_COMMAND, (input) =>
-        controller.executeScheduleCreationSlashCommand(input),
-      ),
-    );
-  }
-  if (scheduleCreationFlow && options.languageModel) {
+  disposables.push(
+    options.commands.registerCommand(CREATE_SCHEDULE_COMMAND, (input) =>
+      controller.executeScheduleCreationSlashCommand(input),
+    ),
+  );
+  if (options.languageModel) {
     disposables.push(
       options.languageModel.registerTool(CREATE_SCHEDULE_TOOL_NAME, {
         invoke: (toolInvocation) =>
@@ -350,7 +344,7 @@ export function registerVsCodeScheduleCommands(
       }),
     );
   }
-  if (scheduleCreationFlow && options.chat) {
+  if (options.chat) {
     disposables.push(
       options.chat.createChatParticipant(
         CREATE_SCHEDULE_CHAT_PARTICIPANT_ID,
@@ -723,7 +717,7 @@ export class ScheduleTreeDataProvider
 interface VsCodeScheduleCommandControllerOptions
   extends RegisterVsCodeScheduleCommandsOptions {
   scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
-  scheduleCreationFlow: VsCodeNaturalLanguageScheduleCreationFlow | undefined;
+  scheduleCreationFlow: VsCodeNaturalLanguageScheduleCreationFlow;
 }
 
 class VsCodeScheduleCommandController {
@@ -734,9 +728,7 @@ class VsCodeScheduleCommandController {
   private readonly viewColumn: unknown;
   private readonly modelCatalog: ScheduleModelCatalog | undefined;
   private readonly scheduleTreeProvider: ScheduleTreeDataProvider | undefined;
-  private readonly scheduleCreationFlow:
-    | VsCodeNaturalLanguageScheduleCreationFlow
-    | undefined;
+  private readonly scheduleCreationFlow: VsCodeNaturalLanguageScheduleCreationFlow;
   private readonly languageModelToolResultFactory:
     | VsCodeLanguageModelToolResultFactory
     | undefined;
@@ -1075,10 +1067,6 @@ class VsCodeScheduleCommandController {
     rawInput: unknown,
     source: "language-model-tool" | "chat-participant" | "slash-command",
   ): Promise<NaturalLanguageScheduleCreationResult> {
-    if (!this.scheduleCreationFlow) {
-      throw new Error("Natural-language schedule creation is not configured.");
-    }
-
     const input = naturalLanguageScheduleCreationInputFrom(rawInput);
     const result =
       source === "language-model-tool"

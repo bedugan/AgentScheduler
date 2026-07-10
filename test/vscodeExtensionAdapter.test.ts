@@ -164,7 +164,7 @@ describe("VS Code extension adapter", () => {
       commands,
       window,
       workspace: {},
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
     });
     await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
@@ -791,6 +791,7 @@ describe("VS Code extension adapter", () => {
 
     try {
       assert.equal(typeof services.dataVersion, "function");
+      assert.equal(Object.hasOwn(services, "lifecycle"), false);
       const intent = services.editor.previewEnableLocalScheduling?.();
       assert.match(
         intent?.workerCommand ?? "",
@@ -1040,7 +1041,7 @@ describe("VS Code extension adapter", () => {
       commands,
       window,
       workspace: {},
-      services: { editor: new EditorControlSurface(lifecycle), lifecycle },
+      services: { editor: new EditorControlSurface(lifecycle) },
       viewColumn: 1,
       languageModel: new RecordingLanguageModel([
         { id: "vscode-chat-model", displayName: "VS Code Chat Model" },
@@ -1343,7 +1344,7 @@ describe("VS Code extension adapter", () => {
     );
   });
 
-  it("registers create and open commands at the adapter boundary", () => {
+  it("registers editor-backed schedule commands at the adapter boundary", () => {
     const context = recordingContext();
     const commands = new RecordingCommands();
 
@@ -1360,8 +1361,9 @@ describe("VS Code extension adapter", () => {
       NEW_SCHEDULE_COMMAND,
       OPEN_SCHEDULE_COMMAND,
       DELETE_SCHEDULE_COMMAND,
+      CREATE_SCHEDULE_COMMAND,
     ]);
-    assert.equal(context.subscriptions.length, 3);
+    assert.equal(context.subscriptions.length, 4);
   });
 
   it("registers natural-language creation surfaces and activates complete tool requests after confirmation", async () => {
@@ -1394,7 +1396,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       eventEmitterFactory: new RecordingEventEmitterFactory(),
       languageModel,
@@ -1469,7 +1471,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       languageModel,
     });
@@ -1517,7 +1519,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       languageModel,
     });
@@ -1567,7 +1569,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       languageModel,
     });
@@ -1620,7 +1622,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       languageModel,
     });
@@ -1668,7 +1670,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       languageModel,
     });
@@ -1730,7 +1732,7 @@ describe("VS Code extension adapter", () => {
           },
         ],
       },
-      services: { editor, lifecycle },
+      services: { editor },
       viewColumn: 1,
       chat,
     });
@@ -3757,6 +3759,10 @@ class RecordingWindow implements VsCodeWindowLike {
 class EmptyScheduleEditor implements VsCodeScheduleEditor {
   async createDraftSchedule(): Promise<ScheduleDetailView> {
     throw new Error("createDraftSchedule should not be called.");
+  }
+
+  async createActiveSchedule(): Promise<ScheduleDetailView> {
+    throw new Error("createActiveSchedule should not be called.");
   }
 
   async openScheduleDetail(): Promise<ScheduleDetailView> {

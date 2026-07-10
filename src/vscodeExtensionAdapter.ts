@@ -156,7 +156,6 @@ export function createDefaultVsCodeSchedulerServices(
       confirmEnableLocalScheduling: (intent) =>
         confirmEnableLocalScheduling(options.window, intent),
     }),
-    lifecycle,
     localSchedulingSetupAvailability: { available: true },
     dataVersion: () => store.dataVersion(),
     close: () => store.close(),
@@ -211,7 +210,6 @@ function createUnavailableLocalSchedulingServices(
           }
         : {},
     ),
-    lifecycle,
     localSchedulingSetupAvailability: {
       available: false,
       canManage: localSchedulingSetup !== undefined,

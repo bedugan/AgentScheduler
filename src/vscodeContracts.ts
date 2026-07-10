@@ -1,4 +1,5 @@
 import type {
+  CreateActiveScheduleInput,
   CreateDraftScheduleInput,
   HarnessMode,
   RunHistoryDetailView,
@@ -12,7 +13,6 @@ import type {
   LocalSchedulingSetupResult,
   WakeupTriggerIntent,
 } from "./localSchedulingSetup.js";
-import type { ScheduleLifecycle } from "./scheduleLifecycle.js";
 import type {
   ScheduleModelCatalog,
   ScheduleModelOption,
@@ -198,6 +198,9 @@ export interface VsCodeScheduleEditor {
   createDraftSchedule(
     input: CreateDraftScheduleInput,
   ): Promise<ScheduleDetailView>;
+  createActiveSchedule(
+    input: CreateActiveScheduleInput,
+  ): Promise<ScheduleDetailView>;
   openScheduleDetail(scheduleId: string): Promise<ScheduleDetailView>;
   saveScheduleDetailEdits(
     scheduleId: string,
@@ -225,7 +228,6 @@ export interface VsCodeScheduleEditor {
 
 export interface VsCodeSchedulerServices {
   editor: VsCodeScheduleEditor;
-  lifecycle?: ScheduleLifecycle;
   localSchedulingSetupAvailability?: {
     available: boolean;
     canManage?: boolean;

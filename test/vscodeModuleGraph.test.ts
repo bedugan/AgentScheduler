@@ -8,6 +8,7 @@ describe("VS Code module dependency graph", () => {
       "vscodeContracts",
       "vscodeCopilotTaskExecutor",
       "vscodeLocalScheduling",
+      "vscodeNaturalLanguageScheduleCreation",
       "vscodeScheduleController",
       "vscodeScheduleDetailMessages",
       "vscodeSchedulePanelHost",
@@ -27,5 +28,29 @@ describe("VS Code module dependency graph", () => {
     assert.match(controller, /from "\.\/vscodeContracts\.js"/);
     const adapter = await readFile("src/vscodeExtensionAdapter.ts", "utf8");
     assert.match(adapter, /export \* from "\.\/vscodeContracts\.js"/);
+  });
+
+  it("routes every VS Code schedule operation through the editor control surface", async () => {
+    const modulesWithoutRawLifecycleAccess = [
+      "vscodeContracts",
+      "vscodeNaturalLanguageScheduleCreation",
+      "vscodeScheduleController",
+    ];
+
+    for (const moduleName of modulesWithoutRawLifecycleAccess) {
+      const source = await readFile(`src/${moduleName}.ts`, "utf8");
+      assert.doesNotMatch(
+        source,
+        /scheduleLifecycle\.js/,
+        `${moduleName} must depend on the editor control surface, not ScheduleLifecycle`,
+      );
+    }
+
+    const adapter = await readFile("src/vscodeExtensionAdapter.ts", "utf8");
+    assert.doesNotMatch(
+      adapter,
+      /\n\s{4}lifecycle,\n\s{4}localSchedulingSetupAvailability/,
+      "the composition surface must not expose its raw lifecycle",
+    );
   });
 });
