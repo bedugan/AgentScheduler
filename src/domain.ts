@@ -67,6 +67,7 @@ export interface CreateDraftScheduleInput {
   targetContext: TargetContext | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   runCap?: RunCapInput;
 }
@@ -77,6 +78,7 @@ export interface CreateActiveScheduleInput {
   targetContext: TargetContext;
   harnessMode: HarnessMode;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   runCap?: RunCapInput;
 }
@@ -91,6 +93,7 @@ export interface Schedule {
   targetContext: TargetContext | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   runCounter: RunCounter;
   nextRunAt: IsoTimestamp | null;
@@ -114,6 +117,7 @@ export interface RunHistoryEntry {
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   executedModel: string | null;
   targetContext: TargetContext | null;
   externalRunId: string | null;
@@ -140,6 +144,7 @@ export interface ScheduleDetailOverview {
   cadence: RunCadence | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   runCounter: ScheduleDetailRunCounterView;
 }
@@ -235,6 +240,7 @@ export interface ScheduleSummary {
   targetContext: TargetContext | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
 }
 
@@ -259,6 +265,7 @@ export interface RunHistoryDetailView {
   resolvedRunInstructions: string;
   approvalMode: ApprovalMode;
   selectedModel: string;
+  selectedAgentProfile?: string;
   executedModel: string | null;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
   outcome: RunOutcomeView;
@@ -285,6 +292,7 @@ export interface UpdateScheduleInput {
   targetContext?: TargetContext | null;
   harnessMode?: HarnessMode | null;
   model?: string;
+  agentProfile?: string;
   approvalMode?: ApprovalMode;
   runCap?: RunCapInput | null;
 }
@@ -327,6 +335,7 @@ export interface ScheduleExportEntry {
   targetContext: TargetContext | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   runCap: RunCapInput | null;
 }

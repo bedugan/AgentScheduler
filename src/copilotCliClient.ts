@@ -7,6 +7,7 @@ import type {
   ScheduleHarnessModeAvailability,
   TargetContext,
 } from "./domain.js";
+import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 import {
   HARNESS_MODE_LABELS,
 } from "./domain.js";
@@ -93,6 +94,7 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
   private readonly runTimeoutMs: number;
   private readonly interactiveExecutor: CopilotInteractiveExecutor | undefined;
   private cachedAvailability: CopilotLocalClientAvailability | undefined;
+  private cachedModelOptions: readonly ScheduleModelOption[] | undefined;
 
   constructor(options: CopilotCliLocalClientOptions = {}) {
     this.command =
@@ -108,6 +110,19 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
 
   currentAvailability(): CopilotLocalClientAvailability | undefined {
     return this.cachedAvailability;
+  }
+
+  async models(): Promise<readonly ScheduleModelOption[]> {
+    if (this.cachedModelOptions) {
+      return this.cachedModelOptions;
+    }
+    const result = await this.runner.run(this.command, ["help", "config"], {
+      timeoutMs: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
+    });
+    this.cachedModelOptions = copilotCliModelOptionsFromConfigHelp(
+      `${result.stdout}\n${result.stderr}`,
+    );
+    return this.cachedModelOptions;
   }
 
   async checkAvailability(
@@ -244,6 +259,31 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
     };
     return this.cachedAvailability;
   }
+}
+
+export function copilotCliModelOptionsFromConfigHelp(
+  output: string,
+): ScheduleModelOption[] {
+  const modelSection = /(?:^|\n)  `model`:[\s\S]*?(?=\n\n  `|$)/.exec(output)?.[0] ?? "";
+  const ids = [...modelSection.matchAll(/^    - "([^"]+)"\s*$/gm)]
+    .map((match) => match[1]?.trim())
+    .filter((id): id is string => Boolean(id));
+  return ["auto", ...new Set(ids)].map((id) => ({
+    id,
+    displayName: id === "auto" ? "Auto" : copilotModelDisplayName(id),
+    vendor: "GitHub Copilot",
+  }));
+}
+
+function copilotModelDisplayName(id: string): string {
+  return id
+    .split("-")
+    .map((part) =>
+      part.toLowerCase() === "gpt"
+        ? "GPT"
+        : `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`,
+    )
+    .join(" ");
 }
 
 export function createDefaultCopilotLocalHarness(
@@ -433,6 +473,11 @@ function copilotPromptArgsFor(request: CopilotLocalStartRequest): string[] {
     args.push("-C", workspaceDirectory);
   }
 
+  const agentProfile = request.schedule.agentProfile?.trim();
+  if (agentProfile) {
+    args.push("--agent", agentProfile);
+  }
+
   const model = request.schedule.model.trim();
   if (model && model !== "auto") {
     args.push("--model", model);
@@ -455,6 +500,10 @@ function copilotInteractiveArgsFor(request: CopilotLocalStartRequest): string[] 
   const workspaceDirectory = workspaceDirectoryFor(request.schedule.targetContext);
   if (workspaceDirectory) {
     args.push("-C", workspaceDirectory);
+  }
+  const agentProfile = request.schedule.agentProfile?.trim();
+  if (agentProfile) {
+    args.push("--agent", agentProfile);
   }
   const model = request.schedule.model.trim();
   if (model && model !== "auto") {

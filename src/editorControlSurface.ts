@@ -50,6 +50,7 @@ export class EditorControlSurface {
       targetContext: schedule.targetContext,
       harnessMode: schedule.harnessMode,
       model: schedule.model,
+      ...(schedule.agentProfile && { agentProfile: schedule.agentProfile }),
       approvalMode: schedule.approvalMode,
     }));
   }

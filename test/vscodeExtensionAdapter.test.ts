@@ -34,6 +34,7 @@ import {
   SQLITE_LOCAL_STORE_FILENAME,
   ScheduleTreeDataProvider,
   SqliteDataVersionMonitor,
+  VisiblePanelRefreshMonitor,
   VsCodeTaskCopilotInteractiveExecutor,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
@@ -136,6 +137,8 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /Review the workspace\./);
     assert.match(html, /vscode-task:run_1/);
     assert.match(html, /data-run-action="cancel"/);
+    assert.match(html, /data-run-action="refresh"/);
+    assert.match(html, /Last refreshed/);
     assert.match(html, /default-approvals/);
   });
 
@@ -177,6 +180,148 @@ describe("VS Code extension adapter", () => {
     assert.equal(window.panels[1]?.viewType, RUN_HISTORY_DETAIL_VIEW_TYPE);
     assert.match(window.panels[1]?.webview.html ?? "", /Create a reviewable run/);
   });
+
+  it("refreshes an open Schedule Detail on demand without changing run state", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const created = await editor.createDraftSchedule({
+      runInstructions: "Original instructions.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/refresh" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor },
+      viewColumn: 1,
+    });
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
+    const panel = requiredPanel(window);
+
+    await editor.saveScheduleDetailEdits(created.schedule.id, {
+      runInstructions: "Instructions changed by the extension.",
+    });
+    assert.doesNotMatch(panel.webview.html, /Instructions changed by the extension/);
+
+    await panel.webview.postMessageFromWebview({
+      type: "refresh",
+      scheduleId: created.schedule.id,
+    });
+
+    assert.match(panel.webview.html, /Instructions changed by the extension/);
+    assert.match(panel.webview.html, /data-action="refresh"/);
+    assert.match(panel.webview.html, /Last refreshed/);
+    assert.equal((await editor.openScheduleDetail(created.schedule.id)).overview.status, "draft");
+  });
+
+  it("pauses live Schedule Detail replacement while the form is focused", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const created = await editor.createDraftSchedule({
+      runInstructions: "Original focus-safe instructions.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/focus-refresh" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const context = recordingContext();
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    registerVsCodeScheduleCommands({
+      context,
+      commands,
+      window,
+      workspace: {},
+      services: { editor },
+      viewColumn: 1,
+    });
+    try {
+      await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
+      const panel = requiredPanel(window);
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: true,
+      });
+      await editor.saveScheduleDetailEdits(created.schedule.id, {
+        runInstructions: "Metadata changed while the form stayed focused.",
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.doesNotMatch(
+        panel.webview.html,
+        /Metadata changed while the form stayed focused/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: false,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.match(
+        panel.webview.html,
+        /Metadata changed while the form stayed focused/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: true,
+      });
+      await panel.webview.postMessageFromWebview({
+        type: "form-dirty",
+        scheduleId: created.schedule.id,
+      });
+      await panel.webview.postMessageFromWebview({
+        type: "form-interaction",
+        scheduleId: created.schedule.id,
+        active: false,
+      });
+      await editor.saveScheduleDetailEdits(created.schedule.id, {
+        runInstructions: "A later persisted change must not erase dirty fields.",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      assert.doesNotMatch(
+        panel.webview.html,
+        /A later persisted change must not erase dirty fields/,
+      );
+
+      await panel.webview.postMessageFromWebview({
+        type: "refresh",
+        scheduleId: created.schedule.id,
+      });
+      assert.match(
+        panel.webview.html,
+        /A later persisted change must not erase dirty fields/,
+      );
+    } finally {
+      for (const disposable of context.subscriptions) {
+        disposable.dispose();
+      }
+    }
+  });
+
   it("detects worker writes through SQLite data_version for open-state refresh", async () => {
     const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-version-"));
     const databasePath = join(directory, "schedules.sqlite");
@@ -280,6 +425,42 @@ describe("VS Code extension adapter", () => {
     releaseDisposed();
     await disposingRefresh;
     assert.equal(disposedRefreshes, 1);
+  });
+
+  it("refreshes live metadata only for visible panels and coalesces overlapping polls", async () => {
+    let visible = false;
+    let refreshes = 0;
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const refreshStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const monitor = new VisiblePanelRefreshMonitor(
+      () => visible,
+      async () => {
+        refreshes += 1;
+        if (refreshes === 1) {
+          started();
+          await gate;
+        }
+      },
+    );
+
+    assert.equal(await monitor.poll(), false);
+    visible = true;
+    const firstPoll = monitor.poll();
+    await refreshStarted;
+    assert.equal(await monitor.poll(), true);
+    release();
+    await firstPoll;
+    assert.equal(refreshes, 2);
+
+    monitor.dispose();
+    assert.equal(await monitor.poll(), false);
+    assert.equal(refreshes, 2);
   });
   it("runs interactive Copilot through a VS Code Task terminal and waits for completion", async () => {
     const tasks = new RecordingTasks();
@@ -1363,7 +1544,7 @@ describe("VS Code extension adapter", () => {
       DELETE_SCHEDULE_COMMAND,
       CREATE_SCHEDULE_COMMAND,
     ]);
-    assert.equal(context.subscriptions.length, 4);
+    assert.equal(context.subscriptions.length, 5);
   });
 
   it("registers natural-language creation surfaces and activates complete tool requests after confirmation", async () => {
@@ -2195,6 +2376,7 @@ describe("VS Code extension adapter", () => {
     assert.match(html, /Local Scheduling/);
     assert.match(html, /name="approvalMode"/);
     assert.match(html, /value="default-approvals" selected/);
+    assert.match(html, /VS Code Task terminal \(managed Copilot CLI fallback\)/);
   });
 
   it("suppresses repeated Run Now clicks and marks the button busy before backend response", async () => {
@@ -2259,6 +2441,7 @@ describe("VS Code extension adapter", () => {
           targetContextUri: "",
           targetContextLabel: "",
           harnessMode: "",
+          agentProfile: "",
           model: "",
           approvalMode: "",
           runCapMaxRuns: "",
@@ -2270,6 +2453,66 @@ describe("VS Code extension adapter", () => {
     assert.equal(runNowButton.attributes.get("aria-busy"), "true");
     assert.equal(runNowButton.attributes.get("aria-live"), "polite");
     assert.equal(runNowButton.textContent, "Starting...");
+  });
+
+  it("reports Schedule Detail form focus as one refresh-pausing interaction", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const detail = await new EditorControlSurface(lifecycle).createDraftSchedule({
+      runInstructions: "Keep focus while editing.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/focus" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const script = scriptContentFrom(renderScheduleDetailWebviewHtml(detail));
+    const postedMessages: unknown[] = [];
+    const listeners = new Map<string, (event: { relatedTarget?: unknown }) => void>();
+    const insideForm = { insideForm: true };
+    const form = {
+      dataset: { scheduleId: detail.schedule.id },
+      elements: { namedItem: () => ({ value: "" }) },
+      contains: (target: unknown) => target === insideForm,
+      addEventListener: (
+        name: string,
+        listener: (event: { relatedTarget?: unknown }) => void,
+      ) => listeners.set(name, listener),
+    };
+    const document = {
+      querySelector: (selector: string) =>
+        selector === "#schedule-detail-form" ? form : null,
+      querySelectorAll: () => [],
+    };
+
+    Function("acquireVsCodeApi", "document", script)(
+      () => ({
+        postMessage: (message: unknown) => postedMessages.push(message),
+      }),
+      document,
+    );
+
+    listeners.get("focusin")?.({});
+    listeners.get("focusout")?.({ relatedTarget: insideForm });
+    listeners.get("focusout")?.({ relatedTarget: null });
+
+    assert.deepEqual(postedMessages, [
+      {
+        type: "form-interaction",
+        scheduleId: detail.schedule.id,
+        active: true,
+      },
+      {
+        type: "form-interaction",
+        scheduleId: detail.schedule.id,
+        active: false,
+      },
+    ]);
   });
 
   it("routes Schedule List selections through Open Schedule and focuses an existing detail panel", async () => {
@@ -2382,6 +2625,7 @@ describe("VS Code extension adapter", () => {
         targetContextUri: "file:///Users/ada/src/AgentScheduler",
         targetContextLabel: "AgentScheduler",
         harnessMode: "cloud-copilot",
+        agentProfile: "triage",
         model: "gpt-5.1",
         approvalMode: "autopilot",
         runCapMaxRuns: "3",
@@ -2404,12 +2648,14 @@ describe("VS Code extension adapter", () => {
       label: "AgentScheduler",
     });
     assert.equal(saved?.harnessMode, "cloud-copilot");
+    assert.equal(saved?.agentProfile, "triage");
     assert.equal(saved?.model, "gpt-5.1");
     assert.equal(saved?.approvalMode, "autopilot");
     assert.deepEqual(saved?.runCounter, { completed: 0, limit: 3 });
 
     assert.match(panel.webview.html, /Review issue #24 and update the schedule\./);
     assert.match(panel.webview.html, /name="model"[^>]*value="gpt-5\.1"/);
+    assert.match(panel.webview.html, /name="agentProfile"[^>]*value="triage"/);
     assert.match(panel.webview.html, /name="runCapMaxRuns"[^>]*value="3"/);
     assert.doesNotMatch(panel.webview.html, /role="alert"/);
   });

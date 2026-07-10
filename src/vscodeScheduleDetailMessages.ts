@@ -12,6 +12,7 @@ export interface ScheduleDetailFormFields {
   targetContextLabel?: unknown;
   harnessMode?: unknown;
   model?: unknown;
+  agentProfile?: unknown;
   approvalMode?: unknown;
   runCapMaxRuns?: unknown;
 }
@@ -23,6 +24,7 @@ export type LocalSchedulingWebviewAction =
 
 export type ScheduleDetailWebviewMessage =
   | { type: "save"; scheduleId: string; fields: ScheduleDetailFormFields }
+  | { type: "refresh"; scheduleId: string }
   | { type: ScheduleDetailActionKind; scheduleId: string; fields?: ScheduleDetailFormFields }
   | { type: LocalSchedulingWebviewAction; scheduleId: string };
 
@@ -52,6 +54,7 @@ export function updateScheduleInputFromWebviewFields(
         : null,
     harnessMode: parseHarnessMode(harnessMode),
     model: stringField(fields, "model").trim(),
+    agentProfile: stringField(fields, "agentProfile").trim(),
     approvalMode: parseApprovalMode(approvalMode),
     runCap:
       runCapMaxRuns.length > 0
@@ -77,6 +80,10 @@ export function parseScheduleDetailWebviewMessage(
 
   if (isLocalSchedulingWebviewAction(message.type)) {
     return { type: message.type, scheduleId: message.scheduleId };
+  }
+
+  if (message.type === "refresh") {
+    return { type: "refresh", scheduleId: message.scheduleId };
   }
 
   if (message.type === "save" && isRecord(message.fields)) {

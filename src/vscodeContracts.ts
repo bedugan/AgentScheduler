@@ -131,6 +131,7 @@ export interface VsCodeQuickPickOptionsLike {
 
 export interface VsCodeWebviewPanelLike {
   title: string;
+  visible?: boolean;
   webview: VsCodeWebviewLike;
   reveal?(showOptions?: unknown): unknown;
   dispose?(): unknown;

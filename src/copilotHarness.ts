@@ -112,6 +112,7 @@ export interface CopilotCloudStartRequest extends HarnessStartRequest {
 }
 
 export interface CopilotLocalClient {
+  models?(): Promise<readonly ScheduleModelOption[]>;
   checkAvailability(
     schedule: Schedule,
   ): Promise<CopilotLocalClientAvailability>;
@@ -161,7 +162,9 @@ export class CopilotLocalHarness implements AgentHarness {
   }
 
   async models(): Promise<readonly ScheduleModelOption[]> {
-    return [{ id: "auto", displayName: "Auto", vendor: "GitHub Copilot" }];
+    return this.client.models?.() ?? [
+      { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+    ];
   }
 
   availability(schedule?: Schedule): ScheduleHarnessModeAvailability {
@@ -239,10 +242,26 @@ export class CopilotLocalHarness implements AgentHarness {
       };
     }
 
-    if (request.schedule.model !== "auto") {
+    const agentProfile = request.schedule.agentProfile?.trim();
+    if (
+      agentProfile &&
+      !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(agentProfile)
+    ) {
       return {
         status: "blocked",
-        reason: `Model '${request.schedule.model}' is not a runnable Local Copilot Mode selector. Choose Auto.`,
+        reason: `Copilot Agent profile '${agentProfile}' is invalid. Use the lowercase letters, numbers, and hyphens from the agent profile filename without the .agent.md suffix.`,
+        resolvedHarnessPolicy,
+      };
+    }
+
+    const modelAvailable = request.schedule.model === "auto" ||
+      (await this.models()).some(
+        (option) => option.id === request.schedule.model,
+      );
+    if (!modelAvailable) {
+      return {
+        status: "blocked",
+        reason: `Scheduled Model '${request.schedule.model}' is unavailable in the current Local Copilot Mode catalog. Choose Auto or another model reported by Copilot CLI.`,
         resolvedHarnessPolicy,
       };
     }

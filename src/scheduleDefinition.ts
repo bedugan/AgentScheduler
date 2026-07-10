@@ -38,6 +38,7 @@ export class ScheduleDefinition {
       targetContext: input.targetContext,
       harnessMode: input.harnessMode,
       model: input.model,
+      ...(input.agentProfile && { agentProfile: input.agentProfile }),
       approvalMode: input.approvalMode,
       runCounter: {
         completed: 0,
@@ -61,6 +62,9 @@ export class ScheduleDefinition {
     const cadenceChanged =
       Object.hasOwn(input, "cadence") &&
       !sameRunCadence(schedule.cadence, input.cadence ?? null);
+    const agentProfile = Object.hasOwn(input, "agentProfile")
+      ? input.agentProfile?.trim()
+      : schedule.agentProfile;
     const nextSchedule: Schedule = {
       ...schedule,
       revision: schedule.revision + 1,
@@ -75,6 +79,7 @@ export class ScheduleDefinition {
         ? (input.harnessMode ?? null)
         : schedule.harnessMode,
       model: input.model ?? schedule.model,
+      ...(agentProfile && { agentProfile }),
       approvalMode: input.approvalMode ?? schedule.approvalMode,
       runCounter: Object.hasOwn(input, "runCap")
         ? {
@@ -211,6 +216,7 @@ function sameScheduleConfiguration(left: Schedule, right: Schedule): boolean {
     sameTargetContext(left.targetContext, right.targetContext) &&
     left.harnessMode === right.harnessMode &&
     left.model === right.model &&
+    left.agentProfile === right.agentProfile &&
     left.approvalMode === right.approvalMode &&
     left.runCounter.limit === right.runCounter.limit
   );

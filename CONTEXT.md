@@ -124,6 +124,10 @@ _Avoid_: Provider, model
 The model selector stored on a schedule, including explicit model ids and provider-defined choices such as Auto. The scheduled model is the user's configuration for future runs.
 _Avoid_: Executed model, harness mode
 
+**Copilot Agent Profile**:
+An optional Copilot CLI agent identifier stored separately from the Scheduled Model. It selects a built-in or custom `.agent.md` behavior profile for a Local Copilot Mode Agent Run and is passed through the Copilot Harness only when explicitly configured.
+_Avoid_: Scheduled Model, Agent Harness, run instructions
+
 **Executed Model**:
 The concrete model reported by the harness for one Agent Run. Run History records the executed model when the harness can report it, because Auto or provider defaults may resolve differently across runs.
 _Avoid_: Scheduled model, model picker

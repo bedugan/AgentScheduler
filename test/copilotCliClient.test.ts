@@ -56,6 +56,41 @@ describe("Copilot CLI local client", () => {
     );
   });
 
+  it("discovers the harness-owned Scheduled Model catalog from Copilot CLI", async () => {
+    const runner = new RecordingCopilotCliCommandRunner({
+      exitCode: 0,
+      stdout: [
+        "Configuration Settings:",
+        "",
+        "  `model`: AI model to use for Copilot CLI.",
+        '    - "claude-haiku-4.5"',
+        '    - "gpt-5.4-mini"',
+        "",
+        "  `contextTier`: context window tier.",
+      ].join("\n"),
+      stderr: "",
+    });
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+    });
+
+    assert.deepEqual(await client.models(), [
+      { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+      {
+        id: "claude-haiku-4.5",
+        displayName: "Claude Haiku 4.5",
+        vendor: "GitHub Copilot",
+      },
+      {
+        id: "gpt-5.4-mini",
+        displayName: "GPT 5.4 Mini",
+        vendor: "GitHub Copilot",
+      },
+    ]);
+    assert.deepEqual(runner.calls[0]?.args, ["help", "config"]);
+  });
+
   it("tells the user how to fetch Copilot CLI when the command is missing", () => {
     const availability = classifyCopilotCliAvailability({
       exitCode: null,
@@ -360,6 +395,48 @@ describe("Copilot CLI local client", () => {
       runner.calls[0]?.args.at(-1) ?? "",
       /Review the scheduled workspace\./,
     );
+  });
+
+  it("passes a selected Copilot Agent profile separately from the Scheduled Model", async () => {
+    const runner = new RecordingCopilotCliCommandRunner({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        type: "result",
+        sessionId: "triage-agent-session",
+        exitCode: 0,
+      }),
+      stderr: "",
+    });
+    const client = new CopilotCliLocalClient({
+      command: "/custom/copilot",
+      runner,
+    });
+    const schedule = {
+      ...createSchedule({
+        approvalMode: "bypass-approvals",
+        model: "gpt-5.4-mini",
+        targetContext: null,
+      }),
+      agentProfile: "triage",
+    };
+
+    await client.start({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      runInstructions: schedule.runInstructions,
+      resolvedHarnessPolicy: resolveCopilotLocalHarnessPolicy({
+        approvalMode: "bypass-approvals",
+        unattended: false,
+      }),
+    });
+
+    assert.deepEqual(runner.calls[0]?.args.slice(0, 4), [
+      "--agent",
+      "triage",
+      "--model",
+      "gpt-5.4-mini",
+    ]);
   });
 
   it("frames recurrence-heavy run instructions as one Copilot CLI occurrence", async () => {

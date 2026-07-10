@@ -49,6 +49,7 @@ interface ScheduleRow {
   target_context_json: string;
   harness_mode: HarnessMode | "";
   model: string;
+  agent_profile?: string | null;
   approval_mode: ApprovalMode;
   run_counter_json: string;
   next_run_at: string | null;
@@ -70,6 +71,7 @@ interface RunHistoryRow {
   resolved_harness_policy_json: string;
   harness_mode: HarnessMode | "";
   model: string;
+  agent_profile?: string | null;
   executed_model?: string | null;
   target_context_json: string;
   external_run_id: string | null;
@@ -143,6 +145,7 @@ export class SqliteScheduleStore
           target_context_json,
           harness_mode,
           model,
+          agent_profile,
           approval_mode,
           run_counter_json,
           next_run_at,
@@ -159,6 +162,7 @@ export class SqliteScheduleStore
           $target_context_json,
           $harness_mode,
           $model,
+          $agent_profile,
           $approval_mode,
           $run_counter_json,
           $next_run_at,
@@ -177,6 +181,7 @@ export class SqliteScheduleStore
         target_context_json: JSON.stringify(schedule.targetContext),
         harness_mode: schedule.harnessMode ?? "",
         model: schedule.model,
+        agent_profile: schedule.agentProfile ?? "",
         approval_mode: schedule.approvalMode,
         run_counter_json: JSON.stringify(schedule.runCounter),
         next_run_at: schedule.nextRunAt,
@@ -208,6 +213,7 @@ export class SqliteScheduleStore
             target_context_json = $target_context_json,
             harness_mode = $harness_mode,
             model = $model,
+            agent_profile = $agent_profile,
             approval_mode = $approval_mode,
             run_counter_json = $run_counter_json,
             next_run_at = $next_run_at,
@@ -239,6 +245,7 @@ export class SqliteScheduleStore
         target_context_json: JSON.stringify(schedule.targetContext),
         harness_mode: schedule.harnessMode ?? "",
         model: schedule.model,
+        agent_profile: schedule.agentProfile ?? "",
         approval_mode: schedule.approvalMode,
         run_counter_json: JSON.stringify(schedule.runCounter),
         next_run_at: schedule.nextRunAt,
@@ -514,6 +521,7 @@ export class SqliteScheduleStore
           resolved_harness_policy_json,
           harness_mode,
           model,
+          agent_profile,
           executed_model,
           target_context_json,
           external_run_id,
@@ -532,6 +540,7 @@ export class SqliteScheduleStore
           $resolved_harness_policy_json,
           $harness_mode,
           $model,
+          $agent_profile,
           $executed_model,
           $target_context_json,
           $external_run_id,
@@ -550,6 +559,7 @@ export class SqliteScheduleStore
           resolved_harness_policy_json = excluded.resolved_harness_policy_json,
           harness_mode = excluded.harness_mode,
           model = excluded.model,
+          agent_profile = excluded.agent_profile,
           executed_model = excluded.executed_model,
           target_context_json = excluded.target_context_json,
           external_run_id = excluded.external_run_id,
@@ -569,6 +579,7 @@ export class SqliteScheduleStore
         resolved_harness_policy_json: JSON.stringify(entry.resolvedHarnessPolicy),
         harness_mode: entry.harnessMode ?? "",
         model: entry.model,
+        agent_profile: entry.agentProfile ?? "",
         executed_model: entry.executedModel,
         target_context_json: JSON.stringify(entry.targetContext),
         external_run_id: entry.externalRunId,
@@ -778,6 +789,7 @@ export class SqliteScheduleStore
         target_context_json TEXT NOT NULL,
         harness_mode TEXT NOT NULL,
         model TEXT NOT NULL,
+        agent_profile TEXT NOT NULL DEFAULT '',
         approval_mode TEXT NOT NULL,
         run_counter_json TEXT NOT NULL,
         next_run_at TEXT,
@@ -802,6 +814,7 @@ export class SqliteScheduleStore
         resolved_harness_policy_json TEXT NOT NULL,
         harness_mode TEXT NOT NULL,
         model TEXT NOT NULL,
+        agent_profile TEXT NOT NULL DEFAULT '',
         executed_model TEXT,
         target_context_json TEXT NOT NULL,
         external_run_id TEXT,
@@ -841,6 +854,16 @@ export class SqliteScheduleStore
         ON local_run_executions(lease_expires_at);
     `);
     this.addColumnIfMissing("run_history", "executed_model", "TEXT");
+    this.addColumnIfMissing(
+      "run_history",
+      "agent_profile",
+      "TEXT NOT NULL DEFAULT ''",
+    );
+    this.addColumnIfMissing(
+      "schedules",
+      "agent_profile",
+      "TEXT NOT NULL DEFAULT ''",
+    );
     this.addColumnIfMissing("local_run_executions", "handle", "TEXT");
     this.addColumnIfMissing(
       "local_run_executions",
@@ -914,6 +937,7 @@ export class SqliteScheduleStore
       targetContext: parseJson<TargetContext | null>(row.target_context_json),
       harnessMode: row.harness_mode === "" ? null : row.harness_mode,
       model: row.model,
+      ...(row.agent_profile && { agentProfile: row.agent_profile }),
       approvalMode: row.approval_mode,
       runCounter: parseJson<RunCounter>(row.run_counter_json),
       nextRunAt: row.next_run_at,
@@ -939,6 +963,7 @@ export class SqliteScheduleStore
       ),
       harnessMode: row.harness_mode === "" ? null : row.harness_mode,
       model: row.model,
+      ...(row.agent_profile && { agentProfile: row.agent_profile }),
       executedModel: row.executed_model ?? null,
       targetContext: parseJson<TargetContext | null>(row.target_context_json),
       externalRunId: row.external_run_id,

@@ -798,6 +798,9 @@ export class RunCoordinator {
       resolvedHarnessPolicy: input.resolvedHarnessPolicy,
       harnessMode: input.schedule.harnessMode,
       model: input.schedule.model,
+      ...(input.schedule.agentProfile && {
+        agentProfile: input.schedule.agentProfile,
+      }),
       executedModel: input.executedModel ?? null,
       targetContext: input.schedule.targetContext,
       externalRunId: input.externalRunId,
