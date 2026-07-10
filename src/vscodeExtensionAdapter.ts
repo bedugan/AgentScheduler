@@ -1,24 +1,14 @@
-import { randomBytes } from "node:crypto";
-
 import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
 import type { CopilotInteractiveExecutor } from "./copilotCliClient.js";
 import type {
-  ApprovalMode,
   CreateDraftScheduleInput,
   HarnessMode,
-  RunCadence,
   RunHistoryEntry,
   RunHistoryDetailView,
-  RunCapInput,
-  ScheduleDetailActionKind,
-  ScheduleDetailAction,
   ScheduleHarnessModeAvailability,
-  ScheduleDetailPreviousRun,
   ScheduleDetailView,
   ScheduleSummary,
-  TargetContext,
   UpdateScheduleInput,
-  WorkspaceTargetContext,
 } from "./domain.js";
 import { EditorControlSurface } from "./editorControlSurface.js";
 import {
@@ -35,18 +25,7 @@ import type {
   ScheduleModelCatalog,
   ScheduleModelOption,
 } from "./scheduleModelCatalog.js";
-import {
-  isScheduleModelAvailable,
-  preferredScheduleModel,
-  unavailableScheduleModelMessage,
-} from "./scheduleModelCatalog.js";
 import { SqliteScheduleStore } from "./sqliteScheduleStore.js";
-import type {
-  NaturalLanguageScheduleActivationProposal,
-  NaturalLanguageScheduleCreationInput,
-  NaturalLanguageScheduleCreationResult,
-} from "./vscodeNaturalLanguageScheduleCreation.js";
-import { VsCodeNaturalLanguageScheduleCreationFlow } from "./vscodeNaturalLanguageScheduleCreation.js";
 import {
   SQLITE_LOCAL_STORE_FILENAME,
   prepareVsCodeLocalScheduling,
@@ -87,25 +66,6 @@ export {
   scheduleTreeItemForSummary,
   type ScheduleTreeNode,
 } from "./vscodeScheduleController.js";
-import {
-  parseScheduleDetailWebviewMessage,
-  isLocalSchedulingWebviewAction,
-  updateScheduleInputFromWebviewFields,
-  type LocalSchedulingWebviewAction,
-  type ScheduleDetailFormFields,
-} from "./vscodeScheduleDetailMessages.js";
-import {
-  cadenceLabel,
-  renderRunHistoryDetailHtml,
-  renderScheduleDetailWebviewHtml,
-  scheduleDetailTitle,
-  targetContextLabel,
-  type ScheduleDetailRenderState,
-} from "./vscodeScheduleRenderers.js";
-import {
-  VsCodeSchedulePanelHost,
-  type SchedulePanelLike,
-} from "./vscodeSchedulePanelHost.js";
 export {
   renderRunHistoryDetailHtml,
   renderScheduleDetailWebviewHtml,
@@ -123,12 +83,6 @@ export {
   type VsCodeGlobalStorageContextLike,
   type VsCodeInstalledExtensionContextLike,
 } from "./vscodeLocalScheduling.js";
-import type {
-  VsCodeCopilotTaskFactory,
-  VsCodeTaskExecutionLike,
-  VsCodeTaskProcessEndEventLike,
-  VsCodeTasksLike,
-} from "./vscodeCopilotTaskExecutor.js";
 
 export const ENABLE_LOCAL_SCHEDULING_ACTION = "Enable Local Scheduling";
 
