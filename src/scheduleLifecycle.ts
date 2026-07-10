@@ -297,6 +297,9 @@ export class ScheduleLifecycle {
     input: UpdateScheduleInput,
   ): Promise<Schedule> {
     const schedule = await this.requireSchedule(scheduleId);
+    const cadenceChanged =
+      Object.hasOwn(input, "cadence") &&
+      !sameRunCadence(schedule.cadence, input.cadence ?? null);
     const nextSchedule: Schedule = {
       ...schedule,
       revision: schedule.revision + 1,
@@ -321,9 +324,13 @@ export class ScheduleLifecycle {
       updatedAt: this.nowIso(),
     };
 
+    if (sameScheduleConfiguration(schedule, nextSchedule)) {
+      return schedule;
+    }
+
     if (nextSchedule.status === "active") {
       this.requireActivationRequirements(nextSchedule);
-      if (Object.hasOwn(input, "cadence")) {
+      if (cadenceChanged) {
         nextSchedule.nextRunAt = nextRunAtAfter(
           nextSchedule.cadence,
           this.clock.now(),
@@ -1717,4 +1724,41 @@ function errorMessageFromUnknown(error: unknown): string {
   return error instanceof Error && error.message.trim().length > 0
     ? error.message
     : String(error);
+}
+
+function sameRunCadence(
+  left: RunCadence | null,
+  right: RunCadence | null,
+): boolean {
+  return (
+    left === right ||
+    (left?.type === "cron" &&
+      right?.type === "cron" &&
+      left.expression === right.expression)
+  );
+}
+
+function sameScheduleConfiguration(left: Schedule, right: Schedule): boolean {
+  return (
+    left.runInstructions === right.runInstructions &&
+    sameRunCadence(left.cadence, right.cadence) &&
+    sameTargetContext(left.targetContext, right.targetContext) &&
+    left.harnessMode === right.harnessMode &&
+    left.model === right.model &&
+    left.approvalMode === right.approvalMode &&
+    left.runCounter.limit === right.runCounter.limit
+  );
+}
+
+function sameTargetContext(
+  left: TargetContext | null,
+  right: TargetContext | null,
+): boolean {
+  return (
+    left === right ||
+    (left?.type === "workspace" &&
+      right?.type === "workspace" &&
+      left.uri === right.uri &&
+      left.label === right.label)
+  );
 }

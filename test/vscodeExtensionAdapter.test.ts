@@ -1718,6 +1718,7 @@ describe("VS Code extension adapter", () => {
 
     await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(schedule.id);
     const panel = requiredPanel(window);
+    clock.set("2026-07-07T17:05:00.000Z");
     await panel.webview.postMessageFromWebview({
       type: "run-now",
       scheduleId: schedule.id,
@@ -1743,11 +1744,33 @@ describe("VS Code extension adapter", () => {
       sandbox: "fake",
     });
     assert.equal(fakeHarness.startRequests.length, 1);
+    const updatedSchedule = await store.getSchedule(schedule.id);
+    assert.equal(updatedSchedule?.revision, 2);
+    assert.equal(updatedSchedule?.nextRunAt, "2026-07-07T17:00:00.000Z");
     assert.equal(
       fakeHarness.startRequests[0]?.schedule.approvalMode,
       "bypass-approvals",
     );
     assert.match(panel.webview.html, /Bypass Approvals/);
+
+    await panel.webview.postMessageFromWebview({
+      type: "run-now",
+      scheduleId: schedule.id,
+      fields: {
+        runInstructions: "Run with bypass approvals.",
+        cadenceExpression: "0 * * * *",
+        targetContextUri: "file:///Users/ada/src/AgentScheduler",
+        targetContextLabel: "AgentScheduler",
+        harnessMode: "local-copilot",
+        model: "gpt-5",
+        approvalMode: "bypass-approvals",
+        runCapMaxRuns: "",
+      },
+    });
+
+    const unchangedSchedule = await store.getSchedule(schedule.id);
+    assert.equal(unchangedSchedule?.revision, 2);
+    assert.equal(unchangedSchedule?.nextRunAt, "2026-07-07T17:00:00.000Z");
   });
 
   it("activates a draft schedule from the Schedule Detail panel and refreshes action state", async () => {

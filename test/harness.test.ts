@@ -290,6 +290,34 @@ describe("Copilot Local harness", () => {
     assert.equal(client.startRequests.length, 0);
   });
 
+  it("allows scheduling-related words when instructions do not request recurrence", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: {
+        status: "available",
+        approvalSurfaceAvailable: false,
+        supportedPermissionFlags: ["--no-ask-user", "--allow-all-tools"],
+      },
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = {
+      ...createSchedule({
+        approvalMode: "bypass-approvals",
+      }),
+      runInstructions:
+        "Review the daily report and diagnose the timer and daemon code.",
+    };
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "ready");
+    assert.equal(client.availabilityRequests.length, 1);
+  });
+
   it("records unattended Default Approvals blocking as a blocked run without falling back", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const client = new RecordingCopilotLocalClient({

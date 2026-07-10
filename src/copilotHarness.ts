@@ -429,14 +429,14 @@ function secondarySchedulerPolicyReason(
 
 function requestsSecondaryScheduler(value: string): boolean {
   const normalized = value.toLowerCase();
-  return [
-    /\b(run|check|execute|perform)\s+every\s+(hour|day|week|[1-9]\d?\s+minutes?)\b/,
-    /\bhourly\b/,
-    /\bdaily\b/,
-    /\bweekly\b/,
-    /\b(task scheduler|scheduled task|scheduled job|schtasks)\b/,
-    /\b(cron|crontab|systemd timer|launch agent|launchd)\b/,
-    /\b(background loop|detached process|daemon|watcher|timer)\b/,
-    /\bpowershell\b.*\bbackground\b/,
-  ].some((pattern) => pattern.test(normalized));
+  const requestsRecurringExecution =
+    /\b(run|check|execute|perform)\s+every\s+(hour|day|week|[1-9]\d?\s+minutes?)\b/.test(
+      normalized,
+    );
+  const requestsSchedulerCreation =
+    /\b(create|register|install|configure|set\s+up|add|start|launch)\b[^.!?\n]{0,160}\b(task scheduler|scheduled task|scheduled job|schtasks|cron(?: entry)?|crontab|systemd timer|launch agent|launchd|background loop|detached process|daemon|watcher)\b/.test(
+      normalized,
+    );
+
+  return requestsRecurringExecution || requestsSchedulerCreation;
 }
