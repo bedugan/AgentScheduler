@@ -97,6 +97,7 @@ export interface LocalSchedulingSetupOptions {
 export interface LocalSchedulingSetupResult {
   intent: WakeupTriggerIntent;
   state: LocalSchedulingSetupState;
+  applied?: boolean;
 }
 
 export class LocalSchedulingSetup implements LocalSchedulingStateSource {
@@ -129,12 +130,21 @@ export class LocalSchedulingSetup implements LocalSchedulingStateSource {
     };
 
     await this.store.saveLocalSchedulingSetup(state);
-    return { intent: result.intent, state };
+    return { intent: result.intent, state, applied: result.applied };
   }
 
   async verify(): Promise<LocalSchedulingSetupResult> {
-    const result = await this.provider.verify(this.request);
     const current = await this.store.getLocalSchedulingSetup();
+    if (
+      !current.enabled ||
+      current.platform !== this.provider.platform ||
+      current.triggerId !== this.request.triggerId
+    ) {
+      throw new Error(
+        "Persisted Local Scheduling setup does not match the expected trigger identity. Enable Local Scheduling again before verification.",
+      );
+    }
+    const result = await this.provider.verify(this.request);
     const now = this.nowIso();
     const state: LocalSchedulingSetupState = {
       ...current,
@@ -143,7 +153,7 @@ export class LocalSchedulingSetup implements LocalSchedulingStateSource {
     };
 
     await this.store.saveLocalSchedulingSetup(state);
-    return { intent: result.intent, state };
+    return { intent: result.intent, state, applied: result.applied };
   }
 
   async uninstall(): Promise<LocalSchedulingSetupResult> {
@@ -164,7 +174,7 @@ export class LocalSchedulingSetup implements LocalSchedulingStateSource {
         };
 
     await this.store.saveLocalSchedulingSetup(state);
-    return { intent: result.intent, state };
+    return { intent: result.intent, state, applied: result.applied };
   }
 
   async isLocalSchedulingEnabled(): Promise<boolean> {

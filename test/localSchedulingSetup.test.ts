@@ -305,6 +305,33 @@ describe("local scheduling setup", () => {
     assert.equal(provider.uninstallRequests.length, 1);
   });
 
+  it("does not verify a stale trigger identity from a prior setup", async () => {
+    const provider = new RecordingWakeupProvider();
+    const store = new InMemoryLocalSchedulingSetupStore();
+    await store.saveLocalSchedulingSetup({
+      enabled: true,
+      platform: "windows",
+      triggerId: "UnexpectedTrigger",
+      installedAt: "2026-07-07T16:00:00.000Z",
+      verifiedAt: null,
+      updatedAt: "2026-07-07T16:00:00.000Z",
+    });
+    const setup = new LocalSchedulingSetup({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      provider,
+      store,
+      request: {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: "/usr/local/bin/node",
+        workerArguments: ["workerCli.js", "scan-due-work"],
+        intervalMinutes: 5,
+      },
+    });
+
+    await assert.rejects(() => setup.verify(), /does not match the expected trigger/);
+    assert.equal(provider.verifyRequests.length, 0);
+  });
+
   it("starts automatic due work only after local scheduling setup is enabled", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const setup = new LocalSchedulingSetup({
