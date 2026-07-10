@@ -36,7 +36,7 @@ import {
   isActiveRunStatus,
   isStartedRunStatus,
 } from "./domain.js";
-import { nextRunAtAfter } from "./cadence.js";
+import { nextRunAtAfter } from "./recurrencePolicy.js";
 import type {
   AgentHarness,
   HarnessCancelResult,
