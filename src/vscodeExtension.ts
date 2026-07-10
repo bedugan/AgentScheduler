@@ -7,6 +7,8 @@ import {
 } from "./vscodeExtensionAdapter.js";
 
 export function activate(context: vscode.ExtensionContext): void {
+  const stateChanges = new vscode.EventEmitter<void>();
+  context.subscriptions.push(stateChanges);
   const interactiveExecutor = new VsCodeTaskCopilotInteractiveExecutor(
     vscode.tasks,
     {
@@ -26,6 +28,7 @@ export function activate(context: vscode.ExtensionContext): void {
         };
         return task;
       },
+      onExecutionStateChanged: () => stateChanges.fire(),
     },
   );
   const services = createDefaultVsCodeSchedulerServices(context, {
@@ -38,7 +41,7 @@ export function activate(context: vscode.ExtensionContext): void {
     commands: vscode.commands,
     window: vscode.window,
     workspace: vscode.workspace,
-    services,
+    services: { ...services, onDidChangeState: stateChanges.event },
     viewColumn: vscode.ViewColumn.One,
     eventEmitterFactory: {
       createEventEmitter: <T>() => new vscode.EventEmitter<T>(),

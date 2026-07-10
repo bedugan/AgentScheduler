@@ -37,7 +37,9 @@ import {
 import {
   cadenceLabel,
   renderRunHistoryDetailHtml,
+  renderRunHistoryLiveHtml,
   renderScheduleDetailWebviewHtml,
+  renderScheduleDetailLiveState,
   scheduleDetailTitle,
   targetContextLabel,
   type ScheduleDetailRenderState,
@@ -137,49 +139,6 @@ export class SqliteDataVersionMonitor {
           return;
         }
         await this.onChange();
-      } while (this.dirty && !this.disposed);
-    } finally {
-      this.refreshInFlight = undefined;
-    }
-  }
-}
-
-export class VisiblePanelRefreshMonitor {
-  private refreshInFlight: Promise<void> | undefined;
-  private dirty = false;
-  private disposed = false;
-
-  constructor(
-    private readonly hasVisiblePanels: () => boolean,
-    private readonly onRefresh: () => unknown | Promise<unknown>,
-  ) {}
-
-  async poll(): Promise<boolean> {
-    if (this.disposed || !this.hasVisiblePanels()) {
-      return false;
-    }
-    if (this.refreshInFlight) {
-      this.dirty = true;
-      return true;
-    }
-    this.refreshInFlight = this.refreshUntilClean();
-    await this.refreshInFlight;
-    return true;
-  }
-
-  dispose(): void {
-    this.disposed = true;
-    this.dirty = false;
-  }
-
-  private async refreshUntilClean(): Promise<void> {
-    try {
-      do {
-        this.dirty = false;
-        if (this.disposed || !this.hasVisiblePanels()) {
-          return;
-        }
-        await this.onRefresh();
       } while (this.dirty && !this.disposed);
     } finally {
       this.refreshInFlight = undefined;
@@ -345,31 +304,25 @@ export function registerVsCodeScheduleCommands(
         return controller.refreshExternalState();
       })
     : undefined;
-  const visiblePanelRefreshMonitor = new VisiblePanelRefreshMonitor(
-    () => controller.hasVisiblePanels(),
-    () => controller.refreshVisibleState(),
-  );
-  const refreshInterval = setInterval(() => {
+  const dataVersionInterval = dataVersionMonitor
+    ? setInterval(() => {
         try {
-          void (async () => {
-            const externalChange = await dataVersionMonitor?.poll() ?? false;
-            if (!externalChange) {
-              await visiblePanelRefreshMonitor.poll();
-            }
-          })().catch(() => {});
+          void dataVersionMonitor.poll().catch(() => {});
         } catch {
           // The extension may be disposing the SQLite connection.
         }
-      }, 1_000);
-  refreshInterval.unref();
+      }, 1_000)
+    : undefined;
+  dataVersionInterval?.unref();
   const disposables = [
-    {
-      dispose: () => {
-        clearInterval(refreshInterval);
-        dataVersionMonitor?.dispose();
-        visiblePanelRefreshMonitor.dispose();
-      },
-    },
+    ...(dataVersionInterval
+      ? [{
+          dispose: () => {
+            clearInterval(dataVersionInterval);
+            dataVersionMonitor?.dispose();
+          },
+        }]
+      : []),
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
       controller.createNewSchedule(),
     ),
@@ -819,7 +772,14 @@ class VsCodeScheduleCommandController {
           }),
         });
       },
+      renderScheduleLive: async (detail) => {
+        const modelOptions = await this.listScheduleModelOptions(
+          detail.schedule.harnessMode,
+        );
+        return renderScheduleDetailLiveState(detail, { modelOptions });
+      },
       renderRunHistory: renderRunHistoryDetailHtml,
+      renderRunHistoryLive: renderRunHistoryLiveHtml,
       loadSchedule: (id) => this.editor.openScheduleDetail(id),
       loadRunHistory: (id) => {
         if (!this.editor.openRunHistoryDetail) {
@@ -840,6 +800,12 @@ class VsCodeScheduleCommandController {
     );
     if (modelRefreshSubscription) {
       this.context.subscriptions.push(modelRefreshSubscription);
+    }
+    const stateRefreshSubscription = options.services.onDidChangeState?.(() => {
+      void this.refreshVisibleState();
+    });
+    if (stateRefreshSubscription) {
+      this.context.subscriptions.push(stateRefreshSubscription);
     }
   }
 
@@ -868,10 +834,6 @@ class VsCodeScheduleCommandController {
   async refreshExternalState(): Promise<void> {
     this.refreshScheduleTree();
     await this.panelHost.refreshVisible();
-  }
-
-  hasVisiblePanels(): boolean {
-    return this.panelHost.hasVisiblePanels();
   }
 
   async refreshVisibleState(): Promise<void> {

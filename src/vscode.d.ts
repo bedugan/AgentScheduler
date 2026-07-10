@@ -85,6 +85,7 @@ declare module "vscode" {
 
   export interface Webview {
     html: string;
+    postMessage(message: unknown): PromiseLike<boolean>;
     onDidReceiveMessage(
       listener: (message: unknown) => unknown,
     ): Disposable;

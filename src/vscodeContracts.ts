@@ -140,6 +140,7 @@ export interface VsCodeWebviewPanelLike {
 
 export interface VsCodeWebviewLike {
   html: string;
+  postMessage?(message: unknown): PromiseLike<boolean>;
   onDidReceiveMessage?(
     listener: (message: unknown) => unknown,
   ): VsCodeDisposableLike;
@@ -229,6 +230,7 @@ export interface VsCodeScheduleEditor {
 
 export interface VsCodeSchedulerServices {
   editor: VsCodeScheduleEditor;
+  onDidChangeState?: VsCodeEventLike<void>;
   localSchedulingSetupAvailability?: {
     available: boolean;
     canManage?: boolean;

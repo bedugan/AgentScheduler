@@ -55,7 +55,6 @@ export {
   SCHEDULE_LIST_VIEW_ID,
   ScheduleTreeDataProvider,
   SqliteDataVersionMonitor,
-  VisiblePanelRefreshMonitor,
   buildNewDraftScheduleInput,
   createVsCodeScheduleModelCatalog,
   currentWorkspaceTargetContext,
