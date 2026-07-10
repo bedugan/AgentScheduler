@@ -2,6 +2,10 @@
   "name": "agent-scheduler",
   "version": "0.1.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bedugan/AgentScheduler.git"
+  },
   "type": "module",
   "main": "./dist/src/vscodeExtension.js",
   "bin": {
@@ -181,6 +185,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "vscode:prepublish": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test \"dist/test/**/*.test.js\""
   },

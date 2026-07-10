@@ -28,10 +28,10 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     },
   );
-  const services = createDefaultVsCodeSchedulerServices(
-    context,
+  const services = createDefaultVsCodeSchedulerServices(context, {
+    window: vscode.window,
     interactiveExecutor,
-  );
+  });
 
   registerVsCodeScheduleCommands({
     context,

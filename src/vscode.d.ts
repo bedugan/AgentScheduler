@@ -31,6 +31,7 @@ declare module "vscode" {
   }
 
   export interface ExtensionContext {
+    extensionUri: { fsPath: string };
     globalStorageUri: Uri;
     subscriptions: Disposable[];
   }

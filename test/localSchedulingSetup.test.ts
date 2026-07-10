@@ -268,6 +268,43 @@ describe("local scheduling setup", () => {
     assert.deepEqual(await setupStore.getLocalSchedulingSetup(), result.state);
   });
 
+  it("lets the editor preview, verify, and disable Local Scheduling setup", async () => {
+    const provider = new RecordingWakeupProvider();
+    const setup = new LocalSchedulingSetup({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      provider,
+      store: new InMemoryLocalSchedulingSetupStore(),
+      request: {
+        triggerId: "AgentSchedulerLocalWakeup",
+        workerExecutable: "/usr/local/bin/node",
+        workerArguments: ["workerCli.js", "scan-due-work"],
+        intervalMinutes: 5,
+      },
+    });
+    const editor = new EditorControlSurface(
+      new ScheduleLifecycle({
+        store: new InMemoryScheduleStore(),
+        harnesses: [new FakeHarness({ mode: "local-copilot" })],
+      }),
+      {
+        localSchedulingSetup: setup,
+        confirmEnableLocalScheduling: async () => true,
+      },
+    );
+
+    assert.equal(editor.previewEnableLocalScheduling().operation, "install");
+    await editor.enableLocalScheduling();
+    const verified = await editor.verifyLocalScheduling();
+    const disabled = await editor.disableLocalScheduling();
+
+    assert.equal(verified.intent.operation, "verify");
+    assert.equal(verified.state.enabled, true);
+    assert.equal(disabled.intent.operation, "uninstall");
+    assert.equal(disabled.state.enabled, false);
+    assert.equal(provider.verifyRequests.length, 1);
+    assert.equal(provider.uninstallRequests.length, 1);
+  });
+
   it("starts automatic due work only after local scheduling setup is enabled", async () => {
     const clock = new FakeClock("2026-07-07T16:05:00.000Z");
     const setup = new LocalSchedulingSetup({
@@ -886,6 +923,8 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
 class RecordingWakeupProvider implements WakeupProvider {
   readonly platform = "windows";
   readonly installRequests: WakeupTriggerRequest[] = [];
+  readonly verifyRequests: WakeupTriggerRequest[] = [];
+  readonly uninstallRequests: WakeupTriggerRequest[] = [];
 
   intentFor(
     operation: WakeupTriggerOperation,
@@ -917,10 +956,12 @@ class RecordingWakeupProvider implements WakeupProvider {
   }
 
   async verify(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
+    this.verifyRequests.push(structuredClone(request));
     return { intent: this.intentFor("verify", request), applied: true };
   }
 
   async uninstall(request: WakeupTriggerRequest): Promise<WakeupTriggerResult> {
+    this.uninstallRequests.push(structuredClone(request));
     return { intent: this.intentFor("uninstall", request), applied: true };
   }
 }

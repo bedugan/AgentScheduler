@@ -153,6 +153,12 @@ Use `Delete Schedule` from Schedule Detail or the Schedule List context menu. Th
 
 Local Scheduling Setup installs one operating-system Wakeup Trigger per user. The trigger starts the Worker CLI periodically, and the Worker CLI reads the Local Store to scan for due automatic runs.
 
+From any Schedule Detail, select **Enable Local Scheduling**. AgentScheduler shows the exact platform, trigger ID, interval, Worker command, OS command, and generated file path in a modal confirmation before making OS changes. Once enabled, use **Verify Local Scheduling** or **Disable Local Scheduling** from the same section. Every open Schedule Detail and the Schedule List refresh after setup changes. Creating or activating a schedule never runs this setup implicitly.
+
+The installed extension uses its packaged `dist/src/workerCli.js` and the `agent-scheduler.sqlite` Local Store under VS Code global storage. The Wakeup Trigger requires a standalone absolute Node.js executable; VS Code's Electron executable is not used. If Node is not discoverable on `PATH`, set `AGENT_SCHEDULER_NODE_PATH` to the absolute `node` or `node.exe` path before starting VS Code.
+
+The Worker CLI commands below remain available for diagnostics and manual administration.
+
 Build first:
 
 ```sh
@@ -205,7 +211,7 @@ Automatic Local Copilot Mode runs use the same Copilot CLI harness as manual run
 
 ## Troubleshooting
 
-**Automatic runs are inactive**: Local Scheduling Setup is disabled. Activate the schedule if needed, then install the wakeup trigger with the Worker CLI. Manual Run Now can still work from the editor when the selected harness is available.
+**Automatic runs are inactive**: Local Scheduling Setup is disabled. Activate the schedule if needed, then select **Enable Local Scheduling** in Schedule Detail and confirm the exact Wakeup Trigger intent. Manual Run Now can still work from the editor when the selected harness is available.
 
 **No Copilot harness modes are available**: The current extension environment has no registered available harness for Local Copilot Mode or Cloud Copilot Mode. Choose an available mode if one is listed, or wire/register the appropriate harness implementation before expecting runs to start.
 
