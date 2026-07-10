@@ -18,6 +18,7 @@ import {
   type CopilotCliCommandResult,
   type CopilotCliCommandRunOptions,
   type CopilotCliCommandRunner,
+  type CopilotInteractiveExecutor,
   type RunResultCommit,
   type ScheduleRunStateUpdate,
 } from "../src/index.js";
@@ -1768,7 +1769,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
         uri: "file:///tmp/agent-scheduler",
       },
       harnessMode: "local-copilot",
-      model: "gpt-5",
+      model: "auto",
       approvalMode: "bypass-approvals",
     });
 
@@ -1799,8 +1800,6 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.deepEqual(runner.calls[0]?.args.slice(0, -1), [
       "-C",
       "/tmp/agent-scheduler",
-      "--model",
-      "gpt-5",
       "--output-format",
       "json",
       "--no-color",
@@ -1816,6 +1815,147 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     assert.match(
       runner.calls[0]?.args.at(-1) ?? "",
       /Run the concrete Copilot CLI client\./,
+    );
+  });
+
+  it("completes a default draft Run Now through the interactive Copilot approval surface", async () => {
+    const interactiveExecutor: CopilotInteractiveExecutor = {
+      run: async (_command, _args, request) => ({
+        externalRunId: "vscode-task:manual-default",
+        status: "completed",
+        completedAt: request.requestedAt,
+        summary: "Interactive Copilot task completed.",
+        executedModel: null,
+      }),
+    };
+    const harness = new CopilotLocalHarness({
+      client: new CopilotCliLocalClient({
+        command: "/custom/copilot",
+        runner: new RecordingCopilotCliCommandRunner({
+          exitCode: 0,
+          stdout: "GitHub Copilot CLI 1.0.25",
+          stderr: "",
+        }),
+        interactiveExecutor,
+      }),
+    });
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [harness],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    assert.deepEqual(await editor.listHarnessModels("local-copilot"), [
+      { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+    ]);
+    const detail = await editor.createDraftSchedule({
+      runInstructions: "Review the workspace with user-approved tools.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/agent-scheduler" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+
+    const run = await editor.runScheduleNow(detail.schedule.id);
+
+    assert.equal(run.status, "completed");
+    assert.equal(run.externalRunId, "vscode-task:manual-default");
+    assert.equal(run.approvalModeSnapshot, "default-approvals");
+  });
+
+  it("refreshes repaired Local Copilot availability in an existing Schedule Detail", async () => {
+    const runner = new RecordingCopilotCliCommandRunner([
+      { exitCode: null, stdout: "", stderr: "", errorCode: "ENOENT" },
+      { exitCode: 0, stdout: "GitHub Copilot CLI 1.0.25", stderr: "" },
+    ]);
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new CopilotLocalHarness({
+          client: new CopilotCliLocalClient({ command: "/custom/copilot", runner }),
+        }),
+      ],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const created = await editor.createDraftSchedule({
+      runInstructions: "Review the repaired workspace.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/agent-scheduler" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+
+    assert.equal(created.harnessAvailability.selected?.available, false);
+    const repaired = await editor.openScheduleDetail(created.schedule.id);
+    assert.equal(repaired.harnessAvailability.selected?.available, true);
+    assert.match(repaired.harnessAvailability.message, /available/);
+  });
+
+  it("keeps concurrent schedule policy readiness isolated per Schedule Detail", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:05:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: true,
+      store: new InMemoryScheduleStore(),
+      harnesses: [
+        new CopilotLocalHarness({
+          client: new CopilotCliLocalClient({
+            command: "/custom/copilot",
+            runner: new RecordingCopilotCliCommandRunner({
+              exitCode: 0,
+              stdout: "GitHub Copilot CLI 1.0.25",
+              stderr: "",
+            }),
+            interactiveExecutor: {
+              run: async (_command, _args, request) => ({
+                externalRunId: "unused",
+                status: "completed",
+                completedAt: request.requestedAt,
+                summary: null,
+              }),
+            },
+          }),
+        }),
+      ],
+    });
+    const defaultSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Use user-approved tools.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/default" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const bypassSchedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Run with bypass approvals.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/bypass" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "bypass-approvals",
+    });
+
+    const [defaultDetail, bypassDetail] = await Promise.all([
+      lifecycle.openScheduleDetail(defaultSchedule.id),
+      lifecycle.openScheduleDetail(bypassSchedule.id),
+    ]);
+
+    assert.equal(defaultDetail.harnessAvailability.selected?.manualRunReady, true);
+    assert.equal(
+      defaultDetail.harnessAvailability.selected?.unattendedRunReady,
+      false,
+    );
+    assert.equal(bypassDetail.harnessAvailability.selected?.manualRunReady, true);
+    assert.equal(
+      bypassDetail.harnessAvailability.selected?.unattendedRunReady,
+      true,
     );
   });
 
@@ -1999,7 +2139,11 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
     options: CopilotCliCommandRunOptions | undefined;
   }> = [];
 
-  constructor(private readonly result: CopilotCliCommandResult) {}
+  private readonly results: CopilotCliCommandResult[];
+
+  constructor(result: CopilotCliCommandResult | CopilotCliCommandResult[]) {
+    this.results = Array.isArray(result) ? result : [result];
+  }
 
   async run(
     command: string,
@@ -2007,7 +2151,11 @@ class RecordingCopilotCliCommandRunner implements CopilotCliCommandRunner {
     options?: CopilotCliCommandRunOptions,
   ): Promise<CopilotCliCommandResult> {
     this.calls.push({ command, args: [...args], options });
-    return structuredClone(this.result);
+    const result = this.results[Math.min(this.calls.length - 1, this.results.length - 1)];
+    if (!result) {
+      throw new Error("RecordingCopilotCliCommandRunner has no result.");
+    }
+    return structuredClone(result);
   }
 }
 

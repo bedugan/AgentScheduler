@@ -8,6 +8,7 @@ import type {
   Schedule,
   ScheduleHarnessModeAvailability,
 } from "./domain.js";
+import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 
 export interface HarnessPreflightRequest {
   schedule: Schedule;
@@ -113,7 +114,11 @@ export type HarnessOpenResult =
 
 export interface AgentHarness {
   readonly mode: HarnessMode;
-  availability?(): ScheduleHarnessModeAvailability;
+  availability?(schedule?: Schedule): ScheduleHarnessModeAvailability;
+  refreshAvailability?(
+    schedule?: Schedule,
+  ): Promise<ScheduleHarnessModeAvailability>;
+  models?(): Promise<readonly ScheduleModelOption[]>;
   preflight(request: HarnessPreflightRequest): Promise<HarnessPreflightResult>;
   start(request: HarnessStartRequest): Promise<HarnessStartResult>;
   status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;

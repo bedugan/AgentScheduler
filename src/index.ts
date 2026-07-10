@@ -84,6 +84,7 @@ export type {
   CopilotCliCommandRunOptions,
   CopilotCliCommandRunner,
   CopilotCliLocalClientOptions,
+  CopilotInteractiveExecutor,
   CreateDefaultCopilotLocalHarnessOptions,
 } from "./copilotCliClient.js";
 export {

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
 import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
+import type { CopilotInteractiveExecutor } from "./copilotCliClient.js";
 import type {
   ApprovalMode,
   CreateDraftScheduleInput,
@@ -215,6 +216,28 @@ export interface VsCodeWindowLike {
   showErrorMessage?(message: string): Promise<unknown>;
 }
 
+export interface VsCodeTaskExecutionLike {}
+
+export interface VsCodeTaskProcessEndEventLike {
+  execution: VsCodeTaskExecutionLike;
+  exitCode: number | undefined;
+}
+
+export interface VsCodeTasksLike {
+  executeTask(task: unknown): Promise<VsCodeTaskExecutionLike>;
+  onDidEndTaskProcess(
+    listener: (event: VsCodeTaskProcessEndEventLike) => unknown,
+  ): VsCodeDisposableLike;
+}
+
+export interface VsCodeCopilotTaskFactory {
+  createCopilotTask(
+    name: string,
+    command: string,
+    args: readonly string[],
+  ): unknown;
+}
+
 export interface VsCodeCommandLike {
   command: string;
   title: string;
@@ -257,6 +280,9 @@ export interface VsCodeScheduleEditor {
   deleteSchedule(scheduleId: string): Promise<void>;
   listSchedules(): Promise<ScheduleSummary[]>;
   listHarnessModeAvailability(): Promise<ScheduleHarnessModeAvailability[]>;
+  listHarnessModels?(
+    mode: HarnessMode,
+  ): Promise<readonly ScheduleModelOption[]>;
 }
 
 export interface VsCodeSchedulerServices {
@@ -329,13 +355,18 @@ export function sqliteLocalStorePath(
 
 export function createDefaultVsCodeSchedulerServices(
   context: VsCodeGlobalStorageContextLike,
+  interactiveExecutor?: CopilotInteractiveExecutor,
 ): VsCodeSchedulerServices {
   const store = new SqliteScheduleStore({
     databasePath: sqliteLocalStorePath(context),
   });
   const lifecycle = new ScheduleLifecycle({
     store,
-    harnesses: [createDefaultCopilotLocalHarness()],
+    harnesses: [
+      createDefaultCopilotLocalHarness(
+        interactiveExecutor ? { interactiveExecutor } : {},
+      ),
+    ],
     localSchedulingSetup: {
       isLocalSchedulingEnabled: async () =>
         (await store.getLocalSchedulingSetup()).enabled,
@@ -351,9 +382,74 @@ export function createDefaultVsCodeSchedulerServices(
   };
 }
 
+export class VsCodeTaskCopilotInteractiveExecutor
+  implements CopilotInteractiveExecutor
+{
+  constructor(
+    private readonly tasks: VsCodeTasksLike,
+    private readonly taskFactory: VsCodeCopilotTaskFactory,
+  ) {}
+
+  async run(
+    command: string,
+    args: readonly string[],
+    request: Parameters<CopilotInteractiveExecutor["run"]>[2],
+  ) {
+    const name = `AgentScheduler: ${request.schedule.id}`;
+    const task = this.taskFactory.createCopilotTask(name, command, args);
+    let execution: VsCodeTaskExecutionLike | undefined;
+    const earlyEvents: VsCodeTaskProcessEndEventLike[] = [];
+    let resolveCompletion:
+      | ((result: Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>) => void)
+      | undefined;
+    const completion = new Promise<
+      Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>
+    >((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const complete = (event: VsCodeTaskProcessEndEventLike): void => {
+      subscription.dispose();
+      const completed = event.exitCode === 0;
+      resolveCompletion?.({
+        externalRunId: `vscode-task:${request.schedule.id}:${request.requestedAt}`,
+        status: completed ? "completed" : "failed",
+        completedAt: new Date().toISOString(),
+        summary: completed
+          ? "Interactive Copilot task completed in the VS Code terminal."
+          : `Interactive Copilot task exited with code ${event.exitCode ?? "unknown"}.`,
+        executedModel: null,
+      });
+    };
+    const subscription = this.tasks.onDidEndTaskProcess((event) => {
+      if (!execution) {
+        earlyEvents.push(event);
+        return;
+      }
+      if (event.execution === execution) {
+        complete(event);
+      }
+    });
+
+    try {
+      execution = await this.tasks.executeTask(task);
+    } catch (error) {
+      subscription.dispose();
+      throw error;
+    }
+
+    const earlyCompletion = earlyEvents.find(
+      (event) => event.execution === execution,
+    );
+    if (earlyCompletion) {
+      complete(earlyCompletion);
+    }
+    return completion;
+  }
+}
+
 export function buildNewDraftScheduleInput(
   workspace: VsCodeWorkspaceLike,
-  defaultModel = "gpt-5",
+  defaultModel = "auto",
   defaultHarnessMode: HarnessMode | null = "local-copilot",
 ): CreateDraftScheduleInput {
   return {
@@ -464,7 +560,7 @@ function createScheduleCreationFlow(
   return new VsCodeNaturalLanguageScheduleCreationFlow({
     lifecycle: options.services.lifecycle,
     ...(currentWorkspace ? { currentWorkspace } : {}),
-    defaultModel: "gpt-5",
+    defaultModel: "auto",
     ...(modelCatalog ? { modelCatalog } : {}),
     confirmActivation: (proposal) =>
       confirmNaturalLanguageScheduleActivation(options.window, proposal),
@@ -474,8 +570,26 @@ function createScheduleCreationFlow(
 export function registerVsCodeScheduleCommands(
   options: RegisterVsCodeScheduleCommandsOptions,
 ): VsCodeDisposableLike[] {
-  const modelCatalog =
-    options.modelCatalog ?? createVsCodeScheduleModelCatalog(options.languageModel);
+  const vsCodeModelCatalog = createVsCodeScheduleModelCatalog(
+    options.languageModel,
+  );
+  const modelCatalog = options.modelCatalog ??
+    (options.services.editor.listHarnessModels
+      ? {
+          listScheduleModels: async () => {
+            const models = await options.services.editor.listHarnessModels?.(
+              "local-copilot",
+            );
+            return models && models.length > 0
+              ? models
+              : (await vsCodeModelCatalog?.listScheduleModels()) ?? [];
+          },
+          ...(vsCodeModelCatalog?.onDidChangeScheduleModels && {
+            onDidChangeScheduleModels:
+              vsCodeModelCatalog.onDidChangeScheduleModels,
+          }),
+        }
+      : vsCodeModelCatalog);
   const scheduleTreeProvider =
     options.eventEmitterFactory && options.window.registerTreeDataProvider
       ? new ScheduleTreeDataProvider(
@@ -930,7 +1044,7 @@ function renderModelField(
       "text",
       "",
       state.modelCatalogAvailable
-        ? "No VS Code chat models were reported; enter a model id manually."
+        ? "The selected harness reported no model choices; enter a model id manually."
         : undefined,
     );
   }
@@ -956,7 +1070,7 @@ function renderModelField(
     options,
     modelAvailable
       ? undefined
-      : "Saved model is unavailable or legacy in this VS Code environment.",
+      : "Saved model is unavailable or legacy for the selected harness.",
   );
 }
 
@@ -1728,7 +1842,7 @@ class VsCodeScheduleCommandController {
     return this.runCommand(async () => {
       const defaultModel =
         preferredScheduleModel(await this.listScheduleModelOptions())?.id ??
-        "gpt-5";
+        "auto";
       const defaultHarnessMode =
         (await this.editor.listHarnessModeAvailability()).find(
           (mode) => mode.available,
@@ -1873,7 +1987,9 @@ class VsCodeScheduleCommandController {
     state: ScheduleDetailRenderState = {},
   ): Promise<void> {
     panel.title = scheduleDetailTitle(detail);
-    const modelOptions = await this.listScheduleModelOptions();
+    const modelOptions = await this.listScheduleModelOptions(
+      detail.schedule.harnessMode,
+    );
     panel.webview.html = renderScheduleDetailWebviewHtml(detail, {
       ...state,
       modelOptions,
@@ -2034,17 +2150,27 @@ class VsCodeScheduleCommandController {
     return selected === DELETE_SCHEDULE_ACTION;
   }
 
-  private async listScheduleModelOptions(): Promise<readonly ScheduleModelOption[]> {
+  private async listScheduleModelOptions(
+    mode: HarnessMode | null = "local-copilot",
+  ): Promise<readonly ScheduleModelOption[]> {
+    if (mode && this.editor.listHarnessModels) {
+      const harnessModels = await this.editor.listHarnessModels(mode);
+      if (harnessModels.length > 0) {
+        return harnessModels;
+      }
+    }
     return this.modelCatalog ? this.modelCatalog.listScheduleModels() : [];
   }
 
   private async requireSelectedModelAvailable(scheduleId: string): Promise<void> {
-    const modelOptions = await this.listScheduleModelOptions();
+    const detail = await this.editor.openScheduleDetail(scheduleId);
+    const modelOptions = await this.listScheduleModelOptions(
+      detail.schedule.harnessMode,
+    );
     if (modelOptions.length === 0) {
       return;
     }
 
-    const detail = await this.editor.openScheduleDetail(scheduleId);
     if (!isScheduleModelAvailable(detail.schedule.model, modelOptions)) {
       throw new Error(unavailableScheduleModelMessage(detail.schedule.model));
     }

@@ -190,11 +190,11 @@ describe("Copilot Local harness", () => {
     );
   });
 
-  it("blocks unattended Default Approvals preflight when no approval surface is available", async () => {
+  it("blocks unattended Default Approvals even when the editor approval surface is available", async () => {
     const client = new RecordingCopilotLocalClient({
       availability: {
         status: "available",
-        approvalSurfaceAvailable: false,
+        approvalSurfaceAvailable: true,
       },
     });
     const harness = new CopilotLocalHarness({ client });
@@ -231,6 +231,25 @@ describe("Copilot Local harness", () => {
     });
     assert.equal(client.availabilityRequests.length, 1);
     assert.equal(client.startRequests.length, 0);
+  });
+
+  it("blocks model identifiers outside the Local Copilot harness catalog", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: { status: "available", approvalSurfaceAvailable: true },
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = { ...createSchedule({ approvalMode: "default-approvals" }), model: "gpt-5" };
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "blocked");
+    assert.match(preflight.reason, /Choose Auto/);
+    assert.equal(client.availabilityRequests.length, 0);
   });
 
   it("blocks Bypass Approvals when the local CLI cannot verify required permission flags", async () => {
@@ -343,7 +362,7 @@ describe("Copilot Local harness", () => {
         uri: "file:///tmp/agent-scheduler",
       },
       harnessMode: "local-copilot",
-      model: "gpt-5",
+      model: "auto",
       approvalMode: "default-approvals",
     });
     await lifecycle.activateSchedule(schedule.id);
@@ -418,7 +437,7 @@ describe("Copilot Local harness", () => {
         uri: "file:///tmp/agent-scheduler",
       },
       harnessMode: "local-copilot",
-      model: "gpt-5",
+      model: "auto",
       approvalMode: "bypass-approvals",
     });
 
@@ -891,7 +910,7 @@ function createSchedule(input: { approvalMode: Schedule["approvalMode"] }): Sche
       uri: "file:///tmp/agent-scheduler",
     },
     harnessMode: "local-copilot",
-    model: "gpt-5",
+    model: "auto",
     approvalMode: input.approvalMode,
     runCounter: {
       completed: 0,

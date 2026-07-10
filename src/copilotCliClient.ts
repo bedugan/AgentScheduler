@@ -63,16 +63,27 @@ export interface CopilotCliLocalClientOptions {
   runner?: CopilotCliCommandRunner;
   cachedAvailability?: CopilotLocalClientAvailability;
   runTimeoutMs?: number;
+  interactiveExecutor?: CopilotInteractiveExecutor;
+}
+
+export interface CopilotInteractiveExecutor {
+  run(
+    command: string,
+    args: readonly string[],
+    request: CopilotLocalStartRequest,
+  ): Promise<HarnessStartResult>;
 }
 
 export interface CreateDefaultCopilotLocalHarnessOptions {
   detectAvailability?: boolean;
+  interactiveExecutor?: CopilotInteractiveExecutor;
 }
 
 export class CopilotCliLocalClient implements CopilotLocalClient {
   private readonly command: string;
   private readonly runner: CopilotCliCommandRunner;
   private readonly runTimeoutMs: number;
+  private readonly interactiveExecutor: CopilotInteractiveExecutor | undefined;
   private cachedAvailability: CopilotLocalClientAvailability | undefined;
 
   constructor(options: CopilotCliLocalClientOptions = {}) {
@@ -84,6 +95,7 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
     this.runTimeoutMs =
       options.runTimeoutMs ?? DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS;
     this.cachedAvailability = options.cachedAvailability;
+    this.interactiveExecutor = options.interactiveExecutor;
   }
 
   currentAvailability(): CopilotLocalClientAvailability | undefined {
@@ -96,15 +108,42 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
     if (this.cachedAvailability) {
       return this.availabilityWithPermissionFlagSupport(schedule);
     }
+    return this.refreshAvailability(schedule);
+  }
 
+  async refreshAvailability(
+    schedule?: Schedule,
+  ): Promise<CopilotLocalClientAvailability> {
     const result = await this.runner.run(this.command, ["--version"], {
       timeoutMs: DEFAULT_COPILOT_CLI_PROBE_TIMEOUT_MS,
     });
-    this.cachedAvailability = classifyCopilotCliAvailability(result);
+    const detected = classifyCopilotCliAvailability(result);
+    this.cachedAvailability =
+      detected.status === "available"
+        ? {
+            ...detected,
+            approvalSurfaceAvailable: this.interactiveExecutor !== undefined,
+          }
+        : detected;
     return this.availabilityWithPermissionFlagSupport(schedule);
   }
 
   async start(request: CopilotLocalStartRequest): Promise<HarnessStartResult> {
+    if (
+      request.resolvedHarnessPolicy.localCopilotMode.requiresApprovalSurface &&
+      !request.resolvedHarnessPolicy.localCopilotMode.unattended
+    ) {
+      if (!this.interactiveExecutor) {
+        throw new Error(
+          "Manual Default Approvals requires an interactive Copilot approval surface.",
+        );
+      }
+      return this.interactiveExecutor.run(
+        this.command,
+        copilotInteractiveArgsFor(request),
+        request,
+      );
+    }
     const result = await this.runner.run(
       this.command,
       copilotPromptArgsFor(request),
@@ -180,9 +219,12 @@ export function createDefaultCopilotLocalHarness(
     options.detectAvailability === false
       ? undefined
       : detectCopilotCliAvailabilitySync();
-  const client = new CopilotCliLocalClient(
-    cachedAvailability ? { cachedAvailability } : {},
-  );
+  const client = new CopilotCliLocalClient({
+    ...(cachedAvailability ? { cachedAvailability } : {}),
+    ...(options.interactiveExecutor
+      ? { interactiveExecutor: options.interactiveExecutor }
+      : {}),
+  });
   return new CopilotLocalHarness({
     client,
     availability: () =>
@@ -343,7 +385,7 @@ function copilotPromptArgsFor(request: CopilotLocalStartRequest): string[] {
   }
 
   const model = request.schedule.model.trim();
-  if (model) {
+  if (model && model !== "auto") {
     args.push("--model", model);
   }
 
@@ -356,6 +398,20 @@ function copilotPromptArgsFor(request: CopilotLocalStartRequest): string[] {
     copilotExecutionPromptFor(request.runInstructions),
   );
 
+  return args;
+}
+
+function copilotInteractiveArgsFor(request: CopilotLocalStartRequest): string[] {
+  const args: string[] = [];
+  const workspaceDirectory = workspaceDirectoryFor(request.schedule.targetContext);
+  if (workspaceDirectory) {
+    args.push("-C", workspaceDirectory);
+  }
+  const model = request.schedule.model.trim();
+  if (model && model !== "auto") {
+    args.push("--model", model);
+  }
+  args.push("-i", copilotExecutionPromptFor(request.runInstructions));
   return args;
 }
 

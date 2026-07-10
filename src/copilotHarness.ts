@@ -5,6 +5,7 @@ import type {
   ScheduleHarnessModeAvailability,
 } from "./domain.js";
 import { HARNESS_MODE_LABELS } from "./domain.js";
+import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 import type {
   AgentHarness,
   HarnessCancelRequest,
@@ -112,6 +113,9 @@ export interface CopilotLocalClient {
   checkAvailability(
     schedule: Schedule,
   ): Promise<CopilotLocalClientAvailability>;
+  refreshAvailability?(
+    schedule?: Schedule,
+  ): Promise<CopilotLocalClientAvailability>;
   start(request: CopilotLocalStartRequest): Promise<HarnessStartResult>;
   status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;
   cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult>;
@@ -144,20 +148,72 @@ export class CopilotLocalHarness implements AgentHarness {
   private readonly availabilityProvider:
     | (() => ScheduleHarnessModeAvailability)
     | undefined;
+  private lastClientAvailability: CopilotLocalClientAvailability | undefined;
 
   constructor(options: CopilotLocalHarnessOptions) {
     this.client = options.client;
     this.availabilityProvider = options.availability;
   }
 
-  availability(): ScheduleHarnessModeAvailability {
-    return (
-      this.availabilityProvider?.() ?? {
-        mode: this.mode,
-        label: HARNESS_MODE_LABELS[this.mode],
-        available: true,
-      }
-    );
+  async models(): Promise<readonly ScheduleModelOption[]> {
+    return [{ id: "auto", displayName: "Auto", vendor: "GitHub Copilot" }];
+  }
+
+  availability(schedule?: Schedule): ScheduleHarnessModeAvailability {
+    if (this.lastClientAvailability) {
+      return this.availabilityProjection(this.lastClientAvailability, schedule);
+    }
+    return this.availabilityProvider?.() ?? {
+      mode: this.mode,
+      label: HARNESS_MODE_LABELS[this.mode],
+      available: true,
+    };
+  }
+
+  async refreshAvailability(
+    schedule?: Schedule,
+  ): Promise<ScheduleHarnessModeAvailability> {
+    if (!this.client.refreshAvailability && !schedule) {
+      return this.availability(schedule);
+    }
+    const availability = this.client.refreshAvailability
+      ? await this.client.refreshAvailability(schedule)
+      : await this.client.checkAvailability(schedule as Schedule);
+    this.lastClientAvailability = availability;
+    return this.availabilityProjection(availability, schedule);
+  }
+
+  private availabilityProjection(
+    availability: CopilotLocalClientAvailability,
+    schedule?: Schedule,
+  ): ScheduleHarnessModeAvailability {
+    const defaultApprovals = schedule?.approvalMode === "default-approvals";
+    return availability.status === "available"
+      ? {
+          mode: this.mode,
+          label: HARNESS_MODE_LABELS[this.mode],
+          available: true,
+          manualRunReady:
+            !defaultApprovals || availability.approvalSurfaceAvailable,
+          ...(defaultApprovals &&
+            !availability.approvalSurfaceAvailable && {
+              manualRunReason:
+                "Manual Default Approvals needs the VS Code interactive Copilot task approval surface.",
+            }),
+          unattendedRunReady: !defaultApprovals,
+          ...(defaultApprovals && {
+            unattendedRunReason:
+              "Unattended Default Approvals blocks before start because no approval surface is available to the background worker.",
+          }),
+          readinessNote:
+            "Copilot authentication is verified when a run starts; Copilot CLI exposes no non-mutating authentication-status command.",
+        }
+      : {
+          mode: this.mode,
+          label: HARNESS_MODE_LABELS[this.mode],
+          available: false,
+          reason: availability.reason,
+        };
   }
 
   async preflight(
@@ -174,6 +230,14 @@ export class CopilotLocalHarness implements AgentHarness {
       return {
         status: "blocked",
         reason: secondarySchedulerReason,
+        resolvedHarnessPolicy,
+      };
+    }
+
+    if (request.schedule.model !== "auto") {
+      return {
+        status: "blocked",
+        reason: `Model '${request.schedule.model}' is not a runnable Local Copilot Mode selector. Choose Auto.`,
         resolvedHarnessPolicy,
       };
     }
@@ -202,7 +266,8 @@ export class CopilotLocalHarness implements AgentHarness {
 
     if (
       resolvedHarnessPolicy.localCopilotMode.requiresApprovalSurface &&
-      !availability.approvalSurfaceAvailable
+      (resolvedHarnessPolicy.localCopilotMode.unattended ||
+        !availability.approvalSurfaceAvailable)
     ) {
       return {
         status: "blocked",
