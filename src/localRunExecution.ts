@@ -19,11 +19,21 @@ export interface LocalRunExecution {
   heartbeatAt: IsoTimestamp;
   leaseExpiresAt: IsoTimestamp;
   capabilities: LocalRunExecutionCapabilities;
+  handle: string | null;
+  recoveryClaimedAt?: IsoTimestamp | null;
+  cancellationRequestedAt?: IsoTimestamp | null;
 }
 
 export interface LocalRunExecutionStarted {
   identity: string;
   capabilities: LocalRunExecutionCapabilities;
+}
+
+export interface ExpiredExecutionClaim {
+  runId: string;
+  observedHeartbeatAt: IsoTimestamp | null;
+  observedLeaseExpiresAt: IsoTimestamp | null;
+  claimedAt: IsoTimestamp;
 }
 
 export function leaseExpiry(

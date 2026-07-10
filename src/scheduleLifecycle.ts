@@ -390,7 +390,8 @@ export class ScheduleLifecycle {
     const cancelReady =
       active &&
       execution?.ownerId === this.executionOwnerId &&
-      execution.capabilities.cancel;
+      execution.capabilities.cancel &&
+      !execution.cancellationRequestedAt;
 
     return {
       run,
@@ -411,7 +412,9 @@ export class ScheduleLifecycle {
           ...(!cancelReady && {
             disabledReason: active
               ? execution
-                ? "Cancellation is unsupported from this process or execution type."
+                ? execution.cancellationRequestedAt
+                  ? "Cancellation was requested and AgentScheduler is waiting for the execution to exit."
+                  : "Cancellation is unsupported from this process or execution type."
                 : "Cancellation is unavailable because this active run has no recoverable execution identity."
               : "Only active runs can be canceled.",
           }),
@@ -421,13 +424,13 @@ export class ScheduleLifecycle {
           label: "Open Run",
           enabled:
             run.externalRunId !== null &&
-            (!active || execution?.capabilities.open === true),
+            execution?.capabilities.open === true,
           ...((run.externalRunId === null ||
-            (active && execution?.capabilities.open !== true)) && {
+            execution?.capabilities.open !== true) && {
             disabledReason:
               run.externalRunId === null
                 ? "This run has no external harness identity to open."
-                : "Opening this active execution is unsupported.",
+                : "Opening this execution is unsupported.",
           }),
         },
       },
@@ -600,6 +603,17 @@ export class ScheduleLifecycle {
       );
     }
     const requestedAt = this.nowIso();
+    if (
+      !(await this.store.requestLocalRunCancellation(
+        run.id,
+        this.executionOwnerId,
+        requestedAt,
+      ))
+    ) {
+      throw new Error(
+        "Cancellation is already pending or no longer supported for this run.",
+      );
+    }
     const cancelResult = await harness.cancel({
       schedule,
       run,
@@ -825,6 +839,7 @@ export class ScheduleLifecycle {
       resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
     });
     let startResult: HarnessStartResult;
+    const executionIdentity = `execution:${randomUUID()}`;
     try {
       startResult = await harness.start(
         {
@@ -833,10 +848,15 @@ export class ScheduleLifecycle {
           requestedAt,
           runInstructions: schedule.runInstructions,
           resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
+          executionIdentity,
         },
         {
           started: (execution) =>
-            this.recordExecutionStarted(startingRun, execution),
+            this.recordExecutionStarted(
+              startingRun,
+              executionIdentity,
+              execution,
+            ),
           heartbeat: () => this.recordExecutionHeartbeat(startingRun.id),
         },
       );
@@ -872,12 +892,13 @@ export class ScheduleLifecycle {
 
   private async recordExecutionStarted(
     run: RunHistoryEntry,
+    executionIdentity: string,
     execution: LocalRunExecutionStarted,
   ): Promise<void> {
     const now = this.nowIso();
     await this.store.saveLocalRunExecution({
       runId: run.id,
-      identity: execution.identity,
+      identity: executionIdentity,
       ownerId: this.executionOwnerId,
       startedAt: now,
       heartbeatAt: now,
@@ -888,25 +909,25 @@ export class ScheduleLifecycle {
           : undefined,
       ),
       capabilities: execution.capabilities,
+      handle: execution.identity,
+      recoveryClaimedAt: null,
+      cancellationRequestedAt: null,
     });
     await this.store.saveRunHistory({
       ...run,
-      externalRunId: execution.identity,
+      externalRunId: executionIdentity,
       summary: "Local run execution started.",
     });
   }
 
   private async recordExecutionHeartbeat(runId: string): Promise<void> {
-    const execution = await this.store.getLocalRunExecution(runId);
-    if (!execution || execution.ownerId !== this.executionOwnerId) {
-      return;
-    }
     const now = this.nowIso();
-    await this.store.saveLocalRunExecution({
-      ...execution,
-      heartbeatAt: now,
-      leaseExpiresAt: leaseExpiry(now),
-    });
+    await this.store.heartbeatLocalRunExecution(
+      runId,
+      this.executionOwnerId,
+      now,
+      leaseExpiry(now),
+    );
   }
 
   private async reconcileAbandonedRuns(now: IsoTimestamp): Promise<void> {
@@ -917,6 +938,16 @@ export class ScheduleLifecycle {
         new Date(run.startedAt).getTime() + LEGACY_ACTIVE_RUN_GRACE_MS <=
           new Date(now).getTime();
       if (!legacyExpired && (!execution || !isExecutionLeaseExpired(execution, now))) {
+        continue;
+      }
+      if (
+        !(await this.store.claimExpiredExecution({
+          runId: run.id,
+          observedHeartbeatAt: execution?.heartbeatAt ?? null,
+          observedLeaseExpiresAt: execution?.leaseExpiresAt ?? null,
+          claimedAt: now,
+        }))
+      ) {
         continue;
       }
       const schedule = await this.requireSchedule(run.scheduleId);

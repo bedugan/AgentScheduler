@@ -45,6 +45,7 @@ export interface HarnessStartRequest {
   requestedAt: IsoTimestamp;
   runInstructions: string;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
+  executionIdentity?: string;
 }
 
 export interface HarnessExecutionObserver {

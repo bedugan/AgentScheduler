@@ -5,7 +5,10 @@ import type {
   Schedule,
   ScheduleStatus,
 } from "./domain.js";
-import type { LocalRunExecution } from "./localRunExecution.js";
+import type {
+  ExpiredExecutionClaim,
+  LocalRunExecution,
+} from "./localRunExecution.js";
 
 export type ActiveRunReservationResult =
   | {
@@ -61,6 +64,18 @@ export interface ScheduleStore {
   saveLocalRunExecution(execution: LocalRunExecution): Promise<void>;
   getLocalRunExecution(runId: string): Promise<LocalRunExecution | undefined>;
   deleteLocalRunExecution(runId: string): Promise<void>;
+  heartbeatLocalRunExecution(
+    runId: string,
+    ownerId: string,
+    heartbeatAt: IsoTimestamp,
+    leaseExpiresAt: IsoTimestamp,
+  ): Promise<boolean>;
+  claimExpiredExecution(claim: ExpiredExecutionClaim): Promise<boolean>;
+  requestLocalRunCancellation(
+    runId: string,
+    ownerId: string,
+    requestedAt: IsoTimestamp,
+  ): Promise<boolean>;
 }
 
 export function cloneStoreValue<T>(value: T): T {

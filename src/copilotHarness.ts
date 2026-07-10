@@ -311,7 +311,7 @@ export class CopilotLocalHarness implements AgentHarness {
     if (observer && !executionObserved && isActiveRunStatus(result.status)) {
       await observer.started({
         identity: result.externalRunId,
-        capabilities: { cancel: true, open: true, heartbeat: false },
+        capabilities: { cancel: true, open: false, heartbeat: false },
       });
     }
     return result;
@@ -374,7 +374,7 @@ export class CopilotCloudHarness implements AgentHarness {
     if (observer && isActiveRunStatus(result.status)) {
       await observer.started({
         identity: result.externalRunId,
-        capabilities: { cancel: true, open: true, heartbeat: false },
+        capabilities: { cancel: true, open: false, heartbeat: false },
       });
     }
     return result;

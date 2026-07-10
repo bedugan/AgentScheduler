@@ -79,7 +79,7 @@ export interface CopilotInteractiveExecutor {
     request: CopilotLocalStartRequest,
     observer?: HarnessExecutionObserver,
   ): Promise<HarnessStartResult>;
-  cancel?(identity: string): Promise<boolean>;
+  cancel?(identity: string): Promise<HarnessCancelResult | undefined>;
 }
 
 export interface CreateDefaultCopilotLocalHarnessOptions {
@@ -193,13 +193,11 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
         request.executionIdentity,
       );
       if (canceled) {
-        return {
-          status: "canceled",
-          completedAt: new Date().toISOString(),
-          summary: "Interactive Copilot task was canceled.",
-          error: null,
-        };
+        return canceled;
       }
+      throw new Error(
+        "Cancellation did not reach a matching active Local Copilot execution.",
+      );
     }
     return {
       status: "failed",

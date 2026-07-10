@@ -24,6 +24,8 @@ import {
 } from "../src/index.js";
 import type {
   HarnessMode,
+  HarnessCancelRequest,
+  HarnessCancelResult,
   HarnessStartRequest,
   HarnessStartResult,
   HarnessExecutionObserver,
@@ -2206,7 +2208,8 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     });
     const run = await lifecycle.startManualRun(schedule.id);
     const execution = await store.getLocalRunExecution(run.id);
-    assert.equal(execution?.identity, "process:123");
+    assert.match(execution?.identity ?? "", /^execution:/);
+    assert.equal(execution?.handle, "process:123");
 
     await store.saveLocalRunExecution({
       ...execution!,
@@ -2223,6 +2226,65 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const recovered = await store.getRunHistoryEntry(run.id);
     assert.equal(recovered?.status, "failed");
     assert.match(recovered?.error ?? "", /lease expired/);
+  });
+
+  it("does not recover an execution whose heartbeat renews between read and claim", async () => {
+    const clock = new FakeClock("2026-07-07T16:05:00.000Z");
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock,
+      idGenerator: new SequentialIdGenerator(),
+      executionOwnerId: "worker:owner",
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [
+        new FakeHarness({
+          mode: "local-copilot",
+          startResult: {
+            externalRunId: "process:heartbeat-race",
+            status: "running",
+            completedAt: null,
+            summary: "Running.",
+          },
+        }),
+      ],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Renew before recovery claim.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/heartbeat-race" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "bypass-approvals",
+    });
+    const run = await lifecycle.startManualRun(schedule.id);
+    const observed = (await store.getLocalRunExecution(run.id))!;
+    await store.saveLocalRunExecution({
+      ...observed,
+      capabilities: { ...observed.capabilities, heartbeat: true },
+      leaseExpiresAt: "2026-07-07T16:04:59.000Z",
+    });
+    const stale = (await store.getLocalRunExecution(run.id))!;
+    assert.equal(
+      await store.heartbeatLocalRunExecution(
+        run.id,
+        "worker:owner",
+        "2026-07-07T16:05:00.000Z",
+        "2026-07-07T16:07:00.000Z",
+      ),
+      true,
+    );
+
+    assert.equal(
+      await store.claimExpiredExecution({
+        runId: run.id,
+        observedHeartbeatAt: stale.heartbeatAt,
+        observedLeaseExpiresAt: stale.leaseExpiresAt,
+        claimedAt: "2026-07-07T16:05:00.000Z",
+      }),
+      false,
+    );
+    assert.equal((await store.getRunHistoryEntry(run.id))?.status, "running");
   });
 
   it("applies one terminal recovery when two reconcilers claim the same expired lease", async () => {
@@ -2316,7 +2378,8 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const run = await lifecycle.startManualRun(schedule.id);
 
     const detail = await lifecycle.openRunHistoryDetail(run.id);
-    assert.equal(detail.execution?.identity, "vscode-task:active");
+    assert.match(detail.execution?.identity ?? "", /^execution:/);
+    assert.equal(detail.execution?.handle, "vscode-task:active");
     assert.equal(detail.actions.cancel.enabled, true);
 
     const restartedLifecycle = new ScheduleLifecycle({
@@ -2336,6 +2399,58 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const canceled = await lifecycle.cancelRun(run.id);
     assert.equal(canceled.status, "canceled");
     assert.equal(canceled.completedAt, "2026-07-07T16:00:00.000Z");
+  });
+
+  it("persists a cancellation request while waiting for execution shutdown", async () => {
+    class TimedOutCancellationHarness extends FakeHarness {
+      override async cancel(
+        _request: HarnessCancelRequest,
+      ): Promise<HarnessCancelResult> {
+        throw new Error("Timed out waiting for the task to end.");
+      }
+    }
+    const store = new InMemoryScheduleStore();
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      executionOwnerId: "extension:current",
+      localSchedulingEnabled: false,
+      store,
+      harnesses: [
+        new TimedOutCancellationHarness({
+          mode: "local-copilot",
+          startResult: {
+            externalRunId: "vscode-task:active",
+            status: "running",
+            completedAt: null,
+            summary: "Interactive task is running.",
+          },
+        }),
+      ],
+    });
+    const schedule = await lifecycle.createDraftSchedule({
+      runInstructions: "Wait for shutdown confirmation.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/cancel-timeout" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "default-approvals",
+    });
+    const run = await lifecycle.startManualRun(schedule.id);
+
+    await assert.rejects(
+      lifecycle.cancelRun(run.id),
+      /Timed out waiting for the task to end/,
+    );
+
+    assert.equal(
+      (await store.getLocalRunExecution(run.id))?.cancellationRequestedAt,
+      "2026-07-07T16:00:00.000Z",
+    );
+    assert.equal((await store.getRunHistoryEntry(run.id))?.status, "running");
+    const detail = await lifecycle.openRunHistoryDetail(run.id);
+    assert.equal(detail.actions.cancel.enabled, false);
+    assert.match(detail.actions.cancel.disabledReason ?? "", /waiting.*exit/i);
   });
 
   it("persists execution identity before completion so an active run can be canceled", async () => {
@@ -2387,7 +2502,11 @@ describe("Schedule Lifecycle API tracer bullet", () => {
     const startPromise = lifecycle.startManualRun(schedule.id);
     await executionStarted;
     const active = (await store.listRunHistory(schedule.id))[0]!;
-    assert.equal(active.externalRunId, "process:456");
+    assert.match(active.externalRunId ?? "", /^execution:/);
+    assert.equal(
+      (await store.getLocalRunExecution(active.id))?.handle,
+      "process:456",
+    );
     assert.equal(
       (await lifecycle.openRunHistoryDetail(active.id)).actions.cancel.enabled,
       true,

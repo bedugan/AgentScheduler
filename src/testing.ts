@@ -35,6 +35,7 @@ import {
   type ScheduleStore,
 } from "./store.js";
 import type { LocalRunExecution } from "./localRunExecution.js";
+import type { ExpiredExecutionClaim } from "./localRunExecution.js";
 
 export class FakeClock implements Clock {
   private current: Date;
@@ -118,6 +119,99 @@ export class InMemoryScheduleStore implements ScheduleStore {
 
   async deleteLocalRunExecution(runId: string): Promise<void> {
     this.localRunExecutions.delete(runId);
+  }
+
+  async heartbeatLocalRunExecution(
+    runId: string,
+    ownerId: string,
+    heartbeatAt: string,
+    leaseExpiresAt: string,
+  ): Promise<boolean> {
+    const execution = this.localRunExecutions.get(runId);
+    const run = await this.getRunHistoryEntry(runId);
+    if (
+      !execution ||
+      execution.ownerId !== ownerId ||
+      execution.recoveryClaimedAt ||
+      !run ||
+      !isActiveRunStatus(run.status) ||
+      run.completedAt !== null
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(runId, {
+      ...execution,
+      heartbeatAt,
+      leaseExpiresAt,
+    });
+    return true;
+  }
+
+  async claimExpiredExecution(claim: ExpiredExecutionClaim): Promise<boolean> {
+    const run = await this.getRunHistoryEntry(claim.runId);
+    if (!run || !isActiveRunStatus(run.status) || run.completedAt !== null) {
+      return false;
+    }
+    const execution = this.localRunExecutions.get(claim.runId);
+    if (!execution) {
+      if (
+        claim.observedHeartbeatAt !== null ||
+        claim.observedLeaseExpiresAt !== null
+      ) {
+        return false;
+      }
+      this.localRunExecutions.set(claim.runId, {
+        runId: claim.runId,
+        identity: `legacy:${claim.runId}`,
+        ownerId: "reconciler",
+        startedAt: run.startedAt,
+        heartbeatAt: claim.claimedAt,
+        leaseExpiresAt: claim.claimedAt,
+        capabilities: { cancel: false, open: false, heartbeat: false },
+        handle: null,
+        recoveryClaimedAt: claim.claimedAt,
+        cancellationRequestedAt: null,
+      });
+      return true;
+    }
+    if (
+      execution.recoveryClaimedAt ||
+      execution.heartbeatAt !== claim.observedHeartbeatAt ||
+      execution.leaseExpiresAt !== claim.observedLeaseExpiresAt ||
+      execution.leaseExpiresAt > claim.claimedAt
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(claim.runId, {
+      ...execution,
+      recoveryClaimedAt: claim.claimedAt,
+    });
+    return true;
+  }
+
+  async requestLocalRunCancellation(
+    runId: string,
+    ownerId: string,
+    requestedAt: string,
+  ): Promise<boolean> {
+    const execution = this.localRunExecutions.get(runId);
+    const run = await this.getRunHistoryEntry(runId);
+    if (
+      !execution ||
+      execution.ownerId !== ownerId ||
+      execution.cancellationRequestedAt ||
+      !execution.capabilities.cancel ||
+      !run ||
+      !isActiveRunStatus(run.status) ||
+      run.completedAt !== null
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(runId, {
+      ...execution,
+      cancellationRequestedAt: requestedAt,
+    });
+    return true;
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
@@ -352,7 +446,7 @@ export class FakeHarness implements AgentHarness {
     if (observer) {
       await observer.started({
         identity: result.externalRunId,
-        capabilities: { cancel: true, open: true, heartbeat: false },
+        capabilities: { cancel: true, open: false, heartbeat: false },
       });
     }
     return result;

@@ -17,7 +17,10 @@ import { dirname, join, posix, win32 } from "node:path";
 
 import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
 import type { CopilotInteractiveExecutor } from "./copilotCliClient.js";
-import type { HarnessExecutionObserver } from "./harness.js";
+import type {
+  HarnessCancelResult,
+  HarnessExecutionObserver,
+} from "./harness.js";
 import { LOCAL_RUN_HEARTBEAT_MS } from "./localRunExecution.js";
 import type {
   ApprovalMode,
@@ -918,32 +921,72 @@ function createUnavailableLocalSchedulingServices(
 
 export class SqliteDataVersionMonitor {
   private observedVersion: number;
+  private refreshInFlight: Promise<void> | undefined;
+  private dirty = false;
+  private disposed = false;
 
   constructor(
     private readonly readVersion: () => number,
-    private readonly onChange: () => unknown,
+    private readonly onChange: () => unknown | Promise<unknown>,
   ) {
     this.observedVersion = readVersion();
   }
 
-  poll(): boolean {
+  async poll(): Promise<boolean> {
+    if (this.disposed) {
+      return false;
+    }
     const nextVersion = this.readVersion();
     if (nextVersion === this.observedVersion) {
       return false;
     }
     this.observedVersion = nextVersion;
-    this.onChange();
+    if (this.refreshInFlight) {
+      this.dirty = true;
+      return true;
+    }
+    this.refreshInFlight = this.refreshUntilClean();
+    await this.refreshInFlight;
     return true;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.dirty = false;
+  }
+
+  private async refreshUntilClean(): Promise<void> {
+    try {
+      do {
+        this.dirty = false;
+        if (this.disposed) {
+          return;
+        }
+        await this.onChange();
+      } while (this.dirty && !this.disposed);
+    } finally {
+      this.refreshInFlight = undefined;
+    }
   }
 }
 
 export class VsCodeTaskCopilotInteractiveExecutor
   implements CopilotInteractiveExecutor
 {
-  private readonly activeExecutions = new Map<string, VsCodeTaskExecutionLike>();
+  private readonly activeExecutions = new Map<
+    string,
+    {
+      execution: VsCodeTaskExecutionLike;
+      cancelRequested: boolean;
+      cancelCompletion: Promise<HarnessCancelResult>;
+      resolveCancel(result: HarnessCancelResult): void;
+    }
+  >();
   constructor(
     private readonly tasks: VsCodeTasksLike,
     private readonly taskFactory: VsCodeCopilotTaskFactory,
+    private readonly cancelTimeoutMs = 5_000,
+    private readonly heartbeatMs = LOCAL_RUN_HEARTBEAT_MS,
   ) {}
 
   async run(
@@ -954,9 +997,13 @@ export class VsCodeTaskCopilotInteractiveExecutor
   ) {
     const name = `AgentScheduler: ${request.schedule.id}`;
     const task = this.taskFactory.createCopilotTask(name, command, args);
-    const identity = `vscode-task:${request.schedule.id}:${request.requestedAt}`;
+    const identity =
+      request.executionIdentity ??
+      `execution:${randomBytes(16).toString("hex")}`;
+    const taskHandle = `vscode-task:${request.schedule.id}:${request.requestedAt}`;
     let heartbeat: NodeJS.Timeout | undefined;
     let execution: VsCodeTaskExecutionLike | undefined;
+    let hasCompleted = false;
     const earlyEvents: VsCodeTaskProcessEndEventLike[] = [];
     let resolveCompletion:
       | ((result: Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>) => void)
@@ -967,16 +1014,28 @@ export class VsCodeTaskCopilotInteractiveExecutor
       resolveCompletion = resolve;
     });
     const complete = (event: VsCodeTaskProcessEndEventLike): void => {
+      hasCompleted = true;
       subscription.dispose();
       if (heartbeat) {
         clearInterval(heartbeat);
       }
-      const completed = event.exitCode === 0;
+      const processCompleted = event.exitCode === 0;
+      const activeExecution = this.activeExecutions.get(identity);
+      if (activeExecution?.cancelRequested) {
+        activeExecution.resolveCancel({
+          status: processCompleted ? "completed" : "canceled",
+          completedAt: new Date().toISOString(),
+          summary: processCompleted
+            ? "Interactive Copilot task completed before cancellation took effect."
+            : "Interactive Copilot task was canceled.",
+          error: null,
+        });
+      }
       resolveCompletion?.({
         externalRunId: identity,
-        status: completed ? "completed" : "failed",
+        status: processCompleted ? "completed" : "failed",
         completedAt: new Date().toISOString(),
-        summary: completed
+        summary: processCompleted
           ? "Interactive Copilot task completed in the VS Code terminal."
           : `Interactive Copilot task exited with code ${event.exitCode ?? "unknown"}.`,
         executedModel: null,
@@ -995,19 +1054,28 @@ export class VsCodeTaskCopilotInteractiveExecutor
 
     try {
       execution = await this.tasks.executeTask(task);
-      this.activeExecutions.set(identity, execution);
+      let resolveCancel!: (result: HarnessCancelResult) => void;
+      const cancelCompletion = new Promise<HarnessCancelResult>((resolve) => {
+        resolveCancel = resolve;
+      });
+      this.activeExecutions.set(identity, {
+        execution,
+        cancelRequested: false,
+        cancelCompletion,
+        resolveCancel,
+      });
       await observer?.started({
-        identity,
+        identity: taskHandle,
         capabilities: {
           cancel: execution.terminate !== undefined,
-          open: true,
+          open: false,
           heartbeat: true,
         },
       });
-      if (observer) {
+      if (observer && !hasCompleted) {
         heartbeat = setInterval(() => {
           void observer.heartbeat().catch(() => {});
-        }, LOCAL_RUN_HEARTBEAT_MS);
+        }, this.heartbeatMs);
         heartbeat.unref();
       }
     } catch (error) {
@@ -1028,13 +1096,30 @@ export class VsCodeTaskCopilotInteractiveExecutor
     return completion;
   }
 
-  async cancel(identity: string): Promise<boolean> {
-    const execution = this.activeExecutions.get(identity);
-    if (!execution?.terminate) {
-      return false;
+  async cancel(identity: string): Promise<HarnessCancelResult | undefined> {
+    const active = this.activeExecutions.get(identity);
+    if (!active?.execution.terminate) {
+      return undefined;
     }
-    execution.terminate();
-    return true;
+    active.cancelRequested = true;
+    active.execution.terminate();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        active.cancelCompletion,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Timed out waiting for the canceled VS Code Task to exit.")),
+            this.cancelTimeoutMs,
+          );
+          timeout.unref();
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 }
 
@@ -1197,13 +1282,13 @@ export function registerVsCodeScheduleCommands(
   });
   const dataVersionMonitor = options.services.dataVersion
     ? new SqliteDataVersionMonitor(options.services.dataVersion, () => {
-        void controller.refreshExternalState().catch(() => {});
+        return controller.refreshExternalState();
       })
     : undefined;
   const dataVersionInterval = dataVersionMonitor
     ? setInterval(() => {
         try {
-          dataVersionMonitor.poll();
+          void dataVersionMonitor.poll().catch(() => {});
         } catch {
           // The extension may be disposing the SQLite connection.
         }
@@ -1212,7 +1297,12 @@ export function registerVsCodeScheduleCommands(
   dataVersionInterval?.unref();
   const disposables = [
     ...(dataVersionInterval
-      ? [{ dispose: () => clearInterval(dataVersionInterval) }]
+      ? [{
+          dispose: () => {
+            clearInterval(dataVersionInterval);
+            dataVersionMonitor?.dispose();
+          },
+        }]
       : []),
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
       controller.createNewSchedule(),

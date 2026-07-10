@@ -118,11 +118,17 @@ describe("VS Code extension adapter", () => {
         startedAt: "2026-07-07T16:00:00.000Z",
         heartbeatAt: "2026-07-07T16:00:30.000Z",
         leaseExpiresAt: "2026-07-07T16:02:30.000Z",
-        capabilities: { cancel: true, open: true, heartbeat: true },
+        capabilities: { cancel: true, open: false, heartbeat: true },
+        handle: "task-handle",
       },
       actions: {
         cancel: { kind: "cancel", label: "Cancel Run", enabled: true },
-        open: { kind: "open", label: "Open Run", enabled: true },
+        open: {
+          kind: "open",
+          label: "Open Run",
+          enabled: false,
+          disabledReason: "Opening this execution is unsupported.",
+        },
       },
     });
 
@@ -202,14 +208,78 @@ describe("VS Code extension adapter", () => {
         updatedAt: "2026-07-07T16:00:00.000Z",
       });
 
-      assert.equal(monitor.poll(), true);
+      assert.equal(await monitor.poll(), true);
       assert.equal(refreshes, 1);
-      assert.equal(monitor.poll(), false);
+      assert.equal(await monitor.poll(), false);
     } finally {
       reader.close();
       worker.close();
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("serializes data_version refreshes, coalesces dirtiness, and stops queued work on dispose", async () => {
+    let version = 1;
+    let refreshes = 0;
+    let release!: () => void;
+    let refreshStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      refreshStarted = resolve;
+    });
+    const monitor = new SqliteDataVersionMonitor(
+      () => version,
+      async () => {
+        refreshes += 1;
+        if (refreshes === 1) {
+          refreshStarted();
+          await gate;
+        }
+      },
+    );
+
+    version = 2;
+    const firstRefresh = monitor.poll();
+    await started;
+    version = 3;
+    assert.equal(await monitor.poll(), true);
+    release();
+    await firstRefresh;
+
+    assert.equal(refreshes, 2);
+    monitor.dispose();
+    version = 4;
+    assert.equal(await monitor.poll(), false);
+
+    let disposedVersion = 1;
+    let disposedRefreshes = 0;
+    let releaseDisposed!: () => void;
+    let disposedStarted!: () => void;
+    const disposedGate = new Promise<void>((resolve) => {
+      releaseDisposed = resolve;
+    });
+    const disposedStart = new Promise<void>((resolve) => {
+      disposedStarted = resolve;
+    });
+    const disposedMonitor = new SqliteDataVersionMonitor(
+      () => disposedVersion,
+      async () => {
+        disposedRefreshes += 1;
+        disposedStarted();
+        await disposedGate;
+      },
+    );
+    disposedVersion = 2;
+    const disposingRefresh = disposedMonitor.poll();
+    await disposedStart;
+    disposedVersion = 3;
+    await disposedMonitor.poll();
+    disposedMonitor.dispose();
+    releaseDisposed();
+    await disposingRefresh;
+    assert.equal(disposedRefreshes, 1);
   });
   it("runs interactive Copilot through a VS Code Task terminal and waits for completion", async () => {
     const tasks = new RecordingTasks();
@@ -286,7 +356,8 @@ describe("VS Code extension adapter", () => {
       interactiveTaskRequest(),
       {
         started: async (execution) => {
-          identity = execution.identity;
+          assert.match(execution.identity, /^vscode-task:/);
+          identity = "execution:test";
           assert.equal(execution.capabilities.cancel, true);
         },
         heartbeat: async () => {},
@@ -294,10 +365,104 @@ describe("VS Code extension adapter", () => {
     );
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.equal(await executor.cancel(identity), true);
+    const cancelPromise = executor.cancel(identity);
     assert.equal(tasks.terminations, 1);
     tasks.finish(130);
+    assert.equal((await cancelPromise)?.status, "canceled");
     await runPromise;
+  });
+
+  it("keeps cancellation pending until Task end and times out without releasing it", async () => {
+    const tasks = new RecordingTasks();
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(
+      tasks,
+      { createCopilotTask: (name) => ({ name }) },
+      10,
+    );
+    let identity = "";
+    const runPromise = executor.run(
+      "copilot",
+      ["-i", "Review once."],
+      interactiveTaskRequest(),
+      {
+        started: async (execution) => {
+          identity = "execution:test";
+        },
+        heartbeat: async () => {},
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await assert.rejects(
+      () => executor.cancel(identity),
+      /Timed out waiting for the canceled VS Code Task to exit/,
+    );
+    tasks.finish(130);
+    await runPromise;
+  });
+
+  it("reports completion when Task success wins a cancellation race", async () => {
+    const tasks = new RecordingTasks();
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(tasks, {
+      createCopilotTask: (name) => ({ name }),
+    });
+    let identity = "";
+    const runPromise = executor.run(
+      "copilot",
+      ["-i", "Review once."],
+      interactiveTaskRequest(),
+      {
+        started: async (execution) => {
+          identity = "execution:test";
+        },
+        heartbeat: async () => {},
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const cancelPromise = executor.cancel(identity);
+    tasks.finish(0);
+
+    assert.equal((await cancelPromise)?.status, "completed");
+    assert.equal((await runPromise).status, "completed");
+  });
+
+  it("does not start heartbeats when Task ends while start persistence is pending", async () => {
+    const tasks = new RecordingTasks();
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(
+      tasks,
+      { createCopilotTask: (name) => ({ name }) },
+      50,
+      5,
+    );
+    let release!: () => void;
+    let persistenceStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      persistenceStarted = resolve;
+    });
+    let heartbeats = 0;
+    const runPromise = executor.run(
+      "copilot",
+      ["-i", "Review once."],
+      interactiveTaskRequest(),
+      {
+        started: async () => {
+          persistenceStarted();
+          await gate;
+        },
+        heartbeat: async () => {
+          heartbeats += 1;
+        },
+      },
+    );
+    await started;
+    tasks.finish(0);
+    release();
+    await runPromise;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(heartbeats, 0);
   });
   it("registers the root package as a local UI extension with schedule commands", async () => {
     const manifest = JSON.parse(
@@ -3294,6 +3459,7 @@ function interactiveTaskRequest() {
     requestedAt: "2026-07-07T16:05:00.000Z",
     runInstructions: "Review once.",
     resolvedHarnessPolicy: {} as never,
+    executionIdentity: "execution:test",
   };
 }
 
