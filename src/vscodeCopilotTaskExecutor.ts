@@ -33,6 +33,7 @@ export interface VsCodeCopilotTaskFactory {
     command: string,
     args: readonly string[],
   ): unknown;
+  onExecutionStateChanged?(): unknown | Promise<unknown>;
 }
 
 export class VsCodeTaskCopilotInteractiveExecutor
@@ -138,6 +139,7 @@ export class VsCodeTaskCopilotInteractiveExecutor
           heartbeat: true,
         },
       });
+      await this.taskFactory.onExecutionStateChanged?.();
       if (observer && !hasCompleted) {
         heartbeat = setInterval(() => {
           void observer.heartbeat().catch(() => {});

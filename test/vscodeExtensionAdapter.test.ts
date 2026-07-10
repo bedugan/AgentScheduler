@@ -34,7 +34,6 @@ import {
   SQLITE_LOCAL_STORE_FILENAME,
   ScheduleTreeDataProvider,
   SqliteDataVersionMonitor,
-  VisiblePanelRefreshMonitor,
   VsCodeTaskCopilotInteractiveExecutor,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
@@ -227,7 +226,7 @@ describe("VS Code extension adapter", () => {
     assert.equal((await editor.openScheduleDetail(created.schedule.id)).overview.status, "draft");
   });
 
-  it("pauses live Schedule Detail replacement while the form is focused", async () => {
+  it("synchronizes same-process live state without replacing the Schedule Detail document", async () => {
     const lifecycle = new ScheduleLifecycle({
       clock: new FakeClock("2026-07-07T16:00:00.000Z"),
       idGenerator: new SequentialIdGenerator(),
@@ -237,13 +236,14 @@ describe("VS Code extension adapter", () => {
     });
     const editor = new EditorControlSurface(lifecycle);
     const created = await editor.createDraftSchedule({
-      runInstructions: "Original focus-safe instructions.",
+      runInstructions: "Keep the original document alive.",
       cadence: { type: "cron", expression: "0 * * * *" },
-      targetContext: { type: "workspace", uri: "file:///tmp/focus-refresh" },
+      targetContext: { type: "workspace", uri: "file:///tmp/live-state" },
       harnessMode: "local-copilot",
       model: "auto",
       approvalMode: "default-approvals",
     });
+    const stateChanges = new RecordingEventEmitter<void>();
     const context = recordingContext();
     const commands = new RecordingCommands();
     const window = new RecordingWindow();
@@ -252,68 +252,25 @@ describe("VS Code extension adapter", () => {
       commands,
       window,
       workspace: {},
-      services: { editor },
+      services: { editor, onDidChangeState: stateChanges.event },
       viewColumn: 1,
     });
     try {
       await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
       const panel = requiredPanel(window);
-      await panel.webview.postMessageFromWebview({
-        type: "form-interaction",
-        scheduleId: created.schedule.id,
-        active: true,
-      });
-      await editor.saveScheduleDetailEdits(created.schedule.id, {
-        runInstructions: "Metadata changed while the form stayed focused.",
-      });
+      const originalHtml = panel.webview.html;
+      assert.equal(panel.webview.htmlAssignments, 1);
 
-      await new Promise((resolve) => setTimeout(resolve, 1_100));
-      assert.doesNotMatch(
-        panel.webview.html,
-        /Metadata changed while the form stayed focused/,
-      );
+      await editor.activateSchedule(created.schedule.id);
+      stateChanges.fire();
+      await settleAsyncWork();
 
-      await panel.webview.postMessageFromWebview({
-        type: "form-interaction",
-        scheduleId: created.schedule.id,
-        active: false,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 1_100));
-      assert.match(
-        panel.webview.html,
-        /Metadata changed while the form stayed focused/,
-      );
-
-      await panel.webview.postMessageFromWebview({
-        type: "form-interaction",
-        scheduleId: created.schedule.id,
-        active: true,
-      });
-      await panel.webview.postMessageFromWebview({
-        type: "form-dirty",
-        scheduleId: created.schedule.id,
-      });
-      await panel.webview.postMessageFromWebview({
-        type: "form-interaction",
-        scheduleId: created.schedule.id,
-        active: false,
-      });
-      await editor.saveScheduleDetailEdits(created.schedule.id, {
-        runInstructions: "A later persisted change must not erase dirty fields.",
-      });
-      await new Promise((resolve) => setTimeout(resolve, 1_100));
-      assert.doesNotMatch(
-        panel.webview.html,
-        /A later persisted change must not erase dirty fields/,
-      );
-
-      await panel.webview.postMessageFromWebview({
-        type: "refresh",
-        scheduleId: created.schedule.id,
-      });
-      assert.match(
-        panel.webview.html,
-        /A later persisted change must not erase dirty fields/,
+      assert.equal(panel.webview.html, originalHtml);
+      assert.equal(panel.webview.htmlAssignments, 1);
+      assert.equal(panel.webview.postedMessages.length, 1);
+      assert.deepEqual(
+        (panel.webview.postedMessages[0] as { type?: unknown }).type,
+        "schedule-live-state",
       );
     } finally {
       for (const disposable of context.subscriptions) {
@@ -427,41 +384,6 @@ describe("VS Code extension adapter", () => {
     assert.equal(disposedRefreshes, 1);
   });
 
-  it("refreshes live metadata only for visible panels and coalesces overlapping polls", async () => {
-    let visible = false;
-    let refreshes = 0;
-    let release!: () => void;
-    let started!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const refreshStarted = new Promise<void>((resolve) => {
-      started = resolve;
-    });
-    const monitor = new VisiblePanelRefreshMonitor(
-      () => visible,
-      async () => {
-        refreshes += 1;
-        if (refreshes === 1) {
-          started();
-          await gate;
-        }
-      },
-    );
-
-    assert.equal(await monitor.poll(), false);
-    visible = true;
-    const firstPoll = monitor.poll();
-    await refreshStarted;
-    assert.equal(await monitor.poll(), true);
-    release();
-    await firstPoll;
-    assert.equal(refreshes, 2);
-
-    monitor.dispose();
-    assert.equal(await monitor.poll(), false);
-    assert.equal(refreshes, 2);
-  });
   it("runs interactive Copilot through a VS Code Task terminal and waits for completion", async () => {
     const tasks = new RecordingTasks();
     const created: Array<{ name: string; command: string; args: readonly string[] }> = [];
@@ -1544,7 +1466,7 @@ describe("VS Code extension adapter", () => {
       DELETE_SCHEDULE_COMMAND,
       CREATE_SCHEDULE_COMMAND,
     ]);
-    assert.equal(context.subscriptions.length, 5);
+    assert.equal(context.subscriptions.length, 4);
   });
 
   it("registers natural-language creation surfaces and activates complete tool requests after confirmation", async () => {
@@ -3880,8 +3802,24 @@ class RecordingChat implements VsCodeChatLike {
 }
 
 class RecordingWebview implements VsCodeWebviewLike {
-  html = "";
+  private htmlValue = "";
+  htmlAssignments = 0;
+  readonly postedMessages: unknown[] = [];
   private readonly messageHandlers: Array<(message: unknown) => unknown> = [];
+
+  get html(): string {
+    return this.htmlValue;
+  }
+
+  set html(value: string) {
+    this.htmlAssignments += 1;
+    this.htmlValue = value;
+  }
+
+  async postMessage(message: unknown): Promise<boolean> {
+    this.postedMessages.push(structuredClone(message));
+    return true;
+  }
 
   onDidReceiveMessage(
     listener: (message: unknown) => unknown,

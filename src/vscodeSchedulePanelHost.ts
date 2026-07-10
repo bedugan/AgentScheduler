@@ -13,6 +13,7 @@ export interface SchedulePanelLike {
   visible?: boolean;
   webview: {
     html: string;
+    postMessage?(message: unknown): PromiseLike<boolean>;
     onDidReceiveMessage?(
       listener: (message: unknown) => unknown,
     ): DisposableLike;
@@ -38,7 +39,11 @@ interface SchedulePanelHostOptions {
     detail: ScheduleDetailView,
     state?: ScheduleDetailRenderState,
   ): Promise<string>;
+  renderScheduleLive(
+    detail: ScheduleDetailView,
+  ): Promise<unknown>;
   renderRunHistory(detail: RunHistoryDetailView): string;
+  renderRunHistoryLive(detail: RunHistoryDetailView): string;
   loadSchedule(scheduleId: string): Promise<ScheduleDetailView>;
   loadRunHistory(runId: string): Promise<RunHistoryDetailView>;
   onScheduleMessage(panel: SchedulePanelLike, message: unknown): unknown;
@@ -55,6 +60,8 @@ export class VsCodeSchedulePanelHost {
   private readonly runHistoryPanels = new Map<string, SchedulePanelLike>();
   private readonly dirtySchedulePanels = new WeakSet<SchedulePanelLike>();
   private readonly interactingSchedulePanels = new WeakSet<SchedulePanelLike>();
+  private readonly scheduleLiveSignatures = new WeakMap<SchedulePanelLike, string>();
+  private readonly runHistoryLiveSignatures = new WeakMap<SchedulePanelLike, string>();
 
   constructor(private readonly options: SchedulePanelHostOptions) {}
 
@@ -99,6 +106,7 @@ export class VsCodeSchedulePanelHost {
       { enableScripts: true, retainContextWhenHidden: true },
     );
     panel.webview.html = this.options.renderRunHistory(detail);
+    this.runHistoryLiveSignatures.set(panel, this.options.renderRunHistoryLive(detail));
     this.runHistoryPanels.set(runId, panel);
     this.track(
       panel.onDidDispose?.(() => this.runHistoryPanels.delete(runId)),
@@ -119,6 +127,10 @@ export class VsCodeSchedulePanelHost {
     this.interactingSchedulePanels.delete(panel);
     panel.title = this.options.scheduleTitle(detail);
     panel.webview.html = await this.options.renderSchedule(detail, state);
+    this.scheduleLiveSignatures.set(
+      panel,
+      JSON.stringify(await this.options.renderScheduleLive(detail)),
+    );
   }
 
   async renderError(
@@ -148,14 +160,45 @@ export class VsCodeSchedulePanelHost {
 
   async refreshVisible(): Promise<void> {
     await Promise.all([
-      this.refreshSchedules(
+      this.syncSchedules(
         (panel) =>
           panel.visible !== false &&
           !this.dirtySchedulePanels.has(panel) &&
           !this.interactingSchedulePanels.has(panel),
       ),
-      this.refreshRunHistory((panel) => panel.visible !== false),
+      this.syncRunHistory((panel) => panel.visible !== false),
     ]);
+  }
+
+  private async syncSchedules(
+    include: (panel: SchedulePanelLike) => boolean,
+  ): Promise<void> {
+    await Promise.all(
+      [...this.schedulePanels.entries()].map(async ([id, panel]) => {
+        if (!include(panel) || !panel.webview.postMessage) {
+          return;
+        }
+        try {
+          const detail = await this.options.loadSchedule(id);
+          const state = await this.options.renderScheduleLive(detail);
+          const signature = JSON.stringify(state);
+          if (signature === this.scheduleLiveSignatures.get(panel)) {
+            return;
+          }
+          const delivered = await panel.webview.postMessage({
+            type: "schedule-live-state",
+            state,
+            refreshedAt: new Date().toISOString(),
+          });
+          if (delivered !== false) {
+            this.scheduleLiveSignatures.set(panel, signature);
+            panel.title = this.options.scheduleTitle(detail);
+          }
+        } catch {
+          this.schedulePanels.delete(id);
+        }
+      }),
+    );
   }
 
   markScheduleDirty(panel: SchedulePanelLike): void {
@@ -229,6 +272,18 @@ export class VsCodeSchedulePanelHost {
         }
       }),
     );
+  }
+
+  private async syncRunHistory(include: (panel: SchedulePanelLike) => boolean): Promise<void> {
+    await Promise.all([...this.runHistoryPanels.entries()].map(async ([id, panel]) => {
+      if (!include(panel) || !panel.webview.postMessage) return;
+      try {
+        const html = this.options.renderRunHistoryLive(await this.options.loadRunHistory(id));
+        if (html === this.runHistoryLiveSignatures.get(panel)) return;
+        const delivered = await panel.webview.postMessage({ type: "run-history-live-state", html });
+        if (delivered !== false) this.runHistoryLiveSignatures.set(panel, html);
+      } catch { this.runHistoryPanels.delete(id); }
+    }));
   }
 
   private track(disposable: DisposableLike | undefined): void {

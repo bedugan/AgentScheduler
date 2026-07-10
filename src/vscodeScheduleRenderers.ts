@@ -22,27 +22,32 @@ export interface ScheduleDetailRenderState {
     reason?: string;
   };
 }
+
+export interface ScheduleDetailLiveState {
+  title: string;
+  overviewHtml: string;
+  actionsHtml: string;
+  localSchedulingHtml: string;
+  previousRunsHtml: string;
+}
+
+export function renderScheduleDetailLiveState(
+  view: ScheduleDetailView,
+  _state: ScheduleDetailRenderState = {},
+): ScheduleDetailLiveState {
+  return {
+    title: scheduleDetailTitle(view),
+    overviewHtml: renderOverviewRows(view, _state),
+    actionsHtml: Object.values(view.actions).map(renderAction).join("\n"),
+    localSchedulingHtml: renderLocalSchedulingContent(view, _state),
+    previousRunsHtml: renderPreviousRuns(view.previousRuns),
+  };
+}
 export function renderScheduleDetailWebviewHtml(
   view: ScheduleDetailView,
   state: ScheduleDetailRenderState = {},
 ): string {
   const scriptNonce = randomBytes(16).toString("base64");
-  const overviewRows: Array<[string, string]> = [
-    ["Status", view.overview.status],
-    ["Enabled", view.overview.enabled ? "Yes" : "No"],
-    ["Target Context", targetContextLabel(view.overview.targetContext)],
-    ["Cadence", cadenceSummaryLabel(view.overview.cadence)],
-    ["Harness Mode", harnessModeOverviewLabel(view)],
-    ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
-    ["Copilot Agent", view.overview.agentProfile ?? "Default"],
-    ["Approval Mode", view.overview.approvalMode],
-    ["Approval Surface", approvalSurfaceLabel(view)],
-    ["Run Counter", view.overview.runCounter.label],
-    ["Next Run", nextRunDisplayLabel(view)],
-    ["Last Run", view.overview.lastRunAt ?? "Never"],
-    ["Harness Availability", view.harnessAvailability.message],
-  ];
-
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -200,7 +205,7 @@ export function renderScheduleDetailWebviewHtml(
   <header class="header">
     <h1>${escapeHtml(scheduleDetailTitle(view))}</h1>
     <span class="muted">${escapeHtml(view.schedule.id)}</span>
-    <span class="muted">Last refreshed ${escapeHtml(state.refreshedAt ?? "when opened")}</span>
+    <span class="muted" id="live-refreshed-at">Last refreshed ${escapeHtml(state.refreshedAt ?? "when opened")}</span>
     <button type="button" data-action="refresh">Refresh</button>
   </header>
 
@@ -208,15 +213,8 @@ export function renderScheduleDetailWebviewHtml(
 
   <section aria-labelledby="overview-heading">
     <h2 id="overview-heading">Overview</h2>
-    <dl class="grid">
-      ${overviewRows
-        .map(
-          ([label, value]) => `<div>
-        <dt>${escapeHtml(label)}</dt>
-        <dd>${escapeHtml(value)}</dd>
-      </div>`,
-        )
-        .join("\n")}
+    <dl class="grid" id="live-overview">
+      ${renderOverviewRows(view, state)}
     </dl>
   </section>
 
@@ -293,28 +291,43 @@ export function renderScheduleDetailWebviewHtml(
 
   <section aria-labelledby="actions-heading">
     <h2 id="actions-heading">Actions</h2>
-    <div class="actions">
+    <div class="actions" id="live-actions">
       ${Object.values(view.actions).map(renderAction).join("\n")}
     </div>
   </section>
 
   <section aria-labelledby="local-scheduling-heading">
     <h2 id="local-scheduling-heading">Local Scheduling</h2>
-    <p><strong>${view.localScheduling.enabled ? "Enabled" : "Disabled"}</strong></p>
-    <p>${escapeHtml(view.localScheduling.message)}</p>
-    ${state.localSchedulingSetupAvailability?.available === false && state.localSchedulingSetupAvailability.reason ? `<p class="field-note">${escapeHtml(state.localSchedulingSetupAvailability.reason)}</p>` : ""}
-    <div class="actions">
-      ${renderLocalSchedulingActions(view.localScheduling.enabled, state.localSchedulingSetupAvailability)}
-    </div>
+    <div id="live-local-scheduling">${renderLocalSchedulingContent(view, state)}</div>
   </section>
 
   <section aria-labelledby="previous-runs-heading">
     <h2 id="previous-runs-heading">Previous Runs</h2>
-    ${renderPreviousRuns(view.previousRuns)}
+    <div id="live-previous-runs">${renderPreviousRuns(view.previousRuns)}</div>
   </section>
   ${renderScheduleDetailScript(scriptNonce)}
 </body>
 </html>`;
+}
+
+function renderOverviewRows(view: ScheduleDetailView, state: ScheduleDetailRenderState): string {
+  const rows: Array<[string, string]> = [
+    ["Status", view.overview.status], ["Enabled", view.overview.enabled ? "Yes" : "No"],
+    ["Target Context", targetContextLabel(view.overview.targetContext)], ["Cadence", cadenceSummaryLabel(view.overview.cadence)],
+    ["Harness Mode", harnessModeOverviewLabel(view)], ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
+    ["Copilot Agent", view.overview.agentProfile ?? "Default"], ["Approval Mode", view.overview.approvalMode],
+    ["Approval Surface", approvalSurfaceLabel(view)], ["Run Counter", view.overview.runCounter.label],
+    ["Next Run", nextRunDisplayLabel(view)], ["Last Run", view.overview.lastRunAt ?? "Never"],
+    ["Harness Availability", view.harnessAvailability.message],
+  ];
+  return rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("\n");
+}
+
+function renderLocalSchedulingContent(view: ScheduleDetailView, state: ScheduleDetailRenderState): string {
+  return `<p><strong>${view.localScheduling.enabled ? "Enabled" : "Disabled"}</strong></p>
+    <p>${escapeHtml(view.localScheduling.message)}</p>
+    ${state.localSchedulingSetupAvailability?.available === false && state.localSchedulingSetupAvailability.reason ? `<p class="field-note">${escapeHtml(state.localSchedulingSetupAvailability.reason)}</p>` : ""}
+    <div class="actions">${renderLocalSchedulingActions(view.localScheduling.enabled, state.localSchedulingSetupAvailability)}</div>`;
 }
 
 function renderLocalSchedulingActions(
@@ -547,11 +560,10 @@ function renderScheduleDetailScript(nonce: string): string {
     });
   });
 
-  const actionButtons = document.querySelectorAll(
-    'button[data-action]:not([data-action="save"])',
-  );
   const inFlightActions = new Set();
-  actionButtons.forEach((button) => {
+  const bindActionButtons = () => document.querySelectorAll(
+    'button[data-action]:not([data-action="save"])',
+  ).forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.action;
       if (!action || button.hasAttribute("disabled") || inFlightActions.has(action)) {
@@ -588,13 +600,26 @@ function renderScheduleDetailScript(nonce: string): string {
       vscode.postMessage(message);
     });
   });
-  document.querySelectorAll("button[data-run-history-id]").forEach((button) => {
+  const bindRunHistoryButtons = () => document.querySelectorAll("button[data-run-history-id]").forEach((button) => {
     button.addEventListener("click", () => {
       vscode.postMessage({
         type: "open-run-history",
         runId: button.dataset.runHistoryId,
       });
     });
+  });
+  bindActionButtons();
+  bindRunHistoryButtons();
+  if (typeof window !== "undefined") window.addEventListener("message", (event) => {
+    if (event.data?.type !== "schedule-live-state") return;
+    const state = event.data.state;
+    const replacements = [["live-overview", state.overviewHtml], ["live-actions", state.actionsHtml], ["live-local-scheduling", state.localSchedulingHtml], ["live-previous-runs", state.previousRunsHtml]];
+    replacements.forEach(([id, html]) => { const node = document.getElementById(id); if (node && typeof html === "string") node.innerHTML = html; });
+    if (typeof state.title === "string") document.title = state.title;
+    const refreshed = document.getElementById("live-refreshed-at");
+    if (refreshed && typeof event.data.refreshedAt === "string") refreshed.textContent = "Last refreshed " + event.data.refreshedAt;
+    bindActionButtons();
+    bindRunHistoryButtons();
   });
 })();
 </script>`;
@@ -651,14 +676,32 @@ export function renderRunHistoryDetailHtml(
   detail: RunHistoryDetailView,
 ): string {
   const nonce = randomBytes(16).toString("base64");
+  return `<!doctype html><html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}';"></head><body>
+    <h1>Run History Detail</h1>
+    <p>Last refreshed ${escapeHtml(new Date().toISOString())}</p>
+    <div id="live-run-history">${renderRunHistoryLiveHtml(detail)}</div>
+    <script nonce="${nonce}">
+      const vscode = acquireVsCodeApi();
+      document.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-run-action]");
+        if (button) vscode.postMessage({ action: button.dataset.runAction });
+      });
+      window.addEventListener("message", (event) => {
+        if (event.data?.type === "run-history-live-state") {
+          const node = document.getElementById("live-run-history");
+          if (node) node.innerHTML = event.data.html;
+        }
+      });
+    </script>
+  </body></html>`;
+}
+
+export function renderRunHistoryLiveHtml(detail: RunHistoryDetailView): string {
   const cancel = detail.actions.cancel;
   const open = detail.actions.open;
   const button = (action: "cancel" | "open" | "refresh", label: string, enabled: boolean, reason?: string) =>
     `<button type="button" data-run-action="${action}"${enabled ? "" : " disabled"}${reason ? ` title="${escapeHtml(reason)}"` : ""}>${escapeHtml(label)}</button>`;
-  return `<!doctype html><html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}';"></head><body>
-    <h1>Run History Detail</h1>
-    <p>Last refreshed ${escapeHtml(new Date().toISOString())}</p>
-    <dl>
+  return `<dl>
       <dt>Status</dt><dd>${escapeHtml(detail.run.status)}</dd>
       <dt>Instructions</dt><dd>${escapeHtml(detail.resolvedRunInstructions)}</dd>
       <dt>Approval Mode</dt><dd>${escapeHtml(detail.approvalMode)}</dd>
@@ -671,14 +714,7 @@ export function renderRunHistoryDetailHtml(
       <dt>Policy</dt><dd><pre>${escapeHtml(JSON.stringify(detail.resolvedHarnessPolicy, null, 2))}</pre></dd>
       <dt>Outcome</dt><dd>${escapeHtml(detail.outcome.description)}</dd>
     </dl>
-    <div>${button("refresh", "Refresh", true)} ${button("open", open.label, open.enabled, open.disabledReason)} ${button("cancel", cancel.label, cancel.enabled, cancel.disabledReason)}</div>
-    <script nonce="${nonce}">
-      const vscode = acquireVsCodeApi();
-      document.querySelectorAll("button[data-run-action]").forEach((button) => {
-        button.addEventListener("click", () => vscode.postMessage({ action: button.dataset.runAction }));
-      });
-    </script>
-  </body></html>`;
+    <div>${button("refresh", "Refresh", true)} ${button("open", open.label, open.enabled, open.disabledReason)} ${button("cancel", cancel.label, cancel.enabled, cancel.disabledReason)}</div>`;
 }
 
 export function scheduleDetailTitle(view: ScheduleDetailView): string {
