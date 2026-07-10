@@ -91,6 +91,14 @@ export class EditorControlSurface {
     return this.lifecycle.openRunHistoryDetail(runId);
   }
 
+  async cancelRun(runId: string): Promise<RunHistoryEntry> {
+    return this.lifecycle.cancelRun(runId);
+  }
+
+  async openRun(runId: string): Promise<unknown> {
+    return this.lifecycle.openRun(runId);
+  }
+
   async saveScheduleDetailEdits(
     scheduleId: string,
     input: UpdateScheduleInput,

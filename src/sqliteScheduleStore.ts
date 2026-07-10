@@ -15,6 +15,7 @@ import type {
   TargetContext,
 } from "./domain.js";
 import { isActiveRunStatus } from "./domain.js";
+import type { LocalRunExecution } from "./localRunExecution.js";
 import {
   defaultLocalSchedulingSetupState,
   type LocalSchedulingSetupState,
@@ -81,6 +82,16 @@ interface LocalSchedulingSetupRow {
   updated_at: string | null;
 }
 
+interface LocalRunExecutionRow {
+  run_id: string;
+  identity: string;
+  owner_id: string;
+  started_at: string;
+  heartbeat_at: string;
+  lease_expires_at: string;
+  capabilities_json: string;
+}
+
 export class SqliteScheduleStore
   implements ScheduleStore, LocalSchedulingSetupStore
 {
@@ -103,6 +114,13 @@ export class SqliteScheduleStore
 
   close(): void {
     this.database.close();
+  }
+
+  dataVersion(): number {
+    const row = this.database.prepare("PRAGMA data_version").get() as
+      | { data_version: number }
+      | undefined;
+    return row?.data_version ?? 0;
   }
 
   async saveSchedule(schedule: Schedule): Promise<void> {
@@ -215,6 +233,12 @@ export class SqliteScheduleStore
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
       this.database
+        .prepare(`
+          DELETE FROM local_run_executions
+          WHERE run_id IN (SELECT id FROM run_history WHERE schedule_id = $schedule_id)
+        `)
+        .run({ schedule_id: id });
+      this.database
         .prepare("DELETE FROM run_history WHERE schedule_id = $schedule_id")
         .run({ schedule_id: id });
       this.database
@@ -225,6 +249,48 @@ export class SqliteScheduleStore
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {
+    this.database.prepare(`
+      INSERT INTO local_run_executions (
+        run_id, identity, owner_id, started_at, heartbeat_at,
+        lease_expires_at, capabilities_json
+      ) VALUES (
+        $run_id, $identity, $owner_id, $started_at, $heartbeat_at,
+        $lease_expires_at, $capabilities_json
+      )
+      ON CONFLICT(run_id) DO UPDATE SET
+        identity = excluded.identity,
+        owner_id = excluded.owner_id,
+        started_at = excluded.started_at,
+        heartbeat_at = excluded.heartbeat_at,
+        lease_expires_at = excluded.lease_expires_at,
+        capabilities_json = excluded.capabilities_json
+    `).run({
+      run_id: execution.runId,
+      identity: execution.identity,
+      owner_id: execution.ownerId,
+      started_at: execution.startedAt,
+      heartbeat_at: execution.heartbeatAt,
+      lease_expires_at: execution.leaseExpiresAt,
+      capabilities_json: JSON.stringify(execution.capabilities),
+    });
+  }
+
+  async getLocalRunExecution(
+    runId: string,
+  ): Promise<LocalRunExecution | undefined> {
+    const row = this.database
+      .prepare("SELECT * FROM local_run_executions WHERE run_id = $run_id")
+      .get({ run_id: runId }) as LocalRunExecutionRow | undefined;
+    return row ? this.localRunExecutionFromRow(row) : undefined;
+  }
+
+  async deleteLocalRunExecution(runId: string): Promise<void> {
+    this.database
+      .prepare("DELETE FROM local_run_executions WHERE run_id = $run_id")
+      .run({ run_id: runId });
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
@@ -555,6 +621,20 @@ export class SqliteScheduleStore
         verified_at TEXT,
         updated_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS local_run_executions (
+        run_id TEXT PRIMARY KEY,
+        identity TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES run_history(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_local_run_execution_lease
+        ON local_run_executions(lease_expires_at);
     `);
     this.addColumnIfMissing("run_history", "executed_model", "TEXT");
   }
@@ -649,6 +729,20 @@ export class SqliteScheduleStore
       externalRunId: row.external_run_id,
       summary: row.summary,
       error: row.error,
+    };
+  }
+
+  private localRunExecutionFromRow(row: LocalRunExecutionRow): LocalRunExecution {
+    return {
+      runId: row.run_id,
+      identity: row.identity,
+      ownerId: row.owner_id,
+      startedAt: row.started_at,
+      heartbeatAt: row.heartbeat_at,
+      leaseExpiresAt: row.lease_expires_at,
+      capabilities: parseJson<LocalRunExecution["capabilities"]>(
+        row.capabilities_json,
+      ),
     };
   }
 

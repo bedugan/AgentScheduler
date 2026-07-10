@@ -36,7 +36,9 @@ declare module "vscode" {
     subscriptions: Disposable[];
   }
 
-  export interface TaskExecution {}
+  export interface TaskExecution {
+    terminate(): void;
+  }
   export interface TaskProcessEndEvent {
     execution: TaskExecution;
     exitCode: number | undefined;

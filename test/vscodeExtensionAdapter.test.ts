@@ -28,10 +28,12 @@ import {
   ENABLE_LOCAL_SCHEDULING_ACTION,
   NEW_SCHEDULE_COMMAND,
   OPEN_SCHEDULE_COMMAND,
+  RUN_HISTORY_DETAIL_VIEW_TYPE,
   SCHEDULE_DETAIL_VIEW_TYPE,
   SCHEDULE_LIST_VIEW_ID,
   SQLITE_LOCAL_STORE_FILENAME,
   ScheduleTreeDataProvider,
+  SqliteDataVersionMonitor,
   VsCodeTaskCopilotInteractiveExecutor,
   buildNewDraftScheduleInput,
   registerVsCodeScheduleCommands,
@@ -41,6 +43,7 @@ import {
   deployPackagedWorker,
   localSchedulingWakeupRequestForVsCode,
   resolveNodeRuntimeExecutable,
+  renderRunHistoryDetailHtml,
   scheduleTreeItemForSummary,
   sqliteLocalStorePath,
   type VsCodeCommandsLike,
@@ -73,6 +76,141 @@ import {
 } from "../src/testing.js";
 
 describe("VS Code extension adapter", () => {
+  it("renders auditable Run History Detail snapshots and supported actions", () => {
+    const html = renderRunHistoryDetailHtml({
+      run: {
+        id: "run_1",
+        scheduleId: "schedule_1",
+        scheduleRevision: 3,
+        trigger: "manual",
+        status: "running",
+        startedAt: "2026-07-07T16:00:00.000Z",
+        completedAt: null,
+        runInstructionsSnapshot: "Review the workspace.",
+        approvalModeSnapshot: "default-approvals",
+        resolvedHarnessPolicy: { provider: "copilot" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        executedModel: null,
+        targetContext: { type: "workspace", uri: "file:///tmp/project" },
+        externalRunId: "copilot-session",
+        summary: "Running.",
+        error: null,
+      },
+      scheduleId: "schedule_1",
+      scheduleRevision: 3,
+      resolvedRunInstructions: "Review the workspace.",
+      approvalMode: "default-approvals",
+      selectedModel: "auto",
+      executedModel: null,
+      resolvedHarnessPolicy: { provider: "copilot" },
+      outcome: {
+        status: "running",
+        completedAt: null,
+        summary: "Running.",
+        error: null,
+        description: "Running.",
+      },
+      execution: {
+        runId: "run_1",
+        identity: "vscode-task:run_1",
+        ownerId: "extension:current",
+        startedAt: "2026-07-07T16:00:00.000Z",
+        heartbeatAt: "2026-07-07T16:00:30.000Z",
+        leaseExpiresAt: "2026-07-07T16:02:30.000Z",
+        capabilities: { cancel: true, open: true, heartbeat: true },
+      },
+      actions: {
+        cancel: { kind: "cancel", label: "Cancel Run", enabled: true },
+        open: { kind: "open", label: "Open Run", enabled: true },
+      },
+    });
+
+    assert.equal(RUN_HISTORY_DETAIL_VIEW_TYPE, "agentScheduler.runHistoryDetail");
+    assert.match(html, /Review the workspace\./);
+    assert.match(html, /vscode-task:run_1/);
+    assert.match(html, /data-run-action="cancel"/);
+    assert.match(html, /default-approvals/);
+  });
+
+  it("opens Run History Detail from a Previous Runs row", async () => {
+    const lifecycle = new ScheduleLifecycle({
+      clock: new FakeClock("2026-07-07T16:00:00.000Z"),
+      idGenerator: new SequentialIdGenerator(),
+      localSchedulingEnabled: false,
+      store: new InMemoryScheduleStore(),
+      harnesses: [new FakeHarness({ mode: "local-copilot" })],
+    });
+    const editor = new EditorControlSurface(lifecycle);
+    const created = await editor.createDraftSchedule({
+      runInstructions: "Create a reviewable run.",
+      cadence: { type: "cron", expression: "0 * * * *" },
+      targetContext: { type: "workspace", uri: "file:///tmp/history" },
+      harnessMode: "local-copilot",
+      model: "auto",
+      approvalMode: "bypass-approvals",
+    });
+    const run = await editor.runScheduleNow(created.schedule.id);
+    const commands = new RecordingCommands();
+    const window = new RecordingWindow();
+    registerVsCodeScheduleCommands({
+      context: recordingContext(),
+      commands,
+      window,
+      workspace: {},
+      services: { editor, lifecycle },
+      viewColumn: 1,
+    });
+    await commandCallback(commands, OPEN_SCHEDULE_COMMAND)(created.schedule.id);
+
+    await requiredPanel(window).webview.postMessageFromWebview({
+      type: "open-run-history",
+      runId: run.id,
+    });
+
+    assert.equal(window.panels[1]?.viewType, RUN_HISTORY_DETAIL_VIEW_TYPE);
+    assert.match(window.panels[1]?.webview.html ?? "", /Create a reviewable run/);
+  });
+  it("detects worker writes through SQLite data_version for open-state refresh", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "agent-scheduler-version-"));
+    const databasePath = join(directory, "schedules.sqlite");
+    const reader = new SqliteScheduleStore({ databasePath });
+    const worker = new SqliteScheduleStore({ databasePath });
+    let refreshes = 0;
+    const monitor = new SqliteDataVersionMonitor(
+      () => reader.dataVersion(),
+      () => {
+        refreshes += 1;
+      },
+    );
+    try {
+      await worker.saveSchedule({
+        id: "schedule_worker_write",
+        revision: 1,
+        status: "draft",
+        enabled: false,
+        runInstructions: "Refresh the editor after worker changes.",
+        cadence: { type: "cron", expression: "0 * * * *" },
+        targetContext: { type: "workspace", uri: "file:///tmp/refresh" },
+        harnessMode: "local-copilot",
+        model: "auto",
+        approvalMode: "bypass-approvals",
+        runCounter: { completed: 0, limit: null },
+        nextRunAt: null,
+        lastRunAt: null,
+        createdAt: "2026-07-07T16:00:00.000Z",
+        updatedAt: "2026-07-07T16:00:00.000Z",
+      });
+
+      assert.equal(monitor.poll(), true);
+      assert.equal(refreshes, 1);
+      assert.equal(monitor.poll(), false);
+    } finally {
+      reader.close();
+      worker.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it("runs interactive Copilot through a VS Code Task terminal and waits for completion", async () => {
     const tasks = new RecordingTasks();
     const created: Array<{ name: string; command: string; args: readonly string[] }> = [];
@@ -134,6 +272,32 @@ describe("VS Code extension adapter", () => {
     ]);
 
     assert.equal(result.status, "completed");
+  });
+
+  it("terminates an owned active VS Code Task when cancellation is supported", async () => {
+    const tasks = new RecordingTasks();
+    const executor = new VsCodeTaskCopilotInteractiveExecutor(tasks, {
+      createCopilotTask: (name) => ({ name }),
+    });
+    let identity = "";
+    const runPromise = executor.run(
+      "copilot",
+      ["-i", "Review once."],
+      interactiveTaskRequest(),
+      {
+        started: async (execution) => {
+          identity = execution.identity;
+          assert.equal(execution.capabilities.cancel, true);
+        },
+        heartbeat: async () => {},
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(await executor.cancel(identity), true);
+    assert.equal(tasks.terminations, 1);
+    tasks.finish(130);
+    await runPromise;
   });
   it("registers the root package as a local UI extension with schedule commands", async () => {
     const manifest = JSON.parse(
@@ -3085,9 +3249,10 @@ class RecordingCommands implements VsCodeCommandsLike {
 }
 
 class RecordingTasks implements VsCodeTasksLike {
-  private readonly execution = {};
+  private readonly execution = { terminate: () => { this.terminations += 1; } };
   private listener: ((event: { execution: object; exitCode: number }) => unknown) | undefined;
   exitDuringExecute: number | undefined;
+  terminations = 0;
 
   async executeTask(): Promise<object> {
     if (this.exitDuringExecute !== undefined) {

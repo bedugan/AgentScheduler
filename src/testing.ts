@@ -18,6 +18,7 @@ import type {
   HarnessPreflightResult,
   HarnessStartRequest,
   HarnessStartResult,
+  HarnessExecutionObserver,
   HarnessStatusRequest,
   HarnessStatusResult,
 } from "./harness.js";
@@ -33,6 +34,7 @@ import {
   type ScheduleRunStateUpdate,
   type ScheduleStore,
 } from "./store.js";
+import type { LocalRunExecution } from "./localRunExecution.js";
 
 export class FakeClock implements Clock {
   private current: Date;
@@ -63,6 +65,7 @@ export class SequentialIdGenerator implements IdGenerator {
 export class InMemoryScheduleStore implements ScheduleStore {
   private readonly schedules = new Map<string, Schedule>();
   private readonly runHistory = new Map<string, RunHistoryEntry[]>();
+  private readonly localRunExecutions = new Map<string, LocalRunExecution>();
 
   async saveSchedule(schedule: Schedule): Promise<void> {
     this.schedules.set(schedule.id, cloneStoreValue(schedule));
@@ -95,8 +98,26 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   async deleteSchedule(id: string): Promise<void> {
+    for (const run of this.runHistory.get(id) ?? []) {
+      this.localRunExecutions.delete(run.id);
+    }
     this.schedules.delete(id);
     this.runHistory.delete(id);
+  }
+
+  async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {
+    this.localRunExecutions.set(execution.runId, cloneStoreValue(execution));
+  }
+
+  async getLocalRunExecution(
+    runId: string,
+  ): Promise<LocalRunExecution | undefined> {
+    const execution = this.localRunExecutions.get(runId);
+    return execution ? cloneStoreValue(execution) : undefined;
+  }
+
+  async deleteLocalRunExecution(runId: string): Promise<void> {
+    this.localRunExecutions.delete(runId);
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
@@ -313,20 +334,28 @@ export class FakeHarness implements AgentHarness {
     };
   }
 
-  async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
+  async start(
+    request: HarnessStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult> {
     this.startRequests.push(cloneStoreValue(request));
-    if (this.startResult) {
-      return typeof this.startResult === "function"
+    const result = this.startResult
+      ? typeof this.startResult === "function"
         ? cloneStoreValue(this.startResult(request))
-        : cloneStoreValue(this.startResult);
+        : cloneStoreValue(this.startResult)
+      : {
+          externalRunId: `fake-run-${this.startRequests.length}`,
+          status: "completed" as const,
+          completedAt: request.requestedAt,
+          summary: "Fake harness completed the draft run.",
+        };
+    if (observer) {
+      await observer.started({
+        identity: result.externalRunId,
+        capabilities: { cancel: true, open: true, heartbeat: false },
+      });
     }
-
-    return {
-      externalRunId: `fake-run-${this.startRequests.length}`,
-      status: "completed",
-      completedAt: request.requestedAt,
-      summary: "Fake harness completed the draft run.",
-    };
+    return result;
   }
 
   async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {

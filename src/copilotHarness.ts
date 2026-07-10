@@ -4,7 +4,8 @@ import type {
   Schedule,
   ScheduleHarnessModeAvailability,
 } from "./domain.js";
-import { HARNESS_MODE_LABELS } from "./domain.js";
+import { HARNESS_MODE_LABELS, isActiveRunStatus } from "./domain.js";
+import type { LocalRunExecutionStarted } from "./localRunExecution.js";
 import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
 import type {
   AgentHarness,
@@ -16,6 +17,7 @@ import type {
   HarnessPreflightResult,
   HarnessStartRequest,
   HarnessStartResult,
+  HarnessExecutionObserver,
   HarnessStatusRequest,
   HarnessStatusResult,
 } from "./harness.js";
@@ -116,7 +118,10 @@ export interface CopilotLocalClient {
   refreshAvailability?(
     schedule?: Schedule,
   ): Promise<CopilotLocalClientAvailability>;
-  start(request: CopilotLocalStartRequest): Promise<HarnessStartResult>;
+  start(
+    request: CopilotLocalStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult>;
   status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;
   cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult>;
   open(request: HarnessOpenRequest): Promise<HarnessOpenResult>;
@@ -284,12 +289,32 @@ export class CopilotLocalHarness implements AgentHarness {
     };
   }
 
-  async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
-    return this.client.start({
+  async start(
+    request: HarnessStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult> {
+    let executionObserved = false;
+    const observed = observer
+      ? {
+          started: async (execution: LocalRunExecutionStarted) => {
+            executionObserved = true;
+            await observer.started(execution);
+          },
+          heartbeat: () => observer.heartbeat(),
+        }
+      : undefined;
+    const result = await this.client.start({
       ...request,
       resolvedHarnessPolicy:
         request.resolvedHarnessPolicy as CopilotLocalResolvedHarnessPolicy,
-    });
+    }, observed);
+    if (observer && !executionObserved && isActiveRunStatus(result.status)) {
+      await observer.started({
+        identity: result.externalRunId,
+        capabilities: { cancel: true, open: true, heartbeat: false },
+      });
+    }
+    return result;
   }
 
   async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {
@@ -337,12 +362,22 @@ export class CopilotCloudHarness implements AgentHarness {
     };
   }
 
-  async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
-    return this.client.start({
+  async start(
+    request: HarnessStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult> {
+    const result = await this.client.start({
       ...request,
       resolvedHarnessPolicy:
         request.resolvedHarnessPolicy as CopilotCloudResolvedHarnessPolicy,
     });
+    if (observer && isActiveRunStatus(result.status)) {
+      await observer.started({
+        identity: result.externalRunId,
+        capabilities: { cancel: true, open: true, heartbeat: false },
+      });
+    }
+    return result;
   }
 
   async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {

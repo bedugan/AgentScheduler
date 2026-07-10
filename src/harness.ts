@@ -9,6 +9,7 @@ import type {
   ScheduleHarnessModeAvailability,
 } from "./domain.js";
 import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
+import type { LocalRunExecutionStarted } from "./localRunExecution.js";
 
 export interface HarnessPreflightRequest {
   schedule: Schedule;
@@ -44,6 +45,11 @@ export interface HarnessStartRequest {
   requestedAt: IsoTimestamp;
   runInstructions: string;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
+}
+
+export interface HarnessExecutionObserver {
+  started(execution: LocalRunExecutionStarted): Promise<void>;
+  heartbeat(): Promise<void>;
 }
 
 export interface HarnessStartResult {
@@ -82,6 +88,7 @@ export interface HarnessCancelRequest {
   run: RunHistoryEntry;
   externalRunId: string;
   requestedAt: IsoTimestamp;
+  executionIdentity?: string;
 }
 
 export interface HarnessCancelResult {
@@ -120,7 +127,10 @@ export interface AgentHarness {
   ): Promise<ScheduleHarnessModeAvailability>;
   models?(): Promise<readonly ScheduleModelOption[]>;
   preflight(request: HarnessPreflightRequest): Promise<HarnessPreflightResult>;
-  start(request: HarnessStartRequest): Promise<HarnessStartResult>;
+  start(
+    request: HarnessStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult>;
   status(request: HarnessStatusRequest): Promise<HarnessStatusResult>;
   cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult>;
   open(request: HarnessOpenRequest): Promise<HarnessOpenResult>;

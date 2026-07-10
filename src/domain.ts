@@ -1,3 +1,5 @@
+import type { LocalRunExecution } from "./localRunExecution.js";
+
 export type IsoTimestamp = string;
 
 export type ApprovalMode =
@@ -260,6 +262,21 @@ export interface RunHistoryDetailView {
   executedModel: string | null;
   resolvedHarnessPolicy: ResolvedHarnessPolicy;
   outcome: RunOutcomeView;
+  execution: LocalRunExecution | null;
+  actions: {
+    cancel: {
+      kind: "cancel";
+      label: string;
+      enabled: boolean;
+      disabledReason?: string;
+    };
+    open: {
+      kind: "open";
+      label: string;
+      enabled: boolean;
+      disabledReason?: string;
+    };
+  };
 }
 
 export interface UpdateScheduleInput {
