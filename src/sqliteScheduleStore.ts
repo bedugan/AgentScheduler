@@ -15,6 +15,11 @@ import type {
   TargetContext,
 } from "./domain.js";
 import { isActiveRunStatus } from "./domain.js";
+import type {
+  ExpiredExecutionClaim,
+  LocalRunExecution,
+} from "./localRunExecution.js";
+import { RECOVERY_CLAIM_LEASE_MS } from "./localRunExecution.js";
 import {
   defaultLocalSchedulingSetupState,
   type LocalSchedulingSetupState,
@@ -81,6 +86,19 @@ interface LocalSchedulingSetupRow {
   updated_at: string | null;
 }
 
+interface LocalRunExecutionRow {
+  run_id: string;
+  identity: string;
+  owner_id: string;
+  started_at: string;
+  heartbeat_at: string;
+  lease_expires_at: string;
+  capabilities_json: string;
+  handle?: string | null;
+  recovery_claimed_at?: string | null;
+  cancellation_requested_at?: string | null;
+}
+
 export class SqliteScheduleStore
   implements ScheduleStore, LocalSchedulingSetupStore
 {
@@ -103,6 +121,13 @@ export class SqliteScheduleStore
 
   close(): void {
     this.database.close();
+  }
+
+  dataVersion(): number {
+    const row = this.database.prepare("PRAGMA data_version").get() as
+      | { data_version: number }
+      | undefined;
+    return row?.data_version ?? 0;
   }
 
   async saveSchedule(schedule: Schedule): Promise<void> {
@@ -215,6 +240,12 @@ export class SqliteScheduleStore
     this.database.exec("BEGIN IMMEDIATE TRANSACTION");
     try {
       this.database
+        .prepare(`
+          DELETE FROM local_run_executions
+          WHERE run_id IN (SELECT id FROM run_history WHERE schedule_id = $schedule_id)
+        `)
+        .run({ schedule_id: id });
+      this.database
         .prepare("DELETE FROM run_history WHERE schedule_id = $schedule_id")
         .run({ schedule_id: id });
       this.database
@@ -225,6 +256,172 @@ export class SqliteScheduleStore
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {
+    this.database.prepare(`
+      INSERT INTO local_run_executions (
+        run_id, identity, owner_id, started_at, heartbeat_at,
+        lease_expires_at, capabilities_json, handle, recovery_claimed_at,
+        cancellation_requested_at
+      ) VALUES (
+        $run_id, $identity, $owner_id, $started_at, $heartbeat_at,
+        $lease_expires_at, $capabilities_json, $handle, $recovery_claimed_at,
+        $cancellation_requested_at
+      )
+      ON CONFLICT(run_id) DO UPDATE SET
+        identity = excluded.identity,
+        owner_id = excluded.owner_id,
+        started_at = excluded.started_at,
+        heartbeat_at = excluded.heartbeat_at,
+        lease_expires_at = excluded.lease_expires_at,
+        capabilities_json = excluded.capabilities_json,
+        handle = excluded.handle,
+        recovery_claimed_at = excluded.recovery_claimed_at,
+        cancellation_requested_at = excluded.cancellation_requested_at
+    `).run({
+      run_id: execution.runId,
+      identity: execution.identity,
+      owner_id: execution.ownerId,
+      started_at: execution.startedAt,
+      heartbeat_at: execution.heartbeatAt,
+      lease_expires_at: execution.leaseExpiresAt,
+      capabilities_json: JSON.stringify(execution.capabilities),
+      handle: execution.handle,
+      recovery_claimed_at: execution.recoveryClaimedAt ?? null,
+      cancellation_requested_at: execution.cancellationRequestedAt ?? null,
+    });
+  }
+
+  async getLocalRunExecution(
+    runId: string,
+  ): Promise<LocalRunExecution | undefined> {
+    const row = this.database
+      .prepare("SELECT * FROM local_run_executions WHERE run_id = $run_id")
+      .get({ run_id: runId }) as LocalRunExecutionRow | undefined;
+    return row ? this.localRunExecutionFromRow(row) : undefined;
+  }
+
+  async deleteLocalRunExecution(runId: string): Promise<void> {
+    this.database
+      .prepare("DELETE FROM local_run_executions WHERE run_id = $run_id")
+      .run({ run_id: runId });
+  }
+
+  async heartbeatLocalRunExecution(
+    runId: string,
+    ownerId: string,
+    heartbeatAt: string,
+    leaseExpiresAt: string,
+  ): Promise<boolean> {
+    const result = this.database.prepare(`
+      UPDATE local_run_executions
+      SET heartbeat_at = $heartbeat_at,
+          lease_expires_at = $lease_expires_at
+      WHERE run_id = $run_id
+        AND owner_id = $owner_id
+        AND recovery_claimed_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM run_history
+          WHERE id = $run_id
+            AND status IN ('running', 'approval-waiting')
+            AND completed_at IS NULL
+        )
+    `).run({ run_id: runId, owner_id: ownerId, heartbeat_at: heartbeatAt, lease_expires_at: leaseExpiresAt });
+    return Number(result.changes) === 1;
+  }
+
+  async claimExpiredExecution(claim: ExpiredExecutionClaim): Promise<boolean> {
+    this.database.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      let claimed = false;
+      if (
+        claim.observedHeartbeatAt === null &&
+        claim.observedLeaseExpiresAt === null
+      ) {
+        const result = this.database.prepare(`
+          INSERT INTO local_run_executions (
+            run_id, identity, owner_id, started_at, heartbeat_at,
+            lease_expires_at, capabilities_json, handle, recovery_claimed_at
+          )
+          SELECT id, 'legacy:' || id, 'reconciler', started_at, $claimed_at,
+                 $claimed_at, $capabilities_json, NULL, $claimed_at
+          FROM run_history
+          WHERE id = $run_id
+            AND status IN ('running', 'approval-waiting')
+            AND completed_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM local_run_executions WHERE run_id = $run_id
+            )
+        `).run({
+          run_id: claim.runId,
+          claimed_at: claim.claimedAt,
+          capabilities_json: JSON.stringify({
+            cancel: false,
+            open: false,
+            heartbeat: false,
+          }),
+        });
+        claimed = Number(result.changes) === 1;
+      } else {
+        const claimExpiredBefore = new Date(
+          new Date(claim.claimedAt).getTime() - RECOVERY_CLAIM_LEASE_MS,
+        ).toISOString();
+        const result = this.database.prepare(`
+          UPDATE local_run_executions
+          SET recovery_claimed_at = $claimed_at
+          WHERE run_id = $run_id
+            AND heartbeat_at = $heartbeat_at
+            AND lease_expires_at = $lease_expires_at
+            AND lease_expires_at <= $claimed_at
+            AND (
+              recovery_claimed_at IS NULL
+              OR recovery_claimed_at <= $claim_expired_before
+            )
+            AND EXISTS (
+              SELECT 1 FROM run_history
+              WHERE id = $run_id
+                AND status IN ('running', 'approval-waiting')
+                AND completed_at IS NULL
+            )
+        `).run({
+          run_id: claim.runId,
+          heartbeat_at: claim.observedHeartbeatAt,
+          lease_expires_at: claim.observedLeaseExpiresAt,
+          claimed_at: claim.claimedAt,
+          claim_expired_before: claimExpiredBefore,
+        });
+        claimed = Number(result.changes) === 1;
+      }
+      this.database.exec("COMMIT");
+      return claimed;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async requestLocalRunCancellation(
+    runId: string,
+    ownerId: string,
+    requestedAt: string,
+  ): Promise<boolean> {
+    const result = this.database.prepare(`
+      UPDATE local_run_executions
+      SET cancellation_requested_at = $requested_at
+      WHERE run_id = $run_id
+        AND owner_id = $owner_id
+        AND cancellation_requested_at IS NULL
+        AND recovery_claimed_at IS NULL
+        AND json_extract(capabilities_json, '$.cancel') = 1
+        AND EXISTS (
+          SELECT 1 FROM run_history
+          WHERE id = $run_id
+            AND status IN ('running', 'approval-waiting')
+            AND completed_at IS NULL
+        )
+    `).run({ run_id: runId, owner_id: ownerId, requested_at: requestedAt });
+    return Number(result.changes) === 1;
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
@@ -555,8 +752,36 @@ export class SqliteScheduleStore
         verified_at TEXT,
         updated_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS local_run_executions (
+        run_id TEXT PRIMARY KEY,
+        identity TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        handle TEXT,
+        recovery_claimed_at TEXT,
+        cancellation_requested_at TEXT,
+        FOREIGN KEY(run_id) REFERENCES run_history(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_local_run_execution_lease
+        ON local_run_executions(lease_expires_at);
     `);
     this.addColumnIfMissing("run_history", "executed_model", "TEXT");
+    this.addColumnIfMissing("local_run_executions", "handle", "TEXT");
+    this.addColumnIfMissing(
+      "local_run_executions",
+      "recovery_claimed_at",
+      "TEXT",
+    );
+    this.addColumnIfMissing(
+      "local_run_executions",
+      "cancellation_requested_at",
+      "TEXT",
+    );
   }
 
   private addColumnIfMissing(
@@ -649,6 +874,23 @@ export class SqliteScheduleStore
       externalRunId: row.external_run_id,
       summary: row.summary,
       error: row.error,
+    };
+  }
+
+  private localRunExecutionFromRow(row: LocalRunExecutionRow): LocalRunExecution {
+    return {
+      runId: row.run_id,
+      identity: row.identity,
+      ownerId: row.owner_id,
+      startedAt: row.started_at,
+      heartbeatAt: row.heartbeat_at,
+      leaseExpiresAt: row.lease_expires_at,
+      capabilities: parseJson<LocalRunExecution["capabilities"]>(
+        row.capabilities_json,
+      ),
+      handle: row.handle ?? null,
+      recoveryClaimedAt: row.recovery_claimed_at ?? null,
+      cancellationRequestedAt: row.cancellation_requested_at ?? null,
     };
   }
 

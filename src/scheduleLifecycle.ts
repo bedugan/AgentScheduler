@@ -52,6 +52,13 @@ import type {
 import { defaultLocalSchedulingSetupState } from "./localSchedulingSetup.js";
 import type { ScheduleStore } from "./store.js";
 import type { ScheduleModelOption } from "./scheduleModelCatalog.js";
+import {
+  LEGACY_ACTIVE_RUN_GRACE_MS,
+  NON_HEARTBEATING_RUN_LEASE_MS,
+  isExecutionLeaseExpired,
+  leaseExpiry,
+  type LocalRunExecutionStarted,
+} from "./localRunExecution.js";
 
 export interface Clock {
   now(): Date;
@@ -68,6 +75,7 @@ export interface ScheduleLifecycleOptions {
   idGenerator?: IdGenerator;
   localSchedulingEnabled?: boolean;
   localSchedulingSetup?: LocalSchedulingStateSource;
+  executionOwnerId?: string;
 }
 
 export class SystemClock implements Clock {
@@ -90,6 +98,7 @@ export class ScheduleLifecycle {
   private readonly localSchedulingSetup: LocalSchedulingStateSource | undefined;
   private readonly harnesses: Map<string, AgentHarness>;
   private readonly manualRunReservations = new Set<string>();
+  private readonly executionOwnerId: string;
 
   constructor(options: ScheduleLifecycleOptions) {
     this.store = options.store;
@@ -97,6 +106,7 @@ export class ScheduleLifecycle {
     this.idGenerator = options.idGenerator ?? new RandomIdGenerator();
     this.localSchedulingEnabled = options.localSchedulingEnabled ?? false;
     this.localSchedulingSetup = options.localSchedulingSetup;
+    this.executionOwnerId = options.executionOwnerId ?? `process:${process.pid}:${randomUUID()}`;
     this.harnesses = new Map(
       options.harnesses.map((harness) => [harness.mode, harness]),
     );
@@ -375,6 +385,13 @@ export class ScheduleLifecycle {
 
   async openRunHistoryDetail(runId: string): Promise<RunHistoryDetailView> {
     const run = await this.requireRun(runId);
+    const execution = await this.store.getLocalRunExecution(run.id);
+    const active = isActiveRunStatus(run.status) && run.completedAt === null;
+    const cancelReady =
+      active &&
+      execution?.ownerId === this.executionOwnerId &&
+      execution.capabilities.cancel &&
+      !execution.cancellationRequestedAt;
 
     return {
       run,
@@ -386,6 +403,37 @@ export class ScheduleLifecycle {
       executedModel: run.executedModel,
       resolvedHarnessPolicy: run.resolvedHarnessPolicy,
       outcome: this.runOutcomeViewFor(run),
+      execution: execution ?? null,
+      actions: {
+        cancel: {
+          kind: "cancel",
+          label: "Cancel Run",
+          enabled: cancelReady,
+          ...(!cancelReady && {
+            disabledReason: active
+              ? execution
+                ? execution.cancellationRequestedAt
+                  ? "Cancellation was requested and AgentScheduler is waiting for the execution to exit."
+                  : "Cancellation is unsupported from this process or execution type."
+                : "Cancellation is unavailable because this active run has no recoverable execution identity."
+              : "Only active runs can be canceled.",
+          }),
+        },
+        open: {
+          kind: "open",
+          label: "Open Run",
+          enabled:
+            run.externalRunId !== null &&
+            execution?.capabilities.open === true,
+          ...((run.externalRunId === null ||
+            execution?.capabilities.open !== true) && {
+            disabledReason:
+              run.externalRunId === null
+                ? "This run has no external harness identity to open."
+                : "Opening this execution is unsupported.",
+          }),
+        },
+      },
     };
   }
 
@@ -429,6 +477,7 @@ export class ScheduleLifecycle {
 
   async scanDueWork(): Promise<DueWorkScanResult> {
     const scannedAt = this.nowIso();
+    await this.reconcileAbandonedRuns(scannedAt);
     const localSchedulingState = await this.getLocalSchedulingSetupState();
     if (!localSchedulingState.enabled) {
       return {
@@ -543,12 +592,34 @@ export class ScheduleLifecycle {
     this.requireHarnessBackedActiveRun(run, "canceled");
     const { schedule, harness, externalRunId } =
       await this.requireHarnessForRun(run);
+    const execution = await this.store.getLocalRunExecution(run.id);
+    if (
+      !execution ||
+      execution.ownerId !== this.executionOwnerId ||
+      !execution.capabilities.cancel
+    ) {
+      throw new Error(
+        "Cancellation is unsupported from this process or execution type.",
+      );
+    }
     const requestedAt = this.nowIso();
+    if (
+      !(await this.store.requestLocalRunCancellation(
+        run.id,
+        this.executionOwnerId,
+        requestedAt,
+      ))
+    ) {
+      throw new Error(
+        "Cancellation is already pending or no longer supported for this run.",
+      );
+    }
     const cancelResult = await harness.cancel({
       schedule,
       run,
       externalRunId,
       requestedAt,
+      executionIdentity: execution.identity,
     });
     const canceledRun = this.applyHarnessRunUpdate(
       run,
@@ -768,14 +839,27 @@ export class ScheduleLifecycle {
       resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
     });
     let startResult: HarnessStartResult;
+    const executionIdentity = `execution:${randomUUID()}`;
     try {
-      startResult = await harness.start({
-        schedule,
-        trigger,
-        requestedAt,
-        runInstructions: schedule.runInstructions,
-        resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
-      });
+      startResult = await harness.start(
+        {
+          schedule,
+          trigger,
+          requestedAt,
+          runInstructions: schedule.runInstructions,
+          resolvedHarnessPolicy: preflight.resolvedHarnessPolicy,
+          executionIdentity,
+        },
+        {
+          started: (execution) =>
+            this.recordExecutionStarted(
+              startingRun,
+              executionIdentity,
+              execution,
+            ),
+          heartbeat: () => this.recordExecutionHeartbeat(startingRun.id),
+        },
+      );
     } catch (error) {
       await this.persistRunResult(
         schedule,
@@ -803,7 +887,84 @@ export class ScheduleLifecycle {
     };
 
     await this.persistRunResult(schedule, run, trigger);
-    return run;
+    return (await this.store.getRunHistoryEntry(run.id)) ?? run;
+  }
+
+  private async recordExecutionStarted(
+    run: RunHistoryEntry,
+    executionIdentity: string,
+    execution: LocalRunExecutionStarted,
+  ): Promise<void> {
+    const now = this.nowIso();
+    await this.store.saveLocalRunExecution({
+      runId: run.id,
+      identity: executionIdentity,
+      ownerId: this.executionOwnerId,
+      startedAt: now,
+      heartbeatAt: now,
+      leaseExpiresAt: leaseExpiry(
+        now,
+        execution.capabilities.heartbeat === false
+          ? NON_HEARTBEATING_RUN_LEASE_MS
+          : undefined,
+      ),
+      capabilities: execution.capabilities,
+      handle: execution.identity,
+      recoveryClaimedAt: null,
+      cancellationRequestedAt: null,
+    });
+    await this.store.saveRunHistory({
+      ...run,
+      externalRunId: executionIdentity,
+      summary: "Local run execution started.",
+    });
+  }
+
+  private async recordExecutionHeartbeat(runId: string): Promise<void> {
+    const now = this.nowIso();
+    await this.store.heartbeatLocalRunExecution(
+      runId,
+      this.executionOwnerId,
+      now,
+      leaseExpiry(now),
+    );
+  }
+
+  private async reconcileAbandonedRuns(now: IsoTimestamp): Promise<void> {
+    for (const run of await this.store.listActiveRuns()) {
+      const execution = await this.store.getLocalRunExecution(run.id);
+      const legacyExpired =
+        !execution &&
+        new Date(run.startedAt).getTime() + LEGACY_ACTIVE_RUN_GRACE_MS <=
+          new Date(now).getTime();
+      if (!legacyExpired && (!execution || !isExecutionLeaseExpired(execution, now))) {
+        continue;
+      }
+      if (
+        !(await this.store.claimExpiredExecution({
+          runId: run.id,
+          observedHeartbeatAt: execution?.heartbeatAt ?? null,
+          observedLeaseExpiresAt: execution?.leaseExpiresAt ?? null,
+          claimedAt: now,
+        }))
+      ) {
+        continue;
+      }
+      const schedule = await this.requireSchedule(run.scheduleId);
+      await this.persistRunResult(
+        schedule,
+        {
+          ...run,
+          status: "failed",
+          completedAt: now,
+          summary: null,
+          error: execution
+            ? `Local run execution '${execution.identity}' stopped heartbeating and its lease expired. AgentScheduler recovered the abandoned Run Slot.`
+            : "Legacy active run has no recoverable execution identity and exceeded the recovery grace period. AgentScheduler recovered the abandoned Run Slot.",
+        },
+        run.trigger,
+      );
+    }
   }
 
   private async openHarnessRun(

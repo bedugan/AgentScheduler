@@ -18,6 +18,7 @@ import type {
 import {
   CopilotLocalHarness,
 } from "./copilotHarness.js";
+import { LOCAL_RUN_HEARTBEAT_MS } from "./localRunExecution.js";
 import type {
   HarnessCancelRequest,
   HarnessCancelResult,
@@ -26,6 +27,7 @@ import type {
   HarnessStartResult,
   HarnessStatusRequest,
   HarnessStatusResult,
+  HarnessExecutionObserver,
 } from "./harness.js";
 
 export const DEFAULT_COPILOT_CLI_COMMAND = "copilot";
@@ -44,10 +46,14 @@ export interface CopilotCliCommandResult {
   stderr: string;
   errorCode?: string;
   errorMessage?: string;
+  completedAt?: string;
 }
 
 export interface CopilotCliCommandRunOptions {
   timeoutMs?: number;
+  onStarted?: (identity: string) => Promise<void>;
+  onHeartbeat?: () => Promise<void>;
+  heartbeatMs?: number;
 }
 
 export interface CopilotCliCommandRunner {
@@ -71,7 +77,9 @@ export interface CopilotInteractiveExecutor {
     command: string,
     args: readonly string[],
     request: CopilotLocalStartRequest,
+    observer?: HarnessExecutionObserver,
   ): Promise<HarnessStartResult>;
+  cancel?(identity: string): Promise<HarnessCancelResult | undefined>;
 }
 
 export interface CreateDefaultCopilotLocalHarnessOptions {
@@ -128,7 +136,10 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
     return this.availabilityWithPermissionFlagSupport(schedule);
   }
 
-  async start(request: CopilotLocalStartRequest): Promise<HarnessStartResult> {
+  async start(
+    request: CopilotLocalStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult> {
     if (
       request.resolvedHarnessPolicy.localCopilotMode.requiresApprovalSurface &&
       !request.resolvedHarnessPolicy.localCopilotMode.unattended
@@ -142,6 +153,7 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
         this.command,
         copilotInteractiveArgsFor(request),
         request,
+        observer,
       );
     }
     const result = await this.runner.run(
@@ -149,6 +161,17 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
       copilotPromptArgsFor(request),
       {
         timeoutMs: this.runTimeoutMs,
+        ...(observer && {
+          onStarted: (identity: string) =>
+            observer.started({
+              identity,
+              capabilities: { cancel: false, open: false, heartbeat: true },
+            }),
+        }),
+        ...(observer && {
+          onHeartbeat: () => observer.heartbeat(),
+        }),
+        heartbeatMs: LOCAL_RUN_HEARTBEAT_MS,
       },
     );
     return harnessStartResultForCopilotCliCommand(request, result);
@@ -165,12 +188,23 @@ export class CopilotCliLocalClient implements CopilotLocalClient {
   }
 
   async cancel(request: HarnessCancelRequest): Promise<HarnessCancelResult> {
+    if (request.executionIdentity && this.interactiveExecutor?.cancel) {
+      const canceled = await this.interactiveExecutor.cancel(
+        request.executionIdentity,
+      );
+      if (canceled) {
+        return canceled;
+      }
+      throw new Error(
+        "Cancellation did not reach a matching active Local Copilot execution.",
+      );
+    }
     return {
       status: "failed",
       completedAt: request.requestedAt,
       summary: null,
       error:
-        "Copilot CLI cancellation is not available until Local Copilot Mode execution is wired.",
+        "Cancellation is unavailable because this Local Copilot execution is not owned by the active editor process.",
     };
   }
 
@@ -343,14 +377,16 @@ function supportedPermissionFlagsFromHelp(helpOutput: string): string[] {
   return [...supportedFlags].sort();
 }
 
-class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
+export class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
   async run(
     command: string,
     args: readonly string[],
     options: CopilotCliCommandRunOptions = {},
   ): Promise<CopilotCliCommandResult> {
-    return new Promise((resolve) => {
-      execFile(
+    return new Promise((resolve, reject) => {
+      let heartbeat: NodeJS.Timeout | undefined;
+      let started = Promise.resolve();
+      const child = execFile(
         command,
         [...args],
         {
@@ -362,6 +398,7 @@ class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
             exitCode: exitCodeFor(error),
             stdout,
             stderr,
+            completedAt: new Date().toISOString(),
           };
           if (error?.message) {
             result.errorMessage = error.message;
@@ -370,9 +407,21 @@ class ExecFileCopilotCliCommandRunner implements CopilotCliCommandRunner {
           if (typeof errorCode === "string") {
             result.errorCode = errorCode;
           }
-          resolve(result);
+          if (heartbeat) {
+            clearInterval(heartbeat);
+          }
+          void started.then(() => resolve(result), reject);
         },
       );
+      if (child.pid !== undefined && options.onStarted) {
+        started = options.onStarted(`process:${child.pid}`);
+        if (options.onHeartbeat) {
+          heartbeat = setInterval(() => {
+            void options.onHeartbeat?.().catch(() => {});
+          }, options.heartbeatMs ?? LOCAL_RUN_HEARTBEAT_MS);
+          heartbeat.unref();
+        }
+      }
     });
   }
 }
@@ -442,7 +491,7 @@ function harnessStartResultForCopilotCliCommand(
     externalRunId:
       parsed.sessionId ?? `copilot-cli:${request.schedule.id}:${request.requestedAt}`,
     status,
-    completedAt: request.requestedAt,
+    completedAt: result.completedAt ?? request.requestedAt,
     summary: summaryForCopilotCliCommand(status, result, parsed),
     executedModel: parsed.executedModel ?? null,
   };

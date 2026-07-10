@@ -48,6 +48,7 @@ export type {
   AgentHarness,
   HarnessCancelRequest,
   HarnessCancelResult,
+  HarnessExecutionObserver,
   HarnessOpenPurpose,
   HarnessOpenRequest,
   HarnessOpenResult,
@@ -91,6 +92,7 @@ export {
   COPILOT_CLI_AUTH_UNAVAILABLE_REASON,
   COPILOT_CLI_MISSING_REASON,
   CopilotCliLocalClient,
+  ExecFileCopilotCliCommandRunner,
   classifyCopilotCliAvailability,
   copilotLocalHarnessAvailabilityFor,
   createDefaultCopilotLocalHarness,
@@ -103,6 +105,18 @@ export type {
   ScheduleRunStateUpdate,
   ScheduleStore,
 } from "./store.js";
+export {
+  LEGACY_ACTIVE_RUN_GRACE_MS,
+  LOCAL_RUN_HEARTBEAT_MS,
+  LOCAL_RUN_LEASE_MS,
+  RECOVERY_CLAIM_LEASE_MS,
+  NON_HEARTBEATING_RUN_LEASE_MS,
+  isExecutionLeaseExpired,
+  leaseExpiry,
+  type LocalRunExecution,
+  type LocalRunExecutionCapabilities,
+  type LocalRunExecutionStarted,
+} from "./localRunExecution.js";
 export {
   RandomIdGenerator,
   ScheduleLifecycle,

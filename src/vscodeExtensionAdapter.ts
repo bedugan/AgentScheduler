@@ -18,11 +18,17 @@ import { dirname, join, posix, win32 } from "node:path";
 import { createDefaultCopilotLocalHarness } from "./copilotCliClient.js";
 import type { CopilotInteractiveExecutor } from "./copilotCliClient.js";
 import type {
+  HarnessCancelResult,
+  HarnessExecutionObserver,
+} from "./harness.js";
+import { LOCAL_RUN_HEARTBEAT_MS } from "./localRunExecution.js";
+import type {
   ApprovalMode,
   CreateDraftScheduleInput,
   HarnessMode,
   RunCadence,
   RunHistoryEntry,
+  RunHistoryDetailView,
   RunCapInput,
   ScheduleDetailActionKind,
   ScheduleDetailAction,
@@ -78,6 +84,7 @@ export const OPEN_SCHEDULE_COMMAND = "agentScheduler.openSchedule";
 export const DELETE_SCHEDULE_COMMAND = "agentScheduler.deleteSchedule";
 export const SCHEDULE_LIST_VIEW_ID = "agentScheduler.scheduleList";
 export const SCHEDULE_DETAIL_VIEW_TYPE = "agentScheduler.scheduleDetail";
+export const RUN_HISTORY_DETAIL_VIEW_TYPE = "agentScheduler.runHistoryDetail";
 export const SQLITE_LOCAL_STORE_FILENAME = "agent-scheduler.sqlite";
 export const ENABLE_LOCAL_SCHEDULING_ACTION = "Enable Local Scheduling";
 
@@ -247,7 +254,9 @@ export interface VsCodeWindowLike {
   showErrorMessage?(message: string): Promise<unknown>;
 }
 
-export interface VsCodeTaskExecutionLike {}
+export interface VsCodeTaskExecutionLike {
+  terminate?(): void;
+}
 
 export interface VsCodeTaskProcessEndEventLike {
   execution: VsCodeTaskExecutionLike;
@@ -318,6 +327,9 @@ export interface VsCodeScheduleEditor {
   enableLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
   verifyLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
   disableLocalScheduling?(): Promise<LocalSchedulingSetupResult>;
+  openRunHistoryDetail?(runId: string): Promise<RunHistoryDetailView>;
+  cancelRun?(runId: string): Promise<RunHistoryEntry>;
+  openRun?(runId: string): Promise<unknown>;
 }
 
 export interface VsCodeSchedulerServices {
@@ -328,6 +340,7 @@ export interface VsCodeSchedulerServices {
     canManage?: boolean;
     reason?: string;
   };
+  dataVersion?: () => number;
   close?(): void;
 }
 
@@ -843,6 +856,7 @@ export function createDefaultVsCodeSchedulerServices(
     }),
     lifecycle,
     localSchedulingSetupAvailability: { available: true },
+    dataVersion: () => store.dataVersion(),
     close: () => store.close(),
   };
 }
@@ -901,26 +915,96 @@ function createUnavailableLocalSchedulingServices(
       canManage: localSchedulingSetup !== undefined,
       reason,
     },
+    dataVersion: () => store.dataVersion(),
     close: () => store.close(),
   };
+}
+
+export class SqliteDataVersionMonitor {
+  private observedVersion: number;
+  private refreshInFlight: Promise<void> | undefined;
+  private dirty = false;
+  private disposed = false;
+
+  constructor(
+    private readonly readVersion: () => number,
+    private readonly onChange: () => unknown | Promise<unknown>,
+  ) {
+    this.observedVersion = readVersion();
+  }
+
+  async poll(): Promise<boolean> {
+    if (this.disposed) {
+      return false;
+    }
+    const nextVersion = this.readVersion();
+    if (nextVersion === this.observedVersion) {
+      return false;
+    }
+    this.observedVersion = nextVersion;
+    if (this.refreshInFlight) {
+      this.dirty = true;
+      return true;
+    }
+    this.refreshInFlight = this.refreshUntilClean();
+    await this.refreshInFlight;
+    return true;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.dirty = false;
+  }
+
+  private async refreshUntilClean(): Promise<void> {
+    try {
+      do {
+        this.dirty = false;
+        if (this.disposed) {
+          return;
+        }
+        await this.onChange();
+      } while (this.dirty && !this.disposed);
+    } finally {
+      this.refreshInFlight = undefined;
+    }
+  }
 }
 
 export class VsCodeTaskCopilotInteractiveExecutor
   implements CopilotInteractiveExecutor
 {
+  private readonly activeExecutions = new Map<
+    string,
+    {
+      execution: VsCodeTaskExecutionLike;
+      cancelRequested: boolean;
+      cancelCompletion: Promise<HarnessCancelResult>;
+      resolveCancel(result: HarnessCancelResult): void;
+    }
+  >();
   constructor(
     private readonly tasks: VsCodeTasksLike,
     private readonly taskFactory: VsCodeCopilotTaskFactory,
+    private readonly cancelTimeoutMs = 5_000,
+    private readonly heartbeatMs = LOCAL_RUN_HEARTBEAT_MS,
   ) {}
 
   async run(
     command: string,
     args: readonly string[],
     request: Parameters<CopilotInteractiveExecutor["run"]>[2],
+    observer?: HarnessExecutionObserver,
   ) {
     const name = `AgentScheduler: ${request.schedule.id}`;
     const task = this.taskFactory.createCopilotTask(name, command, args);
+    const identity =
+      request.executionIdentity ??
+      `execution:${randomBytes(16).toString("hex")}`;
+    const taskHandle = `vscode-task:${request.schedule.id}:${request.requestedAt}`;
+    let heartbeat: NodeJS.Timeout | undefined;
     let execution: VsCodeTaskExecutionLike | undefined;
+    let hasCompleted = false;
     const earlyEvents: VsCodeTaskProcessEndEventLike[] = [];
     let resolveCompletion:
       | ((result: Awaited<ReturnType<CopilotInteractiveExecutor["run"]>>) => void)
@@ -931,17 +1015,33 @@ export class VsCodeTaskCopilotInteractiveExecutor
       resolveCompletion = resolve;
     });
     const complete = (event: VsCodeTaskProcessEndEventLike): void => {
+      hasCompleted = true;
       subscription.dispose();
-      const completed = event.exitCode === 0;
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+      const processCompleted = event.exitCode === 0;
+      const activeExecution = this.activeExecutions.get(identity);
+      if (activeExecution?.cancelRequested) {
+        activeExecution.resolveCancel({
+          status: processCompleted ? "completed" : "canceled",
+          completedAt: new Date().toISOString(),
+          summary: processCompleted
+            ? "Interactive Copilot task completed before cancellation took effect."
+            : "Interactive Copilot task was canceled.",
+          error: null,
+        });
+      }
       resolveCompletion?.({
-        externalRunId: `vscode-task:${request.schedule.id}:${request.requestedAt}`,
-        status: completed ? "completed" : "failed",
+        externalRunId: identity,
+        status: processCompleted ? "completed" : "failed",
         completedAt: new Date().toISOString(),
-        summary: completed
+        summary: processCompleted
           ? "Interactive Copilot task completed in the VS Code terminal."
           : `Interactive Copilot task exited with code ${event.exitCode ?? "unknown"}.`,
         executedModel: null,
       });
+      this.activeExecutions.delete(identity);
     };
     const subscription = this.tasks.onDidEndTaskProcess((event) => {
       if (!execution) {
@@ -955,8 +1055,36 @@ export class VsCodeTaskCopilotInteractiveExecutor
 
     try {
       execution = await this.tasks.executeTask(task);
+      let resolveCancel!: (result: HarnessCancelResult) => void;
+      const cancelCompletion = new Promise<HarnessCancelResult>((resolve) => {
+        resolveCancel = resolve;
+      });
+      this.activeExecutions.set(identity, {
+        execution,
+        cancelRequested: false,
+        cancelCompletion,
+        resolveCancel,
+      });
+      await observer?.started({
+        identity: taskHandle,
+        capabilities: {
+          cancel: execution.terminate !== undefined,
+          open: false,
+          heartbeat: true,
+        },
+      });
+      if (observer && !hasCompleted) {
+        heartbeat = setInterval(() => {
+          void observer.heartbeat().catch(() => {});
+        }, this.heartbeatMs);
+        heartbeat.unref();
+      }
     } catch (error) {
       subscription.dispose();
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+      this.activeExecutions.delete(identity);
       throw error;
     }
 
@@ -967,6 +1095,32 @@ export class VsCodeTaskCopilotInteractiveExecutor
       complete(earlyCompletion);
     }
     return completion;
+  }
+
+  async cancel(identity: string): Promise<HarnessCancelResult | undefined> {
+    const active = this.activeExecutions.get(identity);
+    if (!active?.execution.terminate) {
+      return undefined;
+    }
+    active.cancelRequested = true;
+    active.execution.terminate();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        active.cancelCompletion,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Timed out waiting for the canceled VS Code Task to exit.")),
+            this.cancelTimeoutMs,
+          );
+          timeout.unref();
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 }
 
@@ -1127,7 +1281,30 @@ export function registerVsCodeScheduleCommands(
     scheduleTreeProvider,
     scheduleCreationFlow,
   });
+  const dataVersionMonitor = options.services.dataVersion
+    ? new SqliteDataVersionMonitor(options.services.dataVersion, () => {
+        return controller.refreshExternalState();
+      })
+    : undefined;
+  const dataVersionInterval = dataVersionMonitor
+    ? setInterval(() => {
+        try {
+          void dataVersionMonitor.poll().catch(() => {});
+        } catch {
+          // The extension may be disposing the SQLite connection.
+        }
+      }, 1_000)
+    : undefined;
+  dataVersionInterval?.unref();
   const disposables = [
+    ...(dataVersionInterval
+      ? [{
+          dispose: () => {
+            clearInterval(dataVersionInterval);
+            dataVersionMonitor?.dispose();
+          },
+        }]
+      : []),
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
       controller.createNewSchedule(),
     ),
@@ -1698,6 +1875,14 @@ function renderScheduleDetailScript(nonce: string): string {
       vscode.postMessage(message);
     });
   });
+  document.querySelectorAll("button[data-run-history-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      vscode.postMessage({
+        type: "open-run-history",
+        runId: button.dataset.runHistoryId,
+      });
+    });
+  });
 })();
 </script>`;
 }
@@ -1744,13 +1929,41 @@ function renderPreviousRun(run: ScheduleDetailPreviousRun): string {
           <td>${escapeHtml(run.startedAt)}</td>
           <td>${escapeHtml(run.completedAt ?? "Active")}</td>
           <td>${escapeHtml(run.executedModel ?? "Unknown")}</td>
-          <td>${escapeHtml(previousRunDetail(run))}</td>
+          <td><button type="button" data-run-history-id="${escapeHtml(run.id)}">Open</button></td>
           <td>${escapeHtml(run.outcome.description)}</td>
         </tr>`;
 }
 
-function previousRunDetail(run: ScheduleDetailPreviousRun): string {
-  return run.error ?? run.summary ?? "";
+export function renderRunHistoryDetailHtml(
+  detail: RunHistoryDetailView,
+): string {
+  const nonce = randomBytes(16).toString("base64");
+  const cancel = detail.actions.cancel;
+  const open = detail.actions.open;
+  const button = (action: "cancel" | "open", label: string, enabled: boolean, reason?: string) =>
+    `<button type="button" data-run-action="${action}"${enabled ? "" : " disabled"}${reason ? ` title="${escapeHtml(reason)}"` : ""}>${escapeHtml(label)}</button>`;
+  return `<!doctype html><html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}';"></head><body>
+    <h1>Run History Detail</h1>
+    <dl>
+      <dt>Status</dt><dd>${escapeHtml(detail.run.status)}</dd>
+      <dt>Instructions</dt><dd>${escapeHtml(detail.resolvedRunInstructions)}</dd>
+      <dt>Approval Mode</dt><dd>${escapeHtml(detail.approvalMode)}</dd>
+      <dt>Selected Model</dt><dd>${escapeHtml(detail.selectedModel)}</dd>
+      <dt>Executed Model</dt><dd>${escapeHtml(detail.executedModel ?? "Unknown")}</dd>
+      <dt>Started</dt><dd>${escapeHtml(detail.run.startedAt)}</dd>
+      <dt>Completed</dt><dd>${escapeHtml(detail.run.completedAt ?? "Active")}</dd>
+      <dt>Execution Identity</dt><dd>${escapeHtml(detail.execution?.identity ?? "Unavailable")}</dd>
+      <dt>Policy</dt><dd><pre>${escapeHtml(JSON.stringify(detail.resolvedHarnessPolicy, null, 2))}</pre></dd>
+      <dt>Outcome</dt><dd>${escapeHtml(detail.outcome.description)}</dd>
+    </dl>
+    <div>${button("open", open.label, open.enabled, open.disabledReason)} ${button("cancel", cancel.label, cancel.enabled, cancel.disabledReason)}</div>
+    <script nonce="${nonce}">
+      const vscode = acquireVsCodeApi();
+      document.querySelectorAll("button[data-run-action]").forEach((button) => {
+        button.addEventListener("click", () => vscode.postMessage({ action: button.dataset.runAction }));
+      });
+    </script>
+  </body></html>`;
 }
 
 function scheduleDetailTitle(view: ScheduleDetailView): string {
@@ -2384,6 +2597,7 @@ class VsCodeScheduleCommandController {
   private readonly localSchedulingSetupAvailability:
     | VsCodeSchedulerServices["localSchedulingSetupAvailability"];
   private readonly scheduleDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
+  private readonly runHistoryDetailPanels = new Map<string, VsCodeWebviewPanelLike>();
 
   constructor(options: VsCodeScheduleCommandControllerOptions) {
     this.context = options.context;
@@ -2427,6 +2641,27 @@ class VsCodeScheduleCommandController {
       this.refreshScheduleTree();
       return detail;
     });
+  }
+
+  async refreshExternalState(): Promise<void> {
+    this.refreshScheduleTree();
+    await Promise.all([
+      this.refreshOpenScheduleDetailPanels(),
+      ...[...this.runHistoryDetailPanels.entries()].map(
+        async ([runId, panel]) => {
+          if (!this.editor.openRunHistoryDetail) {
+            return;
+          }
+          try {
+            panel.webview.html = renderRunHistoryDetailHtml(
+              await this.editor.openRunHistoryDetail(runId),
+            );
+          } catch {
+            this.runHistoryDetailPanels.delete(runId);
+          }
+        },
+      ),
+    ]);
   }
 
   async openSchedule(scheduleId: unknown): Promise<ScheduleDetailView | undefined> {
@@ -2574,6 +2809,17 @@ class VsCodeScheduleCommandController {
     panel: VsCodeWebviewPanelLike,
     rawMessage: unknown,
   ): Promise<void> {
+    if (
+      typeof rawMessage === "object" &&
+      rawMessage !== null &&
+      (rawMessage as { type?: unknown }).type === "open-run-history" &&
+      typeof (rawMessage as { runId?: unknown }).runId === "string"
+    ) {
+      await this.openRunHistoryDetailPanel(
+        (rawMessage as { runId: string }).runId,
+      );
+      return;
+    }
     const message = parseScheduleDetailWebviewMessage(rawMessage);
     if (!message) {
       return;
@@ -2655,6 +2901,48 @@ class VsCodeScheduleCommandController {
         );
         return;
     }
+  }
+
+  private async openRunHistoryDetailPanel(runId: string): Promise<void> {
+    if (!this.editor.openRunHistoryDetail) {
+      throw new Error("Run History Detail is not configured.");
+    }
+    const detail = await this.editor.openRunHistoryDetail(runId);
+    const existing = this.runHistoryDetailPanels.get(runId);
+    if (existing) {
+      existing.reveal?.(this.viewColumn);
+      existing.webview.html = renderRunHistoryDetailHtml(detail);
+      return;
+    }
+    const panel = this.window.createWebviewPanel(
+      RUN_HISTORY_DETAIL_VIEW_TYPE,
+      `Run ${runId}`,
+      this.viewColumn,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    panel.webview.html = renderRunHistoryDetailHtml(detail);
+    this.runHistoryDetailPanels.set(runId, panel);
+    panel.onDidDispose?.(() => this.runHistoryDetailPanels.delete(runId));
+    panel.webview.onDidReceiveMessage?.(async (message) => {
+      if (
+        typeof message !== "object" ||
+        message === null ||
+        typeof (message as { action?: unknown }).action !== "string"
+      ) {
+        return;
+      }
+      const action = (message as { action: string }).action;
+      if (action === "cancel" && this.editor.cancelRun) {
+        await this.editor.cancelRun(runId);
+      } else if (action === "open" && this.editor.openRun) {
+        await this.editor.openRun(runId);
+      }
+      panel.webview.html = renderRunHistoryDetailHtml(
+        await this.editor.openRunHistoryDetail!(runId),
+      );
+      this.refreshScheduleTree();
+      await this.refreshOpenScheduleDetailPanels();
+    });
   }
 
   private async runScheduleDetailAction(

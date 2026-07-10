@@ -18,6 +18,7 @@ import type {
   HarnessPreflightResult,
   HarnessStartRequest,
   HarnessStartResult,
+  HarnessExecutionObserver,
   HarnessStatusRequest,
   HarnessStatusResult,
 } from "./harness.js";
@@ -33,6 +34,11 @@ import {
   type ScheduleRunStateUpdate,
   type ScheduleStore,
 } from "./store.js";
+import {
+  RECOVERY_CLAIM_LEASE_MS,
+  type ExpiredExecutionClaim,
+  type LocalRunExecution,
+} from "./localRunExecution.js";
 
 export class FakeClock implements Clock {
   private current: Date;
@@ -63,6 +69,7 @@ export class SequentialIdGenerator implements IdGenerator {
 export class InMemoryScheduleStore implements ScheduleStore {
   private readonly schedules = new Map<string, Schedule>();
   private readonly runHistory = new Map<string, RunHistoryEntry[]>();
+  private readonly localRunExecutions = new Map<string, LocalRunExecution>();
 
   async saveSchedule(schedule: Schedule): Promise<void> {
     this.schedules.set(schedule.id, cloneStoreValue(schedule));
@@ -95,8 +102,122 @@ export class InMemoryScheduleStore implements ScheduleStore {
   }
 
   async deleteSchedule(id: string): Promise<void> {
+    for (const run of this.runHistory.get(id) ?? []) {
+      this.localRunExecutions.delete(run.id);
+    }
     this.schedules.delete(id);
     this.runHistory.delete(id);
+  }
+
+  async saveLocalRunExecution(execution: LocalRunExecution): Promise<void> {
+    this.localRunExecutions.set(execution.runId, cloneStoreValue(execution));
+  }
+
+  async getLocalRunExecution(
+    runId: string,
+  ): Promise<LocalRunExecution | undefined> {
+    const execution = this.localRunExecutions.get(runId);
+    return execution ? cloneStoreValue(execution) : undefined;
+  }
+
+  async deleteLocalRunExecution(runId: string): Promise<void> {
+    this.localRunExecutions.delete(runId);
+  }
+
+  async heartbeatLocalRunExecution(
+    runId: string,
+    ownerId: string,
+    heartbeatAt: string,
+    leaseExpiresAt: string,
+  ): Promise<boolean> {
+    const execution = this.localRunExecutions.get(runId);
+    const run = await this.getRunHistoryEntry(runId);
+    if (
+      !execution ||
+      execution.ownerId !== ownerId ||
+      execution.recoveryClaimedAt ||
+      !run ||
+      !isActiveRunStatus(run.status) ||
+      run.completedAt !== null
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(runId, {
+      ...execution,
+      heartbeatAt,
+      leaseExpiresAt,
+    });
+    return true;
+  }
+
+  async claimExpiredExecution(claim: ExpiredExecutionClaim): Promise<boolean> {
+    const run = await this.getRunHistoryEntry(claim.runId);
+    if (!run || !isActiveRunStatus(run.status) || run.completedAt !== null) {
+      return false;
+    }
+    const execution = this.localRunExecutions.get(claim.runId);
+    if (!execution) {
+      if (
+        claim.observedHeartbeatAt !== null ||
+        claim.observedLeaseExpiresAt !== null
+      ) {
+        return false;
+      }
+      this.localRunExecutions.set(claim.runId, {
+        runId: claim.runId,
+        identity: `legacy:${claim.runId}`,
+        ownerId: "reconciler",
+        startedAt: run.startedAt,
+        heartbeatAt: claim.claimedAt,
+        leaseExpiresAt: claim.claimedAt,
+        capabilities: { cancel: false, open: false, heartbeat: false },
+        handle: null,
+        recoveryClaimedAt: claim.claimedAt,
+        cancellationRequestedAt: null,
+      });
+      return true;
+    }
+    if (
+      (execution.recoveryClaimedAt &&
+        new Date(execution.recoveryClaimedAt).getTime() +
+          RECOVERY_CLAIM_LEASE_MS >
+          new Date(claim.claimedAt).getTime()) ||
+      execution.heartbeatAt !== claim.observedHeartbeatAt ||
+      execution.leaseExpiresAt !== claim.observedLeaseExpiresAt ||
+      execution.leaseExpiresAt > claim.claimedAt
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(claim.runId, {
+      ...execution,
+      recoveryClaimedAt: claim.claimedAt,
+    });
+    return true;
+  }
+
+  async requestLocalRunCancellation(
+    runId: string,
+    ownerId: string,
+    requestedAt: string,
+  ): Promise<boolean> {
+    const execution = this.localRunExecutions.get(runId);
+    const run = await this.getRunHistoryEntry(runId);
+    if (
+      !execution ||
+      execution.ownerId !== ownerId ||
+      execution.cancellationRequestedAt ||
+      !execution.capabilities.cancel ||
+      !run ||
+      !isActiveRunStatus(run.status) ||
+      run.completedAt !== null
+    ) {
+      return false;
+    }
+    this.localRunExecutions.set(runId, {
+      ...execution,
+      cancellationRequestedAt: requestedAt,
+    });
+    return true;
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
@@ -313,20 +434,28 @@ export class FakeHarness implements AgentHarness {
     };
   }
 
-  async start(request: HarnessStartRequest): Promise<HarnessStartResult> {
+  async start(
+    request: HarnessStartRequest,
+    observer?: HarnessExecutionObserver,
+  ): Promise<HarnessStartResult> {
     this.startRequests.push(cloneStoreValue(request));
-    if (this.startResult) {
-      return typeof this.startResult === "function"
+    const result = this.startResult
+      ? typeof this.startResult === "function"
         ? cloneStoreValue(this.startResult(request))
-        : cloneStoreValue(this.startResult);
+        : cloneStoreValue(this.startResult)
+      : {
+          externalRunId: `fake-run-${this.startRequests.length}`,
+          status: "completed" as const,
+          completedAt: request.requestedAt,
+          summary: "Fake harness completed the draft run.",
+        };
+    if (observer) {
+      await observer.started({
+        identity: result.externalRunId,
+        capabilities: { cancel: true, open: false, heartbeat: false },
+      });
     }
-
-    return {
-      externalRunId: `fake-run-${this.startRequests.length}`,
-      status: "completed",
-      completedAt: request.requestedAt,
-      summary: "Fake harness completed the draft run.",
-    };
+    return result;
   }
 
   async status(request: HarnessStatusRequest): Promise<HarnessStatusResult> {

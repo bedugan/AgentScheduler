@@ -5,6 +5,7 @@ import {
   COPILOT_CLI_AUTH_UNAVAILABLE_REASON,
   COPILOT_CLI_MISSING_REASON,
   CopilotCliLocalClient,
+  ExecFileCopilotCliCommandRunner,
   classifyCopilotCliAvailability,
   resolveCopilotLocalHarnessPolicy,
   type CopilotCliCommandResult,
@@ -15,6 +16,32 @@ import {
 } from "../src/index.js";
 
 describe("Copilot CLI local client", () => {
+  it("reports process identity before completion and heartbeats a long-running child", async () => {
+    const runner = new ExecFileCopilotCliCommandRunner();
+    let identity: string | undefined;
+    let heartbeats = 0;
+    const before = new Date().toISOString();
+
+    const result = await runner.run(
+      process.execPath,
+      ["-e", "setTimeout(() => process.exit(0), 80)"],
+      {
+        timeoutMs: 2_000,
+        heartbeatMs: 10,
+        onStarted: async (value) => {
+          identity = value;
+        },
+        onHeartbeat: async () => {
+          heartbeats += 1;
+        },
+      },
+    );
+
+    assert.match(identity ?? "", /^process:\d+$/);
+    assert.ok(heartbeats > 0);
+    assert.equal(result.exitCode, 0);
+    assert.ok((result.completedAt ?? "") >= before);
+  });
   it("reports available when the CLI version probe succeeds", () => {
     assert.deepEqual(
       classifyCopilotCliAvailability({
@@ -228,6 +255,7 @@ describe("Copilot CLI local client", () => {
         }),
       ].join("\n"),
       stderr: "",
+      completedAt: "2026-07-07T16:01:23.000Z",
     });
     const client = new CopilotCliLocalClient({
       command: "/custom/copilot",
@@ -257,7 +285,7 @@ describe("Copilot CLI local client", () => {
     assert.deepEqual(result, {
       externalRunId: "fec78c0b-fe67-4e92-90d3-6147089dab90",
       status: "completed",
-      completedAt: "2026-07-07T16:00:00.000Z",
+      completedAt: "2026-07-07T16:01:23.000Z",
       summary: "Reviewed the workspace and finished.",
       executedModel: "claude-haiku-4.5",
     });
