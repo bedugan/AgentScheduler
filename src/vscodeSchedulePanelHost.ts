@@ -10,6 +10,7 @@ interface DisposableLike {
 
 export interface SchedulePanelLike {
   title: string;
+  visible?: boolean;
   webview: {
     html: string;
     onDidReceiveMessage?(
@@ -52,6 +53,7 @@ interface SchedulePanelHostOptions {
 export class VsCodeSchedulePanelHost {
   private readonly schedulePanels = new Map<string, SchedulePanelLike>();
   private readonly runHistoryPanels = new Map<string, SchedulePanelLike>();
+  private readonly dirtySchedulePanels = new WeakSet<SchedulePanelLike>();
 
   constructor(private readonly options: SchedulePanelHostOptions) {}
 
@@ -112,6 +114,7 @@ export class VsCodeSchedulePanelHost {
     detail: ScheduleDetailView,
     state: ScheduleDetailRenderState = {},
   ): Promise<void> {
+    this.dirtySchedulePanels.delete(panel);
     panel.title = this.options.scheduleTitle(detail);
     panel.webview.html = await this.options.renderSchedule(detail, state);
   }
@@ -136,9 +139,33 @@ export class VsCodeSchedulePanelHost {
     await Promise.all([this.refreshSchedules(), this.refreshRunHistory()]);
   }
 
-  async refreshSchedules(): Promise<void> {
+  hasVisiblePanels(): boolean {
+    return [...this.schedulePanels.values(), ...this.runHistoryPanels.values()]
+      .some((panel) => panel.visible !== false);
+  }
+
+  async refreshVisible(): Promise<void> {
+    await Promise.all([
+      this.refreshSchedules(
+        (panel) =>
+          panel.visible !== false && !this.dirtySchedulePanels.has(panel),
+      ),
+      this.refreshRunHistory((panel) => panel.visible !== false),
+    ]);
+  }
+
+  markScheduleDirty(panel: SchedulePanelLike): void {
+    this.dirtySchedulePanels.add(panel);
+  }
+
+  async refreshSchedules(
+    include: (panel: SchedulePanelLike) => boolean = () => true,
+  ): Promise<void> {
     await Promise.all(
       [...this.schedulePanels.entries()].map(async ([id, panel]) => {
+        if (!include(panel)) {
+          return;
+        }
         try {
           await this.renderSchedule(
             panel,
@@ -148,6 +175,16 @@ export class VsCodeSchedulePanelHost {
           this.schedulePanels.delete(id);
         }
       }),
+    );
+  }
+
+  async refreshSchedulePanel(
+    panel: SchedulePanelLike,
+    scheduleId: string,
+  ): Promise<void> {
+    await this.renderSchedule(
+      panel,
+      await this.options.loadSchedule(scheduleId),
     );
   }
 
@@ -165,9 +202,14 @@ export class VsCodeSchedulePanelHost {
     );
   }
 
-  private async refreshRunHistory(): Promise<void> {
+  private async refreshRunHistory(
+    include: (panel: SchedulePanelLike) => boolean = () => true,
+  ): Promise<void> {
     await Promise.all(
       [...this.runHistoryPanels.entries()].map(async ([id, panel]) => {
+        if (!include(panel)) {
+          return;
+        }
         try {
           await this.refreshRunHistoryPanel(panel, id);
         } catch {

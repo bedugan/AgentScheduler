@@ -24,6 +24,7 @@ interface ParsedScheduleExportEntry {
   targetContext: TargetContext | null;
   harnessMode: HarnessMode | null;
   model: string;
+  agentProfile?: string;
   approvalMode: ApprovalMode;
   originalApprovalMode: string;
   runCap: RunCapInput | null;
@@ -81,6 +82,7 @@ function exportEntryFor(schedule: Schedule): ScheduleExportEntry {
     targetContext: schedule.targetContext,
     harnessMode: schedule.harnessMode,
     model: schedule.model,
+    ...(schedule.agentProfile && { agentProfile: schedule.agentProfile }),
     approvalMode: schedule.approvalMode,
     runCap:
       schedule.runCounter.limit === null
@@ -160,6 +162,7 @@ function importedScheduleFor(
     targetContext: entry.targetContext,
     harnessMode: entry.harnessMode,
     model: entry.model,
+    ...(entry.agentProfile && { agentProfile: entry.agentProfile }),
     approvalMode: entry.approvalMode,
     runCounter: { completed: 0, limit: entry.runCap?.maxRuns ?? null },
     nextRunAt: null,
@@ -191,6 +194,7 @@ function parseScheduleExportEntry(
 ): ParsedScheduleExportEntry {
   const entry = requireRecord(value, path);
   const originalApprovalMode = requireString(entry, "approvalMode", path);
+  const agentProfile = optionalString(entry, "agentProfile", path);
   return {
     sourceScheduleId: requireString(entry, "sourceScheduleId", path),
     revision: requirePositiveInteger(entry, "revision", path),
@@ -205,6 +209,7 @@ function parseScheduleExportEntry(
       `${path}.harnessMode`,
     ),
     model: requireString(entry, "model", path),
+    ...(agentProfile && { agentProfile }),
     approvalMode: parseApprovalMode(originalApprovalMode),
     originalApprovalMode,
     runCap: parseRunCap(entry.runCap, `${path}.runCap`),
@@ -282,6 +287,16 @@ function requireString(
   const value = record[key];
   if (typeof value === "string") return value;
   throw new Error(`${path}.${key} must be a string.`);
+}
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+  path: string,
+): string | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value.trim() || undefined;
+  throw new Error(`${path}.${key} must be a string when provided.`);
 }
 function requirePositiveInteger(
   record: Record<string, unknown>,

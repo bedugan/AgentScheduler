@@ -138,6 +138,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
           label: "Persistence fixture",
         },
         harnessMode: "local-copilot",
+        agentProfile: "triage",
         model: "gpt-5-mini",
         approvalMode: "bypass-approvals",
         runCap: { maxRuns: 3 },
@@ -163,6 +164,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
 
       const detail = await editor.openScheduleDetail(schedule.id);
       assert.equal(detail.schedule.runInstructions, schedule.runInstructions);
+      assert.equal(detail.schedule.agentProfile, "triage");
       assert.deepEqual(detail.runCounter, { completed: 0, limit: 3 });
       assert.equal(detail.previousRuns.length, 1);
       assert.equal(detail.previousRuns[0]?.trigger, "draft-manual");
@@ -172,6 +174,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
         "Run the persistence smoke test.",
       );
       assert.equal(detail.previousRuns[0]?.approvalModeSnapshot, "bypass-approvals");
+      assert.equal(detail.previousRuns[0]?.agentProfile, "triage");
 
       secondStore.close();
     } finally {
@@ -818,6 +821,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
         uri: "file:///tmp/agent-scheduler",
       },
       harnessMode: "local-copilot",
+      agentProfile: "triage",
       model: "auto",
       approvalMode: "default-approvals",
     });
@@ -832,6 +836,10 @@ describe("Schedule Lifecycle API tracer bullet", () => {
       ["auto", "auto"],
     );
     assert.deepEqual(
+      detail.previousRuns.map((run) => run.agentProfile),
+      ["triage", "triage"],
+    );
+    assert.deepEqual(
       detail.previousRuns.map((run) => run.executedModel),
       ["gpt-5.1", "claude-haiku-4.5"],
     );
@@ -840,6 +848,7 @@ describe("Schedule Lifecycle API tracer bullet", () => {
       detail.previousRuns[0]?.id ?? "",
     );
     assert.equal(historyDetail.selectedModel, "auto");
+    assert.equal(historyDetail.selectedAgentProfile, "triage");
     assert.equal(historyDetail.executedModel, "gpt-5.1");
   });
 

@@ -21,6 +21,7 @@ import {
   type HarnessStatusResult,
   type HarnessStartResult,
   type Schedule,
+  type ScheduleModelOption,
 } from "../src/index.js";
 import {
   FakeClock,
@@ -236,6 +237,10 @@ describe("Copilot Local harness", () => {
   it("blocks model identifiers outside the Local Copilot harness catalog", async () => {
     const client = new RecordingCopilotLocalClient({
       availability: { status: "available", approvalSurfaceAvailable: true },
+      models: [
+        { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+        { id: "gpt-5.4-mini", displayName: "GPT 5.4 Mini", vendor: "GitHub Copilot" },
+      ],
     });
     const harness = new CopilotLocalHarness({ client });
     const schedule = { ...createSchedule({ approvalMode: "default-approvals" }), model: "gpt-5" };
@@ -248,7 +253,55 @@ describe("Copilot Local harness", () => {
     });
 
     assert.equal(preflight.status, "blocked");
-    assert.match(preflight.reason, /Choose Auto/);
+    assert.match(preflight.reason, /unavailable/);
+    assert.equal(client.availabilityRequests.length, 0);
+  });
+
+  it("accepts an explicit Scheduled Model reported by Copilot CLI", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: { status: "available", approvalSurfaceAvailable: true },
+      models: [
+        { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+        { id: "gpt-5.4-mini", displayName: "GPT 5.4 Mini", vendor: "GitHub Copilot" },
+      ],
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = {
+      ...createSchedule({ approvalMode: "default-approvals" }),
+      model: "gpt-5.4-mini",
+    };
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "ready");
+    assert.equal(client.availabilityRequests.length, 1);
+  });
+
+  it("blocks a malformed Copilot Agent profile before starting the CLI", async () => {
+    const client = new RecordingCopilotLocalClient({
+      availability: { status: "available", approvalSurfaceAvailable: true },
+    });
+    const harness = new CopilotLocalHarness({ client });
+    const schedule = {
+      ...createSchedule({ approvalMode: "default-approvals" }),
+      agentProfile: "Triage Agent!",
+    };
+
+    const preflight = await harness.preflight({
+      schedule,
+      trigger: "manual",
+      requestedAt: "2026-07-07T16:00:00.000Z",
+      localSchedulingEnabled: false,
+    });
+
+    assert.equal(preflight.status, "blocked");
+    assert.match(preflight.reason, /Copilot Agent profile/);
+    assert.match(preflight.reason, /lowercase/);
     assert.equal(client.availabilityRequests.length, 0);
   });
 
@@ -751,14 +804,24 @@ class RecordingCopilotLocalClient implements CopilotLocalClient {
 
   constructor(options: {
     availability: CopilotLocalClientAvailability;
+    models?: ScheduleModelOption[];
     startResult?: Awaited<ReturnType<CopilotLocalClient["start"]>>;
     statusResult?: Awaited<ReturnType<CopilotLocalClient["status"]>>;
     cancelResult?: Awaited<ReturnType<CopilotLocalClient["cancel"]>>;
   }) {
     this.availability = options.availability;
+    this.modelOptions = options.models;
     this.startResult = options.startResult;
     this.statusResult = options.statusResult;
     this.cancelResult = options.cancelResult;
+  }
+
+  private readonly modelOptions: ScheduleModelOption[] | undefined;
+
+  async models(): Promise<readonly ScheduleModelOption[]> {
+    return structuredClone(this.modelOptions ?? [
+      { id: "auto", displayName: "Auto", vendor: "GitHub Copilot" },
+    ]);
   }
 
   async checkAvailability(schedule: Schedule): Promise<CopilotLocalClientAvailability> {

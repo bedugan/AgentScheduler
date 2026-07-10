@@ -13,6 +13,7 @@ import { isScheduleModelAvailable } from "./scheduleModelCatalog.js";
 
 export interface ScheduleDetailRenderState {
   errorMessage?: string;
+  refreshedAt?: string;
   modelOptions?: readonly ScheduleModelOption[];
   modelCatalogAvailable?: boolean;
   localSchedulingSetupAvailability?: {
@@ -33,7 +34,9 @@ export function renderScheduleDetailWebviewHtml(
     ["Cadence", cadenceSummaryLabel(view.overview.cadence)],
     ["Harness Mode", harnessModeOverviewLabel(view)],
     ["Model", modelOverviewLabel(view.overview.model, state.modelOptions)],
+    ["Copilot Agent", view.overview.agentProfile ?? "Default"],
     ["Approval Mode", view.overview.approvalMode],
+    ["Approval Surface", approvalSurfaceLabel(view)],
     ["Run Counter", view.overview.runCounter.label],
     ["Next Run", nextRunDisplayLabel(view)],
     ["Last Run", view.overview.lastRunAt ?? "Never"],
@@ -197,6 +200,8 @@ export function renderScheduleDetailWebviewHtml(
   <header class="header">
     <h1>${escapeHtml(scheduleDetailTitle(view))}</h1>
     <span class="muted">${escapeHtml(view.schedule.id)}</span>
+    <span class="muted">Last refreshed ${escapeHtml(state.refreshedAt ?? "when opened")}</span>
+    <button type="button" data-action="refresh">Refresh</button>
   </header>
 
   ${state.errorMessage ? renderInlineError(state.errorMessage) : ""}
@@ -244,6 +249,15 @@ export function renderScheduleDetailWebviewHtml(
           targetContextLabelInputValue(view.overview.targetContext),
         )}
         ${renderHarnessModeField(view)}
+        ${renderInput(
+          "agent-profile",
+          "Copilot Agent Profile",
+          "agentProfile",
+          view.overview.agentProfile ?? "",
+          "text",
+          "",
+          "Optional Copilot CLI agent id, for example explore or a custom .agent.md profile.",
+        )}
         ${renderModelField(view.overview.model, state)}
         ${renderSelect("approval-mode", "Approval Mode", "approvalMode", [
           [
@@ -484,6 +498,17 @@ function renderScheduleDetailScript(nonce: string): string {
     return field && "value" in field ? field.value : "";
   };
 
+  let dirtyReported = false;
+  form.addEventListener("input", () => {
+    if (!dirtyReported) {
+      dirtyReported = true;
+      vscode.postMessage({
+        type: "form-dirty",
+        scheduleId: form.dataset.scheduleId,
+      });
+    }
+  });
+
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const fields = {
@@ -492,6 +517,7 @@ function renderScheduleDetailScript(nonce: string): string {
       targetContextUri: valueFor("targetContextUri"),
       targetContextLabel: valueFor("targetContextLabel"),
       harnessMode: valueFor("harnessMode"),
+      agentProfile: valueFor("agentProfile"),
       model: valueFor("model"),
       approvalMode: valueFor("approvalMode"),
       runCapMaxRuns: valueFor("runCapMaxRuns"),
@@ -534,6 +560,7 @@ function renderScheduleDetailScript(nonce: string): string {
           targetContextUri: valueFor("targetContextUri"),
           targetContextLabel: valueFor("targetContextLabel"),
           harnessMode: valueFor("harnessMode"),
+          agentProfile: valueFor("agentProfile"),
           model: valueFor("model"),
           approvalMode: valueFor("approvalMode"),
           runCapMaxRuns: valueFor("runCapMaxRuns"),
@@ -608,15 +635,17 @@ export function renderRunHistoryDetailHtml(
   const nonce = randomBytes(16).toString("base64");
   const cancel = detail.actions.cancel;
   const open = detail.actions.open;
-  const button = (action: "cancel" | "open", label: string, enabled: boolean, reason?: string) =>
+  const button = (action: "cancel" | "open" | "refresh", label: string, enabled: boolean, reason?: string) =>
     `<button type="button" data-run-action="${action}"${enabled ? "" : " disabled"}${reason ? ` title="${escapeHtml(reason)}"` : ""}>${escapeHtml(label)}</button>`;
   return `<!doctype html><html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}';"></head><body>
     <h1>Run History Detail</h1>
+    <p>Last refreshed ${escapeHtml(new Date().toISOString())}</p>
     <dl>
       <dt>Status</dt><dd>${escapeHtml(detail.run.status)}</dd>
       <dt>Instructions</dt><dd>${escapeHtml(detail.resolvedRunInstructions)}</dd>
       <dt>Approval Mode</dt><dd>${escapeHtml(detail.approvalMode)}</dd>
       <dt>Selected Model</dt><dd>${escapeHtml(detail.selectedModel)}</dd>
+      <dt>Copilot Agent</dt><dd>${escapeHtml(detail.selectedAgentProfile ?? "Default")}</dd>
       <dt>Executed Model</dt><dd>${escapeHtml(detail.executedModel ?? "Unknown")}</dd>
       <dt>Started</dt><dd>${escapeHtml(detail.run.startedAt)}</dd>
       <dt>Completed</dt><dd>${escapeHtml(detail.run.completedAt ?? "Active")}</dd>
@@ -624,7 +653,7 @@ export function renderRunHistoryDetailHtml(
       <dt>Policy</dt><dd><pre>${escapeHtml(JSON.stringify(detail.resolvedHarnessPolicy, null, 2))}</pre></dd>
       <dt>Outcome</dt><dd>${escapeHtml(detail.outcome.description)}</dd>
     </dl>
-    <div>${button("open", open.label, open.enabled, open.disabledReason)} ${button("cancel", cancel.label, cancel.enabled, cancel.disabledReason)}</div>
+    <div>${button("refresh", "Refresh", true)} ${button("open", open.label, open.enabled, open.disabledReason)} ${button("cancel", cancel.label, cancel.enabled, cancel.disabledReason)}</div>
     <script nonce="${nonce}">
       const vscode = acquireVsCodeApi();
       document.querySelectorAll("button[data-run-action]").forEach((button) => {
@@ -715,6 +744,16 @@ function harnessModeOverviewLabel(view: ScheduleDetailView): string {
   }
 
   return selected.available ? selected.label : `${selected.label} (unavailable)`;
+}
+
+function approvalSurfaceLabel(view: ScheduleDetailView): string {
+  if (
+    view.overview.harnessMode === "local-copilot" &&
+    view.overview.approvalMode === "default-approvals"
+  ) {
+    return "VS Code Task terminal (managed Copilot CLI fallback)";
+  }
+  return "No interactive approval surface required by the selected policy";
 }
 
 function harnessModeLabel(

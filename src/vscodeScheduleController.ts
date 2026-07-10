@@ -144,6 +144,49 @@ export class SqliteDataVersionMonitor {
   }
 }
 
+export class VisiblePanelRefreshMonitor {
+  private refreshInFlight: Promise<void> | undefined;
+  private dirty = false;
+  private disposed = false;
+
+  constructor(
+    private readonly hasVisiblePanels: () => boolean,
+    private readonly onRefresh: () => unknown | Promise<unknown>,
+  ) {}
+
+  async poll(): Promise<boolean> {
+    if (this.disposed || !this.hasVisiblePanels()) {
+      return false;
+    }
+    if (this.refreshInFlight) {
+      this.dirty = true;
+      return true;
+    }
+    this.refreshInFlight = this.refreshUntilClean();
+    await this.refreshInFlight;
+    return true;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.dirty = false;
+  }
+
+  private async refreshUntilClean(): Promise<void> {
+    try {
+      do {
+        this.dirty = false;
+        if (this.disposed || !this.hasVisiblePanels()) {
+          return;
+        }
+        await this.onRefresh();
+      } while (this.dirty && !this.disposed);
+    } finally {
+      this.refreshInFlight = undefined;
+    }
+  }
+}
+
 export function buildNewDraftScheduleInput(
   workspace: VsCodeWorkspaceLike,
   defaultModel = "auto",
@@ -302,25 +345,31 @@ export function registerVsCodeScheduleCommands(
         return controller.refreshExternalState();
       })
     : undefined;
-  const dataVersionInterval = dataVersionMonitor
-    ? setInterval(() => {
+  const visiblePanelRefreshMonitor = new VisiblePanelRefreshMonitor(
+    () => controller.hasVisiblePanels(),
+    () => controller.refreshVisibleState(),
+  );
+  const refreshInterval = setInterval(() => {
         try {
-          void dataVersionMonitor.poll().catch(() => {});
+          void (async () => {
+            const externalChange = await dataVersionMonitor?.poll() ?? false;
+            if (!externalChange) {
+              await visiblePanelRefreshMonitor.poll();
+            }
+          })().catch(() => {});
         } catch {
           // The extension may be disposing the SQLite connection.
         }
-      }, 1_000)
-    : undefined;
-  dataVersionInterval?.unref();
+      }, 1_000);
+  refreshInterval.unref();
   const disposables = [
-    ...(dataVersionInterval
-      ? [{
-          dispose: () => {
-            clearInterval(dataVersionInterval);
-            dataVersionMonitor?.dispose();
-          },
-        }]
-      : []),
+    {
+      dispose: () => {
+        clearInterval(refreshInterval);
+        dataVersionMonitor?.dispose();
+        visiblePanelRefreshMonitor.dispose();
+      },
+    },
     options.commands.registerCommand(NEW_SCHEDULE_COMMAND, () =>
       controller.createNewSchedule(),
     ),
@@ -761,6 +810,7 @@ class VsCodeScheduleCommandController {
         );
         return renderScheduleDetailWebviewHtml(detail, {
           ...state,
+          refreshedAt: new Date().toISOString(),
           modelOptions,
           modelCatalogAvailable: this.modelCatalog !== undefined,
           ...(this.localSchedulingSetupAvailability && {
@@ -817,7 +867,15 @@ class VsCodeScheduleCommandController {
 
   async refreshExternalState(): Promise<void> {
     this.refreshScheduleTree();
-    await this.panelHost.refreshAll();
+    await this.panelHost.refreshVisible();
+  }
+
+  hasVisiblePanels(): boolean {
+    return this.panelHost.hasVisiblePanels();
+  }
+
+  async refreshVisibleState(): Promise<void> {
+    await this.panelHost.refreshVisible();
   }
 
   async openSchedule(scheduleId: unknown): Promise<ScheduleDetailView | undefined> {
@@ -915,6 +973,14 @@ class VsCodeScheduleCommandController {
     if (
       typeof rawMessage === "object" &&
       rawMessage !== null &&
+      (rawMessage as { type?: unknown }).type === "form-dirty"
+    ) {
+      this.panelHost.markScheduleDirty(panel);
+      return;
+    }
+    if (
+      typeof rawMessage === "object" &&
+      rawMessage !== null &&
       (rawMessage as { type?: unknown }).type === "open-run-history" &&
       typeof (rawMessage as { runId?: unknown }).runId === "string"
     ) {
@@ -929,6 +995,11 @@ class VsCodeScheduleCommandController {
     }
 
     try {
+      if (message.type === "refresh") {
+        await this.panelHost.refreshSchedulePanel(panel, message.scheduleId);
+        return;
+      }
+
       if (isLocalSchedulingWebviewAction(message.type)) {
         await this.runLocalSchedulingAction(message.type);
         await this.panelHost.refreshSchedules();
