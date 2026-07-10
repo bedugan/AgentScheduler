@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -7,8 +7,8 @@ import {
   readdirSync,
   readFileSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { dirname, join, posix, win32 } from "node:path";
@@ -538,9 +538,15 @@ export function deployPackagedWorker(
     "worker",
     fingerprint,
   );
-  if (!existsSync(targetDirectory)) {
+  const deploymentMarker = join(targetDirectory, "deployment.json");
+  if (!existsSync(deploymentMarker)) {
     mkdirSync(targetDirectory, { recursive: true });
     cpSync(sourceDirectory, targetDirectory, { recursive: true });
+    writeFileSync(
+      deploymentMarker,
+      `${JSON.stringify({ fingerprint })}\n`,
+      "utf8",
+    );
   }
   return {
     workerPath: join(targetDirectory, "workerCli.js"),
@@ -629,6 +635,7 @@ export function createDefaultVsCodeSchedulerServices(
     return createUnavailableLocalSchedulingServices(
       context,
       `Local Scheduling is not supported on ${platform}. Schedule editing and Manual Run Now remain available.`,
+      options.interactiveExecutor,
     );
   }
   const deployedWorker = deployPackagedWorker(context);
@@ -652,6 +659,7 @@ export function createDefaultVsCodeSchedulerServices(
     return createUnavailableLocalSchedulingServices(
       context,
       `${errorMessageFor(error)} Schedule editing and Manual Run Now remain available.`,
+      options.interactiveExecutor,
     );
   }
   const provider =
@@ -704,16 +712,20 @@ export function createDefaultVsCodeSchedulerServices(
 function createUnavailableLocalSchedulingServices(
   context: VsCodeInstalledExtensionContextLike,
   reason: string,
+  interactiveExecutor?: CopilotInteractiveExecutor,
 ): VsCodeSchedulerServices {
   const store = new SqliteScheduleStore({
     databasePath: sqliteLocalStorePath(context),
   });
   const lifecycle = new ScheduleLifecycle({
     store,
-    harnesses: [createDefaultCopilotLocalHarness()],
+    harnesses: [
+      createDefaultCopilotLocalHarness(
+        interactiveExecutor ? { interactiveExecutor } : {},
+      ),
+    ],
     localSchedulingSetup: {
-      isLocalSchedulingEnabled: async () =>
-        (await store.getLocalSchedulingSetup()).enabled,
+      isLocalSchedulingEnabled: async () => false,
       getLocalSchedulingSetupState: async () => store.getLocalSchedulingSetup(),
     },
   });

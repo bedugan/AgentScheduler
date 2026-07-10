@@ -35,6 +35,7 @@ import {
   renderScheduleDetailWebviewHtml,
   confirmEnableLocalScheduling,
   createDefaultVsCodeSchedulerServices,
+  deployPackagedWorker,
   localSchedulingWakeupRequestForVsCode,
   resolveNodeRuntimeExecutable,
   scheduleTreeItemForSummary,
@@ -366,6 +367,32 @@ describe("VS Code extension adapter", () => {
         }),
       /absolute Node\.js executable/,
     );
+  });
+
+  it("deploys the packaged worker to an immutable fingerprinted global-storage path", async () => {
+    const globalStoragePath = await mkdtemp(join(tmpdir(), "agent-scheduler-worker-"));
+    try {
+      const context = {
+        globalStorageUri: { fsPath: globalStoragePath },
+        extensionUri: { fsPath: process.cwd() },
+      };
+      const first = deployPackagedWorker(context);
+      const second = deployPackagedWorker(context);
+
+      assert.deepEqual(second, first);
+      assert.match(first.fingerprint, /^[a-f0-9]{16}$/);
+      assert.equal(first.workerPath.startsWith(globalStoragePath), true);
+      await readFile(first.workerPath, "utf8");
+      const marker = JSON.parse(
+        await readFile(
+          join(globalStoragePath, "worker", first.fingerprint, "deployment.json"),
+          "utf8",
+        ),
+      ) as { fingerprint: string };
+      assert.equal(marker.fingerprint, first.fingerprint);
+    } finally {
+      await rm(globalStoragePath, { recursive: true, force: true });
+    }
   });
 
   it("wires Local Scheduling into the shipped default service composition", async () => {
