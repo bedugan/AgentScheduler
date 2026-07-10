@@ -22,12 +22,16 @@ import {
 } from "./localSchedulingSetup.js";
 import type {
   ActiveRunReservationResult,
+  RunResultCommit,
+  ScheduleRunStateUpdate,
   ScheduleStore,
 } from "./store.js";
 
 export interface SqliteScheduleStoreOptions {
   databasePath: string;
 }
+
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 interface ScheduleRow {
   id: string;
@@ -86,7 +90,13 @@ export class SqliteScheduleStore
       mkdirSync(dirname(options.databasePath), { recursive: true });
     }
 
-    this.database = new DatabaseSync(options.databasePath);
+    this.database = new DatabaseSync(options.databasePath, {
+      timeout: SQLITE_BUSY_TIMEOUT_MS,
+    });
+    if (options.databasePath !== ":memory:") {
+      this.database.exec("PRAGMA journal_mode = WAL");
+    }
+    this.database.exec("PRAGMA foreign_keys = ON");
     this.initializeSchema();
   }
 
@@ -217,6 +227,10 @@ export class SqliteScheduleStore
   }
 
   async saveRunHistory(entry: RunHistoryEntry): Promise<void> {
+    this.upsertRunHistory(entry);
+  }
+
+  private upsertRunHistory(entry: RunHistoryEntry): void {
     this.database
       .prepare(`
         INSERT INTO run_history (
@@ -293,6 +307,48 @@ export class SqliteScheduleStore
         summary: entry.summary,
         error: entry.error,
       });
+  }
+
+  async commitRunResult(
+    entry: RunHistoryEntry,
+    scheduleUpdate: ScheduleRunStateUpdate,
+  ): Promise<RunResultCommit> {
+    this.database.exec("BEGIN IMMEDIATE TRANSACTION");
+    try {
+      const result = this.database
+        .prepare(`
+          UPDATE schedules
+          SET status = $status,
+              enabled = $enabled,
+              run_counter_json = $run_counter_json,
+              next_run_at = $next_run_at,
+              last_run_at = $last_run_at,
+              updated_at = $updated_at
+          WHERE id = $id
+            AND revision = $expected_revision
+        `)
+        .run({
+          id: scheduleUpdate.scheduleId,
+          expected_revision: scheduleUpdate.expectedRevision,
+          status: scheduleUpdate.status,
+          enabled: scheduleUpdate.enabled ? 1 : 0,
+          run_counter_json: JSON.stringify(scheduleUpdate.runCounter),
+          next_run_at: scheduleUpdate.nextRunAt,
+          last_run_at: scheduleUpdate.lastRunAt,
+          updated_at: scheduleUpdate.updatedAt,
+        });
+      if (result.changes === 0) {
+        this.database.exec("ROLLBACK");
+        return { committed: false };
+      }
+
+      this.upsertRunHistory(entry);
+      this.database.exec("COMMIT");
+      return { committed: true };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async reserveActiveRun(

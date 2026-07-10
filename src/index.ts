@@ -97,7 +97,11 @@ export {
   DEFAULT_COPILOT_CLI_RUN_TIMEOUT_MS,
   detectCopilotCliAvailabilitySync,
 } from "./copilotCliClient.js";
-export type { ScheduleStore } from "./store.js";
+export type {
+  RunResultCommit,
+  ScheduleRunStateUpdate,
+  ScheduleStore,
+} from "./store.js";
 export {
   RandomIdGenerator,
   ScheduleLifecycle,
