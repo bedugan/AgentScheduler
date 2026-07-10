@@ -41,7 +41,7 @@ import type { ScheduleStore } from "./store.js";
 type Clock = { now(): Date };
 type IdGenerator = { nextId(prefix: string): string };
 
-export interface RunCoordinatorOptions {
+interface RunCoordinatorOptions {
   store: ScheduleStore;
   harnesses: Map<string, AgentHarness>;
   clock: Clock;
@@ -947,4 +947,3 @@ function errorMessageFromUnknown(error: unknown): string {
     ? error.message
     : String(error);
 }
-

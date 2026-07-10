@@ -185,7 +185,10 @@ function parseScheduleExportFile(exportFile: unknown): ParsedScheduleExportEntry
   );
 }
 
-function parseScheduleExportEntry(value: unknown, path: string): ParsedScheduleExportEntry {
+function parseScheduleExportEntry(
+  value: unknown,
+  path: string,
+): ParsedScheduleExportEntry {
   const entry = requireRecord(value, path);
   const originalApprovalMode = requireString(entry, "approvalMode", path);
   return {
@@ -193,8 +196,14 @@ function parseScheduleExportEntry(value: unknown, path: string): ParsedScheduleE
     revision: requirePositiveInteger(entry, "revision", path),
     runInstructions: requireString(entry, "runInstructions", path),
     cadence: parseNullableCadence(entry.cadence, `${path}.cadence`),
-    targetContext: parseNullableTargetContext(entry.targetContext, `${path}.targetContext`),
-    harnessMode: parseNullableHarnessMode(entry.harnessMode, `${path}.harnessMode`),
+    targetContext: parseNullableTargetContext(
+      entry.targetContext,
+      `${path}.targetContext`,
+    ),
+    harnessMode: parseNullableHarnessMode(
+      entry.harnessMode,
+      `${path}.harnessMode`,
+    ),
     model: requireString(entry, "model", path),
     approvalMode: parseApprovalMode(originalApprovalMode),
     originalApprovalMode,
@@ -211,18 +220,31 @@ function parseCadence(value: unknown, path: string): RunCadence {
   if (type !== "cron") throw new Error(`${path}.type must be 'cron'.`);
   return { type, expression: requireString(cadence, "expression", path) };
 }
-function parseNullableTargetContext(value: unknown, path: string): TargetContext | null {
+function parseNullableTargetContext(
+  value: unknown,
+  path: string,
+): TargetContext | null {
   return value === null ? null : parseTargetContext(value, path);
 }
 function parseTargetContext(value: unknown, path: string): TargetContext {
   const target = requireRecord(value, path);
   const type = requireString(target, "type", path);
-  if (type !== "workspace") throw new Error(`${path}.type must be 'workspace'.`);
-  const parsed: TargetContext = { type, uri: requireString(target, "uri", path) };
-  if (target.label !== undefined) parsed.label = requireString(target, "label", path);
+  if (type !== "workspace") {
+    throw new Error(`${path}.type must be 'workspace'.`);
+  }
+  const parsed: TargetContext = {
+    type,
+    uri: requireString(target, "uri", path),
+  };
+  if (target.label !== undefined) {
+    parsed.label = requireString(target, "label", path);
+  }
   return parsed;
 }
-function parseNullableHarnessMode(value: unknown, path: string): HarnessMode | null {
+function parseNullableHarnessMode(
+  value: unknown,
+  path: string,
+): HarnessMode | null {
   return value === null ? null : parseHarnessMode(value, path);
 }
 function parseHarnessMode(value: unknown, path: string): HarnessMode {
@@ -230,25 +252,45 @@ function parseHarnessMode(value: unknown, path: string): HarnessMode {
   throw new Error(`${path} must be a supported harness mode.`);
 }
 function parseApprovalMode(value: string): ApprovalMode {
-  return value === "default-approvals" || value === "bypass-approvals" || value === "autopilot"
+  return value === "default-approvals" ||
+    value === "bypass-approvals" ||
+    value === "autopilot"
     ? value
     : "default-approvals";
 }
 function parseRunCap(value: unknown, path: string): RunCapInput | null {
   if (value === null || value === undefined) return null;
-  return { maxRuns: requirePositiveInteger(requireRecord(value, path), "maxRuns", path) };
+  return {
+    maxRuns: requirePositiveInteger(
+      requireRecord(value, path),
+      "maxRuns",
+      path,
+    ),
+  };
 }
 function requireRecord(value: unknown, path: string): Record<string, unknown> {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
   throw new Error(`${path} must be an object.`);
 }
-function requireString(record: Record<string, unknown>, key: string, path: string): string {
+function requireString(
+  record: Record<string, unknown>,
+  key: string,
+  path: string,
+): string {
   const value = record[key];
   if (typeof value === "string") return value;
   throw new Error(`${path}.${key} must be a string.`);
 }
-function requirePositiveInteger(record: Record<string, unknown>, key: string, path: string): number {
+function requirePositiveInteger(
+  record: Record<string, unknown>,
+  key: string,
+  path: string,
+): number {
   const value = record[key];
-  if (Number.isInteger(value) && typeof value === "number" && value > 0) return value;
+  if (Number.isInteger(value) && typeof value === "number" && value > 0) {
+    return value;
+  }
   throw new Error(`${path}.${key} must be a positive integer.`);
 }

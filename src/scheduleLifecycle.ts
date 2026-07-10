@@ -67,11 +67,7 @@ export class RandomIdGenerator implements IdGenerator {
 export class ScheduleLifecycle {
   private readonly store: ScheduleStore;
   private readonly clock: Clock;
-  private readonly idGenerator: IdGenerator;
-  private readonly localSchedulingEnabled: boolean;
-  private readonly localSchedulingSetup: LocalSchedulingStateSource | undefined;
   private readonly harnesses: Map<string, AgentHarness>;
-  private readonly executionOwnerId: string;
   private readonly scheduleDefinition: ScheduleDefinition;
   private readonly scheduleFile: ScheduleFile;
   private readonly runCoordinator: RunCoordinator;
@@ -80,36 +76,35 @@ export class ScheduleLifecycle {
   constructor(options: ScheduleLifecycleOptions) {
     this.store = options.store;
     this.clock = options.clock ?? new SystemClock();
-    this.idGenerator = options.idGenerator ?? new RandomIdGenerator();
-    this.localSchedulingEnabled = options.localSchedulingEnabled ?? false;
-    this.localSchedulingSetup = options.localSchedulingSetup;
-    this.executionOwnerId = options.executionOwnerId ?? `process:${process.pid}:${randomUUID()}`;
+    const idGenerator = options.idGenerator ?? new RandomIdGenerator();
+    const executionOwnerId =
+      options.executionOwnerId ?? `process:${process.pid}:${randomUUID()}`;
     this.harnesses = new Map(
       options.harnesses.map((harness) => [harness.mode, harness]),
     );
     this.scheduleProjection = new ScheduleProjection(
-      this.executionOwnerId,
+      executionOwnerId,
       () => this.listHarnessModeAvailability(),
       (mode, schedule) => this.harnessModeAvailabilityFor(mode, schedule),
     );
     this.scheduleDefinition = new ScheduleDefinition(
-      this.idGenerator,
+      idGenerator,
       (schedule) =>
         this.scheduleProjection.selectedHarnessUnavailableReason(schedule),
     );
-    this.scheduleFile = new ScheduleFile(this.idGenerator, (mode) =>
+    this.scheduleFile = new ScheduleFile(idGenerator, (mode) =>
       this.harnesses.has(mode),
     );
     this.runCoordinator = new RunCoordinator({
       store: this.store,
       harnesses: this.harnesses,
       clock: this.clock,
-      idGenerator: this.idGenerator,
+      idGenerator,
       scheduleDefinition: this.scheduleDefinition,
-      executionOwnerId: this.executionOwnerId,
-      localSchedulingEnabled: this.localSchedulingEnabled,
-      ...(this.localSchedulingSetup && {
-        localSchedulingSetup: this.localSchedulingSetup,
+      executionOwnerId,
+      localSchedulingEnabled: options.localSchedulingEnabled ?? false,
+      ...(options.localSchedulingSetup && {
+        localSchedulingSetup: options.localSchedulingSetup,
       }),
     });
   }
